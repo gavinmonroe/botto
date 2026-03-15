@@ -55,18 +55,14 @@ pub async fn run(
     // Initialize directory structure
     memory::init_dirs(memory_dir).await?;
 
-    // Load or create baseline variant (v000)
-    let baseline = match memory::load_variant(memory_dir, "v000").await {
-        Ok(v) => {
-            info!("loaded existing baseline variant v000");
-            v
-        }
-        Err(_) => {
-            info!("creating baseline variant v000 from production prompts");
-            let v = prompts::baseline_variant();
-            memory::save_variant(memory_dir, &v).await?;
-            v
-        }
+    // Always regenerate baseline from code — never load stale prompts from disk.
+    // The baseline must reflect the current production prompts in prompts.rs,
+    // not whatever was saved from a previous run with different prompt text.
+    let baseline = {
+        info!("creating baseline variant v000 from current production prompts");
+        let v = prompts::baseline_variant();
+        memory::save_variant(memory_dir, &v).await?;
+        v
     };
 
     // Load or generate test cases

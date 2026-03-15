@@ -233,13 +233,15 @@ impl SandboxManager {
             Err(_) => None, // File doesn't exist or can't be read — that's fine
         };
 
-        let base_image = detector::detect_base_image(
+        let detection = detector::detect_base_image(
             &gl_cfg,
             project_id,
             &req.source_branch,
             otto_config.as_ref(),
         )
         .await;
+
+        let base_image = detection.image.clone();
 
         let strategy = detector::determine_strategy(
             &gl_cfg,
@@ -250,8 +252,8 @@ impl SandboxManager {
         .await;
 
         info!(
-            "sandbox fix: job={} image={} strategy={:?}",
-            req.job_id, base_image, strategy
+            "sandbox fix: job={} image={} lang={:?} strategy={:?}",
+            req.job_id, base_image, detection.lang, strategy
         );
 
         // Build the clone URL with embedded token for auth.
@@ -270,12 +272,32 @@ impl SandboxManager {
             info!("sandbox fix: fork detected, cloning from {}", clone_project);
         }
 
-        // Create container
+        // Create container — use resource hints to size appropriately.
+        // Compiled languages (Rust, Java, C++) need more CPU/memory than
+        // interpreted ones (Python, Ruby). The hints come from the detector.
         let container_name = format!("botto-fix-{}", &req.job_id[..8]);
-        let memory_limit = (self.cfg.sandbox.max_memory_mb * 1024 * 1024) as i64;
+        let hints = &detection.resource_hints;
+        let memory_limit = {
+            let configured = self.cfg.sandbox.max_memory_mb;
+            let recommended = hints.min_memory_mb;
+            // Use the larger of configured and recommended, capped at configured * 2
+            let effective = configured.max(recommended).min(configured * 2);
+            (effective * 1024 * 1024) as i64
+        };
+        let cpu_quota = {
+            // Scale CPU quota based on hints. Default is 100_000 (1 CPU).
+            // Resource hints suggest min_cpus; cap at host-available or 4.
+            let effective_cpus = (hints.min_cpus).min(4).max(1);
+            (effective_cpus as i64) * 100_000
+        };
+
+        // Build environment variables for the container. Every exec inherits
+        // these, which prevents the AI from wasting steps on `export PATH=...`
+        // after installing a runtime. We include common runtime paths upfront.
+        let container_env = build_container_env(&detection.lang);
 
         let container_id = match self
-            .create_container(&container_name, &base_image, memory_limit)
+            .create_container(&container_name, &base_image, memory_limit, cpu_quota, &container_env)
             .await
         {
             Ok(id) => id,
@@ -311,7 +333,7 @@ impl SandboxManager {
 
         // Execute the fix pipeline inside the container
         let result = self
-            .execute_fix_pipeline(&container_id, &req, &clone_url_authed, &strategy, &mr_ref)
+            .execute_fix_pipeline(&container_id, &req, &clone_url_authed, &strategy, &mr_ref, &detection.lang)
             .await;
 
         // Cleanup
@@ -358,6 +380,7 @@ impl SandboxManager {
         clone_url: &str,
         strategy: &FixStrategy,
         mr_ref: &MrRef,
+        lang: &crate::services::sandbox::detector::ProjectLang,
     ) -> FixResult {
         // Harness runs get 25 minutes — real projects (Rust, Java) need time
         // for cargo check, mvn compile, etc. Production uses the configured timeout.
@@ -409,6 +432,29 @@ impl SandboxManager {
                 test_output: e.output,
                 error: Some(e.error),
             };
+        }
+
+        // Step 1.5: Pre-install native dependencies for known problematic packages.
+        // After clone, scan lockfiles for gems/packages that need system libraries.
+        // This saves 10-20 AI setup steps per container for projects using packages
+        // like rugged, nokogiri, pg, etc. that require native compilation.
+        // Best-effort: if this fails, the AI setup loop handles it.
+        {
+            let native_deps_cmd = build_native_deps_command(lang);
+            if let Some(cmd) = native_deps_cmd {
+                debug!("pre-installing native deps for {:?} project", lang);
+                match self.exec_in_container(container_id, &cmd, deadline).await {
+                    Ok(output) if output.exit_code == 0 => {
+                        debug!("native deps pre-installed successfully");
+                    }
+                    Ok(output) => {
+                        debug!("native deps pre-install partial (exit {}), AI will handle remainder", output.exit_code);
+                    }
+                    Err(e) => {
+                        debug!("native deps pre-install failed (non-fatal): {}", e);
+                    }
+                }
+            }
         }
 
         // Step 2: AI-driven project setup.
@@ -541,7 +587,89 @@ impl SandboxManager {
             }
         }
 
-        // Step 3: Apply fix (with AI retry)
+        // Step 3: Pre-validate — verify the target file exists and contains
+        // the original code BEFORE attempting the apply. This catches the common
+        // failure mode where the MR's source branch was rebased, the file was
+        // renamed, or the review snippet doesn't match the actual file content.
+        // Without this check, the apply step fails and the AI burns 12+ retry
+        // steps trying to find a file that simply isn't there.
+        {
+            let check_cmd = format!(
+                "test -f /workspace/{} && echo FILE_EXISTS || echo FILE_MISSING",
+                shell_escape(&req.file_path),
+            );
+            match self.exec_in_container(container_id, &check_cmd, deadline).await {
+                Ok(output) if output.stdout.contains("FILE_EXISTS") => {
+                    debug!("pre-validate: file exists at /workspace/{}", req.file_path);
+                }
+                _ => {
+                    warn!(
+                        "pre-validate: file not found at /workspace/{} — skipping fix",
+                        req.file_path
+                    );
+                    return FixResult {
+                        job_id: req.job_id.clone(),
+                        success: false,
+                        commit_sha: None,
+                        test_output: None,
+                        error: Some(format!(
+                            "pre-validate failed: file '{}' not found in cloned repo (branch may have been rebased or file renamed)",
+                            req.file_path
+                        )),
+                    };
+                }
+            }
+
+            // Verify the original code snippet exists in the file
+            use base64::Engine;
+            let b64 = base64::engine::general_purpose::STANDARD;
+            let original_b64 = b64.encode(req.original_code.as_bytes());
+            let file_path_b64 = b64.encode(req.file_path.as_bytes());
+            let verify_cmd = format!(
+                r#"cd /workspace && python3 -c "
+import base64, sys
+path = base64.b64decode('{}').decode()
+original = base64.b64decode('{}').decode()
+with open(path, 'r') as f:
+    content = f.read()
+if original in content:
+    print('SNIPPET_FOUND')
+else:
+    print('SNIPPET_MISSING')
+    # Show first 200 chars of file for debugging
+    print('File starts with:', repr(content[:200]))
+""#,
+                file_path_b64, original_b64,
+            );
+            match self.exec_in_container(container_id, &verify_cmd, deadline).await {
+                Ok(output) if output.stdout.contains("SNIPPET_FOUND") => {
+                    debug!("pre-validate: original code snippet found in {}", req.file_path);
+                }
+                Ok(output) if output.stdout.contains("SNIPPET_MISSING") => {
+                    warn!(
+                        "pre-validate: original code not found in {} — snippet may be stale",
+                        req.file_path
+                    );
+                    return FixResult {
+                        job_id: req.job_id.clone(),
+                        success: false,
+                        commit_sha: None,
+                        test_output: Some(output.stdout),
+                        error: Some(format!(
+                            "pre-validate failed: original code snippet not found in '{}' (source branch may have been updated since review)",
+                            req.file_path
+                        )),
+                    };
+                }
+                _ => {
+                    // python3 not available or other error — proceed anyway,
+                    // the apply step will catch it
+                    debug!("pre-validate: snippet check inconclusive, proceeding");
+                }
+            }
+        }
+
+        // Step 4: Apply fix (with AI retry)
         self.send_progress(&req.job_id, &req.comment_id, mr_ref, "running", "applying fix...");
         self.update_job_status(&req.job_id, "running").await;
 
@@ -1152,6 +1280,8 @@ impl SandboxManager {
         name: &str,
         image: &str,
         memory_limit: i64,
+        cpu_quota: i64,
+        env: &[String],
     ) -> Result<String, String> {
         // Pull image if not present
         let _ = self.docker
@@ -1170,7 +1300,7 @@ impl SandboxManager {
             memory: Some(memory_limit),
             memory_swap: Some(memory_limit), // no swap
             cpu_period: Some(100_000),
-            cpu_quota: Some(100_000), // 1 CPU
+            cpu_quota: Some(cpu_quota),
             ..Default::default()
         };
 
@@ -1178,6 +1308,7 @@ impl SandboxManager {
             image: Some(image.to_string()),
             cmd: Some(vec!["sleep".to_string(), "3600".to_string()]), // keep alive
             working_dir: Some("/workspace".to_string()),
+            env: Some(env.to_vec()),
             host_config: Some(host_config),
             ..Default::default()
         };
@@ -1359,6 +1490,162 @@ fn strip_markdown_fences(s: &str) -> String {
 // ---------------------------------------------------------------------------
 // Command builders
 // ---------------------------------------------------------------------------
+
+/// Build container environment variables based on detected language.
+/// These persist across all `exec_in_container` calls, preventing the AI
+/// from wasting steps on `export PATH=...` after every command.
+fn build_container_env(lang: &crate::services::sandbox::detector::ProjectLang) -> Vec<String> {
+    use crate::services::sandbox::detector::ProjectLang;
+
+    // Start with a comprehensive PATH that includes common runtime locations.
+    // The base image already has its own PATH; we prepend additional paths
+    // so tools installed by the image or by the AI are found immediately.
+    let mut env = vec![
+        // Comprehensive PATH covering all common runtime install locations
+        "PATH=/usr/local/go/bin:/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/root/.local/bin:/root/go/bin".to_string(),
+        // Non-interactive apt-get (no prompts)
+        "DEBIAN_FRONTEND=noninteractive".to_string(),
+        // Disable interactive pagers (git, man, etc.)
+        "GIT_PAGER=cat".to_string(),
+        "PAGER=cat".to_string(),
+        // Sensible defaults
+        "LANG=C.UTF-8".to_string(),
+        "HOME=/root".to_string(),
+    ];
+
+    // Language-specific env vars
+    match lang {
+        ProjectLang::Go => {
+            env.push("GOPATH=/root/go".to_string());
+            env.push("GOFLAGS=-mod=mod".to_string());
+        }
+        ProjectLang::Node => {
+            env.push("NODE_ENV=test".to_string());
+            env.push("NPM_CONFIG_LOGLEVEL=warn".to_string());
+            // Disable npm update notifier (noisy in CI)
+            env.push("NO_UPDATE_NOTIFIER=1".to_string());
+        }
+        ProjectLang::Python => {
+            // Don't write .pyc files (faster in ephemeral containers)
+            env.push("PYTHONDONTWRITEBYTECODE=1".to_string());
+            env.push("PYTHONUNBUFFERED=1".to_string());
+            env.push("PIP_DISABLE_PIP_VERSION_CHECK=1".to_string());
+        }
+        ProjectLang::Rust => {
+            env.push("CARGO_HOME=/usr/local/cargo".to_string());
+            env.push("RUSTUP_HOME=/usr/local/rustup".to_string());
+        }
+        ProjectLang::DotNet => {
+            // Suppress .NET telemetry and first-run experience
+            env.push("DOTNET_CLI_TELEMETRY_OPTOUT=1".to_string());
+            env.push("DOTNET_NOLOGO=1".to_string());
+        }
+        ProjectLang::Java | ProjectLang::Scala | ProjectLang::Clojure => {
+            // Reduce JVM memory footprint in containers
+            env.push("JAVA_TOOL_OPTIONS=-Xmx1536m".to_string());
+            env.push("MAVEN_OPTS=-Xmx1536m".to_string());
+        }
+        ProjectLang::Ruby => {
+            env.push("BUNDLE_SILENCE_ROOT_WARNING=1".to_string());
+        }
+        _ => {}
+    }
+
+    env
+}
+
+/// Pre-install native system dependencies for known problematic packages.
+///
+/// Many language ecosystems have packages that require native C libraries to
+/// compile. The AI wastes 10-20 steps discovering and installing these one by
+/// one. This function scans the cloned repo's lockfiles and pre-installs the
+/// system packages needed for common native gems/packages.
+///
+/// Returns None if no pre-installation is needed for this language.
+/// The command is best-effort — if it fails, the AI setup loop handles it.
+fn build_native_deps_command(lang: &crate::services::sandbox::detector::ProjectLang) -> Option<String> {
+    use crate::services::sandbox::detector::ProjectLang;
+
+    match lang {
+        ProjectLang::Ruby => {
+            // Ruby gems with native extensions are the #1 source of setup pain.
+            // Check Gemfile.lock for known problematic gems and pre-install their deps.
+            // Uses apt-get (Debian/Ubuntu slim images) with fallback to apk (Alpine).
+            Some(concat!(
+                "if [ -f /workspace/Gemfile.lock ]; then ",
+                  "DEPS=''; ",
+                  // rugged (libgit2 bindings) — needs cmake, libgit2-dev, libssl-dev, libzstd-dev
+                  "grep -q 'rugged' /workspace/Gemfile.lock && DEPS=\"$DEPS build-essential cmake pkg-config libgit2-dev libssl-dev libzstd-dev\"; ",
+                  // nokogiri (XML parser) — needs libxml2-dev, libxslt-dev
+                  "grep -q 'nokogiri' /workspace/Gemfile.lock && DEPS=\"$DEPS build-essential pkg-config libxml2-dev libxslt-dev\"; ",
+                  // pg (PostgreSQL client) — needs libpq-dev
+                  "grep -q '  pg ' /workspace/Gemfile.lock && DEPS=\"$DEPS libpq-dev\"; ",
+                  // mysql2 — needs libmysqlclient-dev
+                  "grep -q 'mysql2' /workspace/Gemfile.lock && DEPS=\"$DEPS default-libmysqlclient-dev\"; ",
+                  // grpc — needs build tools
+                  "grep -q 'grpc' /workspace/Gemfile.lock && DEPS=\"$DEPS build-essential\"; ",
+                  // ffi — needs libffi-dev
+                  "grep -q '  ffi ' /workspace/Gemfile.lock && DEPS=\"$DEPS libffi-dev\"; ",
+                  // sassc — needs build tools
+                  "grep -q 'sassc' /workspace/Gemfile.lock && DEPS=\"$DEPS build-essential\"; ",
+                  "if [ -n \"$DEPS\" ]; then ",
+                    "if command -v apt-get >/dev/null 2>&1; then ",
+                      "apt-get update -qq && apt-get install -y -qq --no-install-recommends $DEPS 2>&1 | tail -5; ",
+                    "elif command -v apk >/dev/null 2>&1; then ",
+                      "apk add --no-cache build-base cmake pkgconfig libgit2-dev openssl-dev zstd-dev libxml2-dev libxslt-dev postgresql-dev libffi-dev 2>&1 | tail -5; ",
+                    "fi; ",
+                  "fi; ",
+                "fi"
+            ).to_string())
+        }
+        ProjectLang::Python => {
+            // Python packages with C extensions
+            Some(concat!(
+                "if [ -f /workspace/requirements.txt ] || [ -f /workspace/pyproject.toml ]; then ",
+                  "DEPS=''; ",
+                  "FILES=$(cat /workspace/requirements.txt /workspace/pyproject.toml 2>/dev/null); ",
+                  // psycopg2 — needs libpq-dev
+                  "echo \"$FILES\" | grep -q 'psycopg2' && DEPS=\"$DEPS libpq-dev\"; ",
+                  // lxml — needs libxml2-dev, libxslt-dev
+                  "echo \"$FILES\" | grep -q 'lxml' && DEPS=\"$DEPS libxml2-dev libxslt-dev\"; ",
+                  // Pillow — needs image libs
+                  "echo \"$FILES\" | grep -qi 'pillow' && DEPS=\"$DEPS libjpeg-dev zlib1g-dev\"; ",
+                  // cryptography — needs libssl-dev, libffi-dev
+                  "echo \"$FILES\" | grep -q 'cryptography' && DEPS=\"$DEPS libssl-dev libffi-dev\"; ",
+                  // mysqlclient — needs libmysqlclient-dev
+                  "echo \"$FILES\" | grep -q 'mysqlclient' && DEPS=\"$DEPS default-libmysqlclient-dev\"; ",
+                  "if [ -n \"$DEPS\" ]; then ",
+                    "if command -v apt-get >/dev/null 2>&1; then ",
+                      "apt-get update -qq && apt-get install -y -qq --no-install-recommends build-essential $DEPS 2>&1 | tail -5; ",
+                    "fi; ",
+                  "fi; ",
+                "fi"
+            ).to_string())
+        }
+        ProjectLang::Node => {
+            // Node native addons (node-gyp based)
+            Some(concat!(
+                "if [ -f /workspace/package.json ]; then ",
+                  "DEPS=''; ",
+                  // sharp (image processing) — needs vips
+                  "grep -q 'sharp' /workspace/package.json && DEPS=\"$DEPS libvips-dev\"; ",
+                  // bcrypt — needs build tools
+                  "grep -q 'bcrypt' /workspace/package.json && DEPS=\"$DEPS build-essential python3\"; ",
+                  // canvas — needs cairo, pango
+                  "grep -q 'canvas' /workspace/package.json && DEPS=\"$DEPS build-essential libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev\"; ",
+                  // sqlite3 — needs build tools
+                  "grep -q 'better-sqlite3\\|sqlite3' /workspace/package.json && DEPS=\"$DEPS build-essential python3\"; ",
+                  "if [ -n \"$DEPS\" ]; then ",
+                    "if command -v apt-get >/dev/null 2>&1; then ",
+                      "apt-get update -qq && apt-get install -y -qq --no-install-recommends $DEPS 2>&1 | tail -5; ",
+                    "fi; ",
+                  "fi; ",
+                "fi"
+            ).to_string())
+        }
+        _ => None,
+    }
+}
 
 /// Detect setup commands by checking what package manager files exist.
 async fn detect_setup_commands(container_id: &str, mgr: &SandboxManager) -> Vec<String> {

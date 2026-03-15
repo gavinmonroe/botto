@@ -416,6 +416,8 @@ pub async fn discover_from_gitlab(
             };
 
             // Step 3: Grab ALL fixable findings from this MR
+            // Filter out non-code files (docs, configs, images) — these can't
+            // be meaningfully tested in a sandbox container.
             let fixable: Vec<&ReviewComment> = review
                 .file_reviews
                 .iter()
@@ -426,6 +428,7 @@ pub async fn discover_from_gitlab(
                         && !c.original_code.as_ref().unwrap().is_empty()
                         && !c.suggestion.as_ref().unwrap().is_empty()
                         && c.original_code != c.suggestion
+                        && !is_non_code_file(&c.file_path)
                 })
                 .collect();
 
@@ -460,6 +463,28 @@ pub async fn discover_from_gitlab(
                 )
                 .await
                 .ok();
+
+                // Pre-validate: verify the original_code snippet actually exists
+                // in the fetched file content. If it doesn't, the sandbox apply
+                // step will fail immediately and waste a Docker container + time.
+                // Common causes: branch was rebased, review snippet is stale,
+                // whitespace differences between review and actual file.
+                if let Some(ref content) = file_content {
+                    let original = pick.original_code.as_ref().unwrap();
+                    if !content.contains(original.as_str()) {
+                        info!(
+                            "harness: skipping finding in {} — original_code snippet not found in file (stale review or rebased branch)",
+                            pick.file_path,
+                        );
+                        continue;
+                    }
+                } else {
+                    info!(
+                        "harness: skipping finding in {} — could not fetch file content from source branch",
+                        pick.file_path,
+                    );
+                    continue;
+                }
 
                 let file_diff = mr_context
                     .diff_files
