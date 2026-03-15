@@ -504,8 +504,9 @@ impl SandboxManager {
                 if let Some(ref t) = self.telemetry {
                     t.setup_steps.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
-                let detail = format!("AI setting up project (step {})...", setup_step);
-                self.send_progress(&req.job_id, &req.comment_id, mr_ref, "setting_up", &detail);
+                // Initial progress before AI responds (we don't know the command yet)
+                self.send_progress(&req.job_id, &req.comment_id, mr_ref, "setting_up",
+                    &format!("AI analyzing (step {})...", setup_step));
 
                 let ai_request = ChatCompletionRequest {
                     model: self.cfg.ai.models.fix.clone(),
@@ -561,6 +562,11 @@ impl SandboxManager {
                 });
 
                 info!("AI setup step {}: {}", setup_step, truncate_output(&cmd, 200));
+
+                // Send richer progress with command preview
+                let cmd_preview = truncate_output(&cmd, 120);
+                let detail = format!("setup step {}: {}", setup_step, cmd_preview);
+                self.send_progress(&req.job_id, &req.comment_id, mr_ref, "setting_up", &detail);
 
                 let (cmd_exit, cmd_output) = match self.exec_in_container(container_id, &cmd, deadline).await {
                     Ok(o) => (o.exit_code, o.stdout),
@@ -797,8 +803,8 @@ else:
                 if let Some(ref t) = self.telemetry {
                     t.fix_steps.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
-                let detail = format!("AI working on fix (step {})...", step_count);
-                self.send_progress(&req.job_id, &req.comment_id, mr_ref, "testing", &detail);
+                self.send_progress(&req.job_id, &req.comment_id, mr_ref, "testing",
+                    &format!("AI analyzing (step {})...", step_count));
 
                 // Ask AI
                 let ai_request = ChatCompletionRequest {
@@ -884,7 +890,8 @@ else:
                 } else {
                     // AI wants to run a shell command
                     info!("AI step {}: {}", step_count, truncate_output(&cmd, 200));
-                    let detail = format!("AI running command (step {})...", step_count);
+                    let cmd_preview = truncate_output(&cmd, 120);
+                    let detail = format!("fix step {}: {}", step_count, cmd_preview);
                     self.send_progress(&req.job_id, &req.comment_id, mr_ref, "testing", &detail);
 
                     let (cmd_exit, cmd_output) = match self.exec_in_container(container_id, &cmd, deadline).await {
@@ -1191,10 +1198,8 @@ else:
 
                     info!("AI fix for '{}' step {}: {}", step_name, step_count, fix_cmd);
 
-                    let detail = format!(
-                        "running AI fix for {} (step {})...",
-                        step_name, step_count
-                    );
+                    let cmd_preview = truncate_output(&fix_cmd, 120);
+                    let detail = format!("retry {}: {}", step_name, cmd_preview);
                     self.send_progress(&req.job_id, &req.comment_id, mr_ref, pipeline_status, &detail);
 
                     // Run the AI's fix command

@@ -443,6 +443,26 @@ pub async fn handle_fix_request(
 
             let result = mgr.run_fix(req).await;
 
+            // Post a GitLab MR comment on successful fix with commit link.
+            // This gives visibility to all MR participants, not just Otto users.
+            if result.success {
+                if let Some(ref sha) = result.commit_sha {
+                    let comment_body = format!(
+                        "🔧 **Botto applied a fix** for this review comment.\n\n\
+                         Commit: {}\n\n\
+                         The fix was applied and tests passed in a sandboxed Docker container.",
+                        sha,
+                    );
+                    if let Some(pid) = project_id {
+                        if let Err(e) = crate::services::gitlab::client::post_mr_note(
+                            &gl_cfg, pid, mr_iid, &comment_body,
+                        ).await {
+                            tracing::warn!("failed to post fix comment on MR: {}", e);
+                        }
+                    }
+                }
+            }
+
             let msg = WsOutbound::FixComplete {
                 job_id: result.job_id,
                 comment_id: comment_id.to_string(),

@@ -405,6 +405,34 @@ pub async fn create_commit(
         .map_err(|e| GitLabError::Parse(e.to_string()))
 }
 
+/// Post a note (comment) on a merge request.
+/// Used to notify the MR about successful sandbox fixes with commit links.
+pub async fn post_mr_note(
+    cfg: &GitLabConfig,
+    project_id: i64,
+    mr_iid: u64,
+    body: &str,
+) -> Result<Note, GitLabError> {
+    let url = format!(
+        "{}/api/v4/projects/{}/merge_requests/{}/notes",
+        cfg.base_url, project_id, mr_iid
+    );
+    let client = build_client();
+
+    let resp = client
+        .post(&url)
+        .headers(auth_headers(&cfg.token))
+        .json(&serde_json::json!({ "body": body }))
+        .send()
+        .await
+        .map_err(|e| GitLabError::Network(e.to_string()))?;
+
+    let resp = check_response(resp, "post_mr_note").await?;
+    resp.json()
+        .await
+        .map_err(|e| GitLabError::Parse(e.to_string()))
+}
+
 /// Trigger a pipeline on a branch with optional variables.
 pub async fn create_pipeline(
     cfg: &GitLabConfig,
