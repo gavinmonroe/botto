@@ -1489,6 +1489,10 @@ fn build_apply_command(file_path: &str, original: &str, suggestion: &str) -> Str
     // The old approach used escaped strings inside double-quoted Python,
     // which broke on code containing double quotes, backslashes, or
     // special characters (common in real-world code).
+    //
+    // Also handles the "already applied" case: if the original code is gone
+    // but the suggestion is already present, exit 0 (success). This prevents
+    // the AI retry loop from spinning when it already fixed the code.
     use base64::Engine;
     let b64 = base64::engine::general_purpose::STANDARD;
     let original_b64 = b64.encode(original.as_bytes());
@@ -1503,13 +1507,16 @@ original = base64.b64decode('{}').decode()
 replacement = base64.b64decode('{}').decode()
 with open(path, 'r') as f:
     content = f.read()
-if original not in content:
-    print('WARNING: original code not found, writing suggestion as patch')
+if original in content:
+    content = content.replace(original, replacement, 1)
+    with open(path, 'w') as f:
+        f.write(content)
+    print('Fix applied successfully')
+elif replacement in content:
+    print('Fix already applied')
+else:
+    print('WARNING: original code not found in file')
     sys.exit(1)
-content = content.replace(original, replacement, 1)
-with open(path, 'w') as f:
-    f.write(content)
-print('Fix applied successfully')
 ""#,
         file_path_b64,
         original_b64,
