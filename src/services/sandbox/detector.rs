@@ -479,9 +479,13 @@ fn parse_dockerfile_from(content: &str) -> Option<String> {
     for line in content.lines() {
         let trimmed = line.trim();
         if trimmed.to_uppercase().starts_with("FROM ") {
-            let image = trimmed[5..].trim();
-            // Strip "AS builder" etc.
-            let image = image.split_whitespace().next().unwrap_or(image);
+            let after_from = trimmed[5..].trim();
+            // Skip --platform=linux/amd64 and other flags before the image name.
+            // Docker syntax: FROM [--platform=<platform>] <image> [AS <name>]
+            let image = after_from
+                .split_whitespace()
+                .find(|token| !token.starts_with("--"))
+                .unwrap_or(after_from);
             if !image.is_empty() && image != "scratch" {
                 return Some(image.to_string());
             }
@@ -830,6 +834,15 @@ mod tests {
             Some("python:3.12".to_string())
         );
         assert_eq!(parse_dockerfile_from("RUN echo hello"), None);
+        // --platform flag should be skipped
+        assert_eq!(
+            parse_dockerfile_from("FROM --platform=linux/amd64 golang:1.23-alpine AS builder"),
+            Some("golang:1.23-alpine".to_string())
+        );
+        assert_eq!(
+            parse_dockerfile_from("FROM --platform=$BUILDPLATFORM node:22-slim"),
+            Some("node:22-slim".to_string())
+        );
     }
 
     #[test]
