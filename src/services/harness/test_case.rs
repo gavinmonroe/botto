@@ -356,6 +356,17 @@ pub async fn discover_from_gitlab(
                 continue;
             }
 
+            // Prefer fast-build languages (Go, Python, JS/TS, Ruby) over slow ones (Rust, Java, C++)
+            // Rust cargo builds take 5+ minutes in Docker, eating the whole timeout.
+            let dominant_lang = dominant_language(&mr_context.diff_files);
+            if is_slow_build_language(&dominant_lang) {
+                info!(
+                    "harness: skipping {}!{} — slow build language ({}) — prefer Go/Python/JS/TS/Ruby",
+                    project.path_with_namespace, mr.iid, dominant_lang,
+                );
+                continue;
+            }
+
             // Step 2: Run OUR Botto review pipeline on this MR
             // Retry up to 2 times if the review fails (API rate limits, transient errors)
             info!("harness: running Botto review on {}!{}...", project.path_with_namespace, mr.iid);
@@ -613,6 +624,25 @@ fn is_non_code_file(path: &str) -> bool {
         || lower.contains("/dist/")
         || lower.starts_with("doc/")
         || lower.starts_with("docs/")
+}
+
+/// Determine the dominant language in an MR by counting file extensions.
+fn dominant_language(diff_files: &[DiffFileData]) -> String {
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for f in diff_files {
+        let lang = infer_language(&f.file_path).to_string();
+        *counts.entry(lang).or_insert(0) += 1;
+    }
+    counts
+        .into_iter()
+        .max_by_key(|(_, count)| *count)
+        .map(|(lang, _)| lang)
+        .unwrap_or_else(|| "unknown".into())
+}
+
+/// Languages with slow build/compile times that eat the sandbox timeout.
+fn is_slow_build_language(lang: &str) -> bool {
+    matches!(lang, "rust" | "java" | "c" | "cpp" | "csharp" | "scala" | "kotlin")
 }
 
 // ---------------------------------------------------------------------------

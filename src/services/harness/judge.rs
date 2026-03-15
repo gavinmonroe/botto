@@ -239,10 +239,24 @@ fn build_mutation_system_prompt(parent: &PromptVariant, history: &str) -> String
          The goal is to make these agents succeed at fixing real code issues across ALL programming \
          languages (Go, Python, Ruby, TypeScript, JavaScript, Rust, Java, etc.) and ALL issue types \
          (bugs, race conditions, security, performance, error handling, etc.).\n\n\
-         CRITICAL RULES for mutations:\n\
-         - Setup prompt MUST contain placeholders: {{project}}, {{file_path}}, {{test_cmd}}\n\
-         - Fix prompt MUST contain placeholders: {{context}}, {{original}}, {{suggestion}}, {{test_cmd}}\n\
-         - Retry prompt MUST contain placeholder: {{context}}\n\
+         ===== CRITICAL: PLACEHOLDER RULES =====\n\
+         The prompts are TEMPLATES with runtime placeholders that get replaced with real values.\n\
+         You MUST preserve these EXACT placeholder strings (curly braces included) in your output:\n\n\
+         Setup prompt REQUIRED placeholders (copy these literally):\n\
+           {{project}}    — replaced with the project path\n\
+           {{file_path}}  — replaced with the file being modified\n\
+           {{test_cmd}}   — replaced with the detected test command\n\n\
+         Fix prompt REQUIRED placeholders (copy these literally):\n\
+           {{context}}    — replaced with MR context sections\n\
+           {{original}}   — replaced with the original code being fixed\n\
+           {{suggestion}} — replaced with the suggested replacement code\n\
+           {{test_cmd}}   — replaced with the test command\n\n\
+         Retry prompt REQUIRED placeholders (copy these literally):\n\
+           {{context}}    — replaced with error context\n\n\
+         If ANY placeholder is missing from your output, the variant is REJECTED.\n\
+         When in doubt, keep the placeholder exactly as-is from the parent prompt.\n\
+         ===== END PLACEHOLDER RULES =====\n\n\
+         Other rules:\n\
          - Agents MUST respond with commands, signals, or UNFIXABLE — never explanations\n\
          - Do NOT remove the core protocol (command/signal/UNFIXABLE response format)\n\n\
          ## Current parent prompt (generation {})\n\n\
@@ -309,10 +323,16 @@ fn build_mutation_user_prompt(
 
     format!(
         "Generate mutation {} of {} using this strategy:\n\n{}\n\n\
+         IMPORTANT: Your output MUST contain these exact placeholder strings:\n\
+         - Setup prompt: {{project}}, {{file_path}}, {{test_cmd}}\n\
+         - Fix prompt: {{context}}, {{original}}, {{suggestion}}, {{test_cmd}}\n\
+         - Retry prompt: {{context}}\n\
+         Copy them verbatim from the parent prompt. If you're unsure, keep the section \
+         identical to the parent and only change the parts you intend to mutate.\n\n\
          Respond in this EXACT format (no other text):\n\n\
-         SETUP_PROMPT:\n```\n<the full setup prompt template>\n```\n\n\
-         FIX_PROMPT:\n```\n<the full fix prompt template>\n```\n\n\
-         RETRY_PROMPT:\n```\n<the full retry prompt template>\n```\n\n\
+         SETUP_PROMPT:\n```\n<the full setup prompt template — MUST include {{project}}, {{file_path}}, {{test_cmd}}>\n```\n\n\
+         FIX_PROMPT:\n```\n<the full fix prompt template — MUST include {{context}}, {{original}}, {{suggestion}}, {{test_cmd}}>\n```\n\n\
+         RETRY_PROMPT:\n```\n<the full retry prompt template — MUST include {{context}}>\n```\n\n\
          PARAMS:\n\
          setup_temperature=<float>\n\
          setup_max_tokens=<int>\n\

@@ -1485,18 +1485,24 @@ fn infer_test_file(file_path: &str) -> String {
 
 /// Build the command to apply a code fix (replace original with suggestion).
 fn build_apply_command(file_path: &str, original: &str, suggestion: &str) -> String {
-    // Use python for reliable multi-line string replacement
-    let escaped_original = original.replace('\\', "\\\\").replace('\'', "\\'").replace('\n', "\\n");
-    let escaped_suggestion = suggestion.replace('\\', "\\\\").replace('\'', "\\'").replace('\n', "\\n");
+    // Use base64 encoding to avoid ALL shell/Python quoting issues.
+    // The old approach used escaped strings inside double-quoted Python,
+    // which broke on code containing double quotes, backslashes, or
+    // special characters (common in real-world code).
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let original_b64 = b64.encode(original.as_bytes());
+    let suggestion_b64 = b64.encode(suggestion.as_bytes());
+    let file_path_b64 = b64.encode(file_path.as_bytes());
 
     format!(
         r#"cd /workspace && python3 -c "
-import sys
-path = '{}'
+import base64, sys
+path = base64.b64decode('{}').decode()
+original = base64.b64decode('{}').decode()
+replacement = base64.b64decode('{}').decode()
 with open(path, 'r') as f:
     content = f.read()
-original = '{}'
-replacement = '{}'
 if original not in content:
     print('WARNING: original code not found, writing suggestion as patch')
     sys.exit(1)
@@ -1505,9 +1511,9 @@ with open(path, 'w') as f:
     f.write(content)
 print('Fix applied successfully')
 ""#,
-        file_path.replace('\'', "\\'"),
-        escaped_original,
-        escaped_suggestion,
+        file_path_b64,
+        original_b64,
+        suggestion_b64,
     )
 }
 
