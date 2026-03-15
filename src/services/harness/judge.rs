@@ -106,14 +106,20 @@ pub async fn generate_mutations(
                     .unwrap_or_default();
 
                 match parse_mutation_response(&text, parent, round, &used_ids, strategy) {
-                    Ok(variant) => {
+                    Ok(mut variant) => {
+                        // Repair any missing placeholders by splicing from parent.
+                        // This is the safety net — the AI often drops placeholders
+                        // despite heavy prompting. Rather than rejecting the variant,
+                        // we repair it and keep the AI's other improvements.
+                        repair_placeholders(&mut variant, parent);
+
                         let errors = validate_variant(&variant);
                         if errors.is_empty() {
                             used_ids.push(variant.id.clone());
                             variants.push(variant);
                         } else {
                             warn!(
-                                "judge produced invalid variant ({}): {:?}",
+                                "judge produced invalid variant after repair ({}): {:?}",
                                 strategy, errors
                             );
                             // Fall back to a param-only mutation
@@ -495,6 +501,103 @@ fn parse_analysis_response(text: &str) -> (String, Vec<String>) {
         .unwrap_or_default();
 
     (analysis, learnings)
+}
+
+// ---------------------------------------------------------------------------
+// Placeholder repair — the safety net for AI-generated mutations.
+//
+// The judge AI frequently drops template placeholders like {context},
+// {original}, {suggestion}, {test_cmd} when rewriting prompts, despite
+// heavy prompting to preserve them. Rather than rejecting these variants
+// (which wastes the AI's other improvements), we repair them by finding
+// the placeholder's surrounding context in the parent and splicing it
+// back into the mutated prompt.
+//
+// Strategy: for each missing placeholder, find the line in the parent
+// that contains it, then append that line (or a minimal block) to the
+// mutated prompt. This preserves the AI's structural changes while
+// ensuring the template still works at runtime.
+// ---------------------------------------------------------------------------
+
+/// Repair missing placeholders in a mutated variant by splicing from parent.
+fn repair_placeholders(variant: &mut PromptVariant, parent: &PromptVariant) {
+    // Setup prompt: {project}, {file_path}, {test_cmd}
+    let setup_placeholders = ["{project}", "{file_path}", "{test_cmd}"];
+    variant.setup_prompt = repair_prompt(
+        &variant.setup_prompt,
+        &parent.setup_prompt,
+        &setup_placeholders,
+    );
+
+    // Fix prompt: {context}, {original}, {suggestion}, {test_cmd}
+    let fix_placeholders = ["{context}", "{original}", "{suggestion}", "{test_cmd}"];
+    variant.fix_prompt = repair_prompt(
+        &variant.fix_prompt,
+        &parent.fix_prompt,
+        &fix_placeholders,
+    );
+
+    // Retry prompt: {context}
+    let retry_placeholders = ["{context}"];
+    variant.retry_prompt = repair_prompt(
+        &variant.retry_prompt,
+        &parent.retry_prompt,
+        &retry_placeholders,
+    );
+}
+
+/// Repair a single prompt template by splicing missing placeholders from parent.
+///
+/// For each missing placeholder:
+///   1. Find the block of lines in the parent that contain it (the line itself
+///      plus up to 2 lines of surrounding context)
+///   2. Append that block to the mutated prompt
+///
+/// This is intentionally conservative — it appends rather than trying to
+/// insert at the "right" position, because a working prompt with a slightly
+/// awkward structure beats a broken template every time.
+fn repair_prompt(mutated: &str, parent: &str, placeholders: &[&str]) -> String {
+    let mut result = mutated.to_string();
+
+    for ph in placeholders {
+        if result.contains(ph) {
+            continue; // Already present, no repair needed
+        }
+
+        // Find the block in parent containing this placeholder
+        let parent_lines: Vec<&str> = parent.lines().collect();
+        let mut block_lines: Vec<&str> = Vec::new();
+
+        for (i, line) in parent_lines.iter().enumerate() {
+            if line.contains(ph) {
+                // Take the line with the placeholder, plus 1 line before for context
+                if i > 0 && !parent_lines[i - 1].trim().is_empty() {
+                    block_lines.push(parent_lines[i - 1]);
+                }
+                block_lines.push(line);
+                // If the next line is a continuation (e.g. ``` fence), include it
+                if i + 1 < parent_lines.len() {
+                    let next = parent_lines[i + 1].trim();
+                    if next == "```" || next.starts_with("```") {
+                        block_lines.push(parent_lines[i + 1]);
+                    }
+                }
+                break;
+            }
+        }
+
+        if !block_lines.is_empty() {
+            // Append the repaired block
+            result.push_str("\n\n");
+            for line in &block_lines {
+                result.push_str(line);
+                result.push('\n');
+            }
+            result = result.trim_end().to_string();
+        }
+    }
+
+    result
 }
 
 // ---------------------------------------------------------------------------

@@ -433,6 +433,55 @@ pub async fn post_mr_note(
         .map_err(|e| GitLabError::Parse(e.to_string()))
 }
 
+/// Reply to a specific discussion thread on a merge request.
+/// This keeps the fix notification contextual — it appears as a reply
+/// to the original review comment rather than a disconnected top-level note.
+pub async fn reply_to_discussion(
+    cfg: &GitLabConfig,
+    project_id: i64,
+    mr_iid: u64,
+    discussion_id: &str,
+    body: &str,
+) -> Result<Note, GitLabError> {
+    let url = format!(
+        "{}/api/v4/projects/{}/merge_requests/{}/discussions/{}/notes",
+        cfg.base_url, project_id, mr_iid, discussion_id
+    );
+    let client = build_client();
+
+    let resp = client
+        .post(&url)
+        .headers(auth_headers(&cfg.token))
+        .json(&serde_json::json!({ "body": body }))
+        .send()
+        .await
+        .map_err(|e| GitLabError::Network(e.to_string()))?;
+
+    let resp = check_response(resp, "reply_to_discussion").await?;
+    resp.json()
+        .await
+        .map_err(|e| GitLabError::Parse(e.to_string()))
+}
+
+/// Find the discussion ID that contains a specific note (comment) ID.
+/// Returns None if the note isn't found in any discussion.
+pub async fn find_discussion_for_note(
+    cfg: &GitLabConfig,
+    project_id: i64,
+    mr_iid: u64,
+    note_id: i64,
+) -> Result<Option<String>, GitLabError> {
+    let discussions = fetch_mr_discussions(cfg, project_id, mr_iid).await?;
+    for discussion in &discussions {
+        for note in &discussion.notes {
+            if note.id == note_id {
+                return Ok(Some(discussion.id.clone()));
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// Trigger a pipeline on a branch with optional variables.
 pub async fn create_pipeline(
     cfg: &GitLabConfig,

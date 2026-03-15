@@ -297,7 +297,7 @@ impl SandboxManager {
         let container_env = build_container_env(&detection.lang);
 
         let container_id = match self
-            .create_container(&container_name, &base_image, memory_limit, cpu_quota, &container_env)
+            .create_container(&container_name, &base_image, memory_limit, cpu_quota, &container_env, &detection.lang)
             .await
         {
             Ok(id) => id,
@@ -1287,6 +1287,7 @@ else:
         memory_limit: i64,
         cpu_quota: i64,
         env: &[String],
+        lang: &crate::services::sandbox::detector::ProjectLang,
     ) -> Result<String, String> {
         // Pull image if not present
         let _ = self.docker
@@ -1306,6 +1307,7 @@ else:
             memory_swap: Some(memory_limit), // no swap
             cpu_period: Some(100_000),
             cpu_quota: Some(cpu_quota),
+            binds: Some(build_cache_volumes(lang)),
             ..Default::default()
         };
 
@@ -1495,6 +1497,69 @@ fn strip_markdown_fences(s: &str) -> String {
 // ---------------------------------------------------------------------------
 // Command builders
 // ---------------------------------------------------------------------------
+
+/// Build Docker bind-mount volumes for shared package caches.
+///
+/// These named volumes persist across container lifecycles, so the second
+/// container to build a Go project reuses the module cache from the first.
+/// This cuts `go mod download` / `bundle install` / `npm ci` from minutes
+/// to seconds on repeat runs.
+///
+/// Uses Docker named volumes (not host paths) so they work on any host OS
+/// and are automatically managed by Docker.
+fn build_cache_volumes(lang: &crate::services::sandbox::detector::ProjectLang) -> Vec<String> {
+    use crate::services::sandbox::detector::ProjectLang;
+
+    let mut vols = Vec::new();
+
+    match lang {
+        ProjectLang::Go => {
+            // Go module cache + build cache
+            vols.push("botto-cache-gomod:/root/go/pkg/mod".to_string());
+            vols.push("botto-cache-gobuild:/root/.cache/go-build".to_string());
+        }
+        ProjectLang::Ruby => {
+            // Bundler gem cache (not the install dir — that's image-specific)
+            vols.push("botto-cache-bundle:/usr/local/bundle/cache".to_string());
+        }
+        ProjectLang::Node => {
+            // npm/yarn/pnpm caches
+            vols.push("botto-cache-npm:/root/.npm".to_string());
+            vols.push("botto-cache-yarn:/root/.cache/yarn".to_string());
+            vols.push("botto-cache-pnpm:/root/.local/share/pnpm/store".to_string());
+        }
+        ProjectLang::Python => {
+            // pip download cache
+            vols.push("botto-cache-pip:/root/.cache/pip".to_string());
+        }
+        ProjectLang::Rust => {
+            // Cargo registry + git cache (not target/ — that's project-specific)
+            vols.push("botto-cache-cargo-registry:/usr/local/cargo/registry".to_string());
+            vols.push("botto-cache-cargo-git:/usr/local/cargo/git".to_string());
+        }
+        ProjectLang::Java | ProjectLang::Scala | ProjectLang::Clojure => {
+            // Maven/Gradle local repository
+            vols.push("botto-cache-maven:/root/.m2/repository".to_string());
+            vols.push("botto-cache-gradle:/root/.gradle/caches".to_string());
+        }
+        ProjectLang::DotNet => {
+            // NuGet package cache
+            vols.push("botto-cache-nuget:/root/.nuget/packages".to_string());
+        }
+        ProjectLang::Elixir => {
+            // Hex + Mix cache
+            vols.push("botto-cache-hex:/root/.hex".to_string());
+            vols.push("botto-cache-mix:/root/.mix".to_string());
+        }
+        ProjectLang::Php => {
+            // Composer cache
+            vols.push("botto-cache-composer:/root/.composer/cache".to_string());
+        }
+        _ => {}
+    }
+
+    vols
+}
 
 /// Build container environment variables based on detected language.
 /// These persist across all `exec_in_container` calls, preventing the AI

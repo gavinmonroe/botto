@@ -444,7 +444,8 @@ pub async fn handle_fix_request(
             let result = mgr.run_fix(req).await;
 
             // Post a GitLab MR comment on successful fix with commit link.
-            // This gives visibility to all MR participants, not just Otto users.
+            // Try to reply to the original review discussion thread for context.
+            // Falls back to a top-level MR note if the discussion can't be found.
             if result.success {
                 if let Some(ref sha) = result.commit_sha {
                     let comment_body = format!(
@@ -454,10 +455,40 @@ pub async fn handle_fix_request(
                         sha,
                     );
                     if let Some(pid) = project_id {
-                        if let Err(e) = crate::services::gitlab::client::post_mr_note(
-                            &gl_cfg, pid, mr_iid, &comment_body,
-                        ).await {
-                            tracing::warn!("failed to post fix comment on MR: {}", e);
+                        // Try to find the discussion thread for the original comment
+                        let note_id: Option<i64> = comment_id.parse().ok();
+                        let mut posted = false;
+
+                        if let Some(nid) = note_id {
+                            match crate::services::gitlab::client::find_discussion_for_note(
+                                &gl_cfg, pid, mr_iid, nid,
+                            ).await {
+                                Ok(Some(discussion_id)) => {
+                                    match crate::services::gitlab::client::reply_to_discussion(
+                                        &gl_cfg, pid, mr_iid, &discussion_id, &comment_body,
+                                    ).await {
+                                        Ok(_) => { posted = true; }
+                                        Err(e) => {
+                                            tracing::warn!("failed to reply to discussion: {}", e);
+                                        }
+                                    }
+                                }
+                                Ok(None) => {
+                                    tracing::debug!("discussion not found for note {}, falling back to top-level", nid);
+                                }
+                                Err(e) => {
+                                    tracing::warn!("failed to find discussion for note: {}", e);
+                                }
+                            }
+                        }
+
+                        // Fallback: post as top-level note
+                        if !posted {
+                            if let Err(e) = crate::services::gitlab::client::post_mr_note(
+                                &gl_cfg, pid, mr_iid, &comment_body,
+                            ).await {
+                                tracing::warn!("failed to post fix comment on MR: {}", e);
+                            }
                         }
                     }
                 }
