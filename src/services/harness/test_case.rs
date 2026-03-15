@@ -356,6 +356,17 @@ pub async fn discover_from_gitlab(
                 continue;
             }
 
+            // Skip monorepos and massive projects that take too long to clone.
+            // Even with --depth=1, gitlab-org/gitlab is ~3GB and takes 5+ minutes.
+            // With 4 containers cloning simultaneously, this saturates the network.
+            if is_too_large_to_clone(&project.path_with_namespace) {
+                info!(
+                    "harness: skipping {}!{} — repo too large to clone in sandbox",
+                    project.path_with_namespace, mr.iid,
+                );
+                continue;
+            }
+
             // Prefer fast-build languages (Go, Python, JS/TS, Ruby) over slow ones (Rust, Java, C++)
             // Rust cargo builds take 5+ minutes in Docker, eating the whole timeout.
             let dominant_lang = dominant_language(&mr_context.diff_files);
@@ -668,6 +679,31 @@ fn dominant_language(diff_files: &[DiffFileData]) -> String {
 /// Languages with slow build/compile times that eat the sandbox timeout.
 fn is_slow_build_language(lang: &str) -> bool {
     matches!(lang, "rust" | "java" | "c" | "cpp" | "csharp" | "scala" | "kotlin")
+}
+
+/// Check if a project is too large to clone in a sandbox container.
+/// Even with --depth=1, monorepos like gitlab-org/gitlab are multi-GB
+/// and take 5+ minutes to clone. With multiple containers cloning
+/// simultaneously, this saturates network and causes timeouts.
+fn is_too_large_to_clone(project_path: &str) -> bool {
+    // Known monorepos / very large repos that are impractical to clone
+    // in ephemeral containers with limited time budgets.
+    let blocklist = [
+        "gitlab-org/gitlab",           // ~3GB shallow clone
+        "gitlab-org/gitaly",           // large Go monorepo
+        "gitlab-org/omnibus-gitlab",   // large packaging repo
+        "gitlab-org/charts",           // large Helm charts
+    ];
+
+    // Exact match or the path starts with a blocked prefix followed by /
+    // (to catch gitlab-org/gitlab but not gitlab-org/gitlab-runner)
+    for blocked in &blocklist {
+        if project_path == *blocked {
+            return true;
+        }
+    }
+
+    false
 }
 
 // ---------------------------------------------------------------------------
