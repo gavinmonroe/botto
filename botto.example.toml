@@ -1,0 +1,52 @@
+# =============================================================================
+# Botto configuration — all fields are optional.
+# Environment variables override file values:
+#   BOTTO_API_KEY, BOTTO_GITLAB_TOKEN, BOTTO_GITLAB_URL,
+#   BOTTO_AI_KEY, BOTTO_AI_URL, BOTTO_WEBHOOK_SECRET
+# =============================================================================
+
+[server]
+host = "0.0.0.0"
+port = 7700
+
+[auth]
+# Shared secret that Otto extensions use to authenticate.
+# Generate with: openssl rand -hex 32
+api_key = ""
+
+[gitlab]
+url = "https://gitlab.com"
+# Bot account PAT — needs read_api + write_repository (for sandbox push).
+bot_token = ""
+# Webhook secret — must match the token configured in GitLab webhook settings.
+# webhook_secret = ""
+
+[ai]
+# OpenAI-compatible endpoint (e.g., OpenRouter, local vLLM, Anthropic proxy).
+base_url = ""
+api_key = ""
+
+# Per-task model overrides. Defaults shown below.
+# [ai.models]
+# summary = "claude-sonnet-4-5"
+# code_review = "claude-sonnet-4-5"
+# edge_cases = "claude-sonnet-4-5"
+# related_files = "claude-haiku-4-5"
+# follow_up = "claude-sonnet-4-5"
+# chat = "claude-sonnet-4-5"
+# ac_validation = "claude-sonnet-4-5"
+# adversarial_tests = "claude-sonnet-4-5"
+# contracts = "claude-sonnet-4-5"
+# behavioral_delta = "claude-sonnet-4-5"
+
+[sandbox]
+# Auto-detected from Docker availability. Override to force on/off.
+# enabled = true
+# max_concurrent = 2        # auto-detected from CPU cores
+# timeout_seconds = 300
+# max_memory_mb = 2048      # auto-detected from system memory
+# max_disk_mb = 4096
+
+[cache]
+# review_ttl_days = 7
+# max_cached_reviews = 500  # per project

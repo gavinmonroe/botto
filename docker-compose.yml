@@ -1,0 +1,27 @@
+version: "3.8"
+
+services:
+  botto:
+    build: .
+    ports:
+      - "7700:7700"
+    volumes:
+      - botto-data:/data
+      - /var/run/docker.sock:/var/run/docker.sock  # Required for sandbox feature
+    environment:
+      - BOTTO_API_KEY=${BOTTO_API_KEY}
+      - BOTTO_GITLAB_TOKEN=${BOTTO_GITLAB_TOKEN}
+      - BOTTO_GITLAB_URL=${BOTTO_GITLAB_URL:-https://gitlab.com}
+      - BOTTO_AI_KEY=${BOTTO_AI_KEY}
+      - BOTTO_AI_URL=${BOTTO_AI_URL}
+      - BOTTO_WEBHOOK_SECRET=${BOTTO_WEBHOOK_SECRET:-}
+      - RUST_LOG=botto=info,tower_http=info
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7700/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  botto-data:

@@ -1,0 +1,61 @@
+[package]
+name = "botto"
+version = "0.1.0"
+edition = "2024"
+description = "Shared orchestration backend for Otto Chrome extensions"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP server + WebSocket
+axum = { version = "0.8", features = ["ws"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+
+# HTTP client (GitLab API, AI API)
+reqwest = { version = "0.12", features = ["json", "stream", "gzip"] }
+reqwest-eventsource = "0.6"
+
+# Database
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Docker API
+bollard = "0.18"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Utilities
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+flate2 = "1"
+dashmap = "6"
+sysinfo = "0.33"
+urlencoding = "2"
+base64 = "0.22"
+
+# Async utilities
+futures = "0.3"
+tokio-stream = "0.1"
+tokio-util = "0.7"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+
+[dev-dependencies]
+tokio-tungstenite = "0.28"
