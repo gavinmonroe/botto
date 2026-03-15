@@ -1,6 +1,7 @@
 pub mod ai;
 pub mod events;
 pub mod gitlab;
+pub mod harness;
 pub mod queue;
 pub mod review;
 pub mod sandbox;

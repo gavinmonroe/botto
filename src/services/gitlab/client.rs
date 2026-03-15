@@ -462,6 +462,76 @@ pub async fn get_pipeline(
     .await
 }
 
+/// Fetch merge requests at the group level (across all projects in the group).
+/// This maps to: https://gitlab.com/groups/gitlab-org/-/merge_requests
+/// Used by harness to pick random MRs from the entire org.
+pub async fn fetch_group_merge_requests(
+    cfg: &GitLabConfig,
+    group_path: &str,
+    state: &str,
+    per_page: usize,
+    page: usize,
+) -> Result<Vec<MergeRequest>, GitLabError> {
+    let encoded = encode_project_path(group_path);
+    let per_page_str = per_page.to_string();
+    let page_str = page.to_string();
+    get_json(
+        cfg,
+        &format!("/groups/{}/merge_requests", encoded),
+        &[
+            ("state", state),
+            ("order_by", "updated_at"),
+            ("sort", "desc"),
+            ("per_page", &per_page_str),
+            ("page", &page_str),
+        ],
+    )
+    .await
+}
+
+/// Fetch projects under a group (for harness MR discovery).
+/// Returns up to `max_pages` pages of projects, sorted by activity.
+pub async fn fetch_group_projects(
+    cfg: &GitLabConfig,
+    group_path: &str,
+    max_pages: usize,
+) -> Result<Vec<Project>, GitLabError> {
+    let encoded = encode_project_path(group_path);
+    get_all_pages(
+        cfg,
+        &format!("/groups/{}/projects", encoded),
+        &[
+            ("order_by", "last_activity_at"),
+            ("sort", "desc"),
+            ("with_merge_requests_enabled", "true"),
+            ("simple", "true"),
+        ],
+        max_pages,
+    )
+    .await
+}
+
+/// Fetch merged MRs for a project with discussion stats.
+/// Used by harness to find MRs with review comments.
+pub async fn fetch_merged_mrs_with_discussions(
+    cfg: &GitLabConfig,
+    project_id: i64,
+    limit: usize,
+) -> Result<Vec<MergeRequest>, GitLabError> {
+    let limit_str = limit.to_string();
+    get_json::<Vec<MergeRequest>>(
+        cfg,
+        &format!("/projects/{}/merge_requests", project_id),
+        &[
+            ("state", "merged"),
+            ("order_by", "updated_at"),
+            ("sort", "desc"),
+            ("per_page", &limit_str),
+        ],
+    )
+    .await
+}
+
 // ---------------------------------------------------------------------------
 // Response types — only the fields we need, serde ignores the rest.
 // ---------------------------------------------------------------------------

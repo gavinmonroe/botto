@@ -23,6 +23,7 @@ pub struct BottoConfig {
     pub ai: AiConfig,
     pub sandbox: SandboxConfig,
     pub cache: CacheConfig,
+    pub harness: HarnessConfig,
     pub data_dir: PathBuf,
 }
 
@@ -107,6 +108,25 @@ pub struct CacheConfig {
     pub max_cached_reviews: u32,
 }
 
+#[derive(Debug, Clone)]
+pub struct HarnessConfig {
+    pub enabled: bool,
+    /// Max evolution rounds per run.
+    pub max_rounds: u32,
+    /// Number of prompt variants to test per round.
+    pub variants_per_round: u32,
+    /// Max concurrent sandbox instances for harness runs.
+    pub concurrency: u32,
+    /// Number of test cases to run each variant against.
+    pub test_cases: u32,
+    /// Seed GitLab orgs/groups to discover MRs from.
+    pub gitlab_seed_orgs: Vec<String>,
+    /// Directory for harness memory (prompts, learnings, test cases).
+    pub memory_dir: PathBuf,
+    /// Model to use for the judge AI.
+    pub judge_model: String,
+}
+
 // ---------------------------------------------------------------------------
 // TOML file schema (optional fields — everything has defaults)
 // ---------------------------------------------------------------------------
@@ -119,6 +139,7 @@ struct TomlConfig {
     ai: Option<TomlAi>,
     sandbox: Option<TomlSandbox>,
     cache: Option<TomlCache>,
+    harness: Option<TomlHarness>,
 }
 
 #[derive(Deserialize, Default)]
@@ -176,6 +197,18 @@ struct TomlSandbox {
 struct TomlCache {
     review_ttl_days: Option<u32>,
     max_cached_reviews: Option<u32>,
+}
+
+#[derive(Deserialize, Default)]
+struct TomlHarness {
+    enabled: Option<bool>,
+    max_rounds: Option<u32>,
+    variants_per_round: Option<u32>,
+    concurrency: Option<u32>,
+    test_cases: Option<u32>,
+    gitlab_seed_orgs: Option<Vec<String>>,
+    memory_dir: Option<String>,
+    judge_model: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -249,6 +282,7 @@ pub async fn load(config_path: &Option<PathBuf>, data_dir: &Path) -> Result<Bott
     let toml_ai = toml_cfg.ai.unwrap_or_default();
     let toml_sandbox = toml_cfg.sandbox.unwrap_or_default();
     let toml_cache = toml_cfg.cache.unwrap_or_default();
+    let toml_harness = toml_cfg.harness.unwrap_or_default();
     let toml_models = toml_ai.models.unwrap_or_default();
     let default_models = AiModelConfig::default();
 
@@ -315,6 +349,20 @@ pub async fn load(config_path: &Option<PathBuf>, data_dir: &Path) -> Result<Bott
         cache: CacheConfig {
             review_ttl_days: toml_cache.review_ttl_days.unwrap_or(7),
             max_cached_reviews: toml_cache.max_cached_reviews.unwrap_or(500),
+        },
+        harness: HarnessConfig {
+            enabled: toml_harness.enabled.unwrap_or(false),
+            max_rounds: toml_harness.max_rounds.unwrap_or(10),
+            variants_per_round: toml_harness.variants_per_round.unwrap_or(4),
+            concurrency: toml_harness.concurrency.unwrap_or(3),
+            test_cases: toml_harness.test_cases.unwrap_or(5),
+            gitlab_seed_orgs: toml_harness.gitlab_seed_orgs.unwrap_or_else(|| {
+                vec!["gitlab-org".into()]
+            }),
+            memory_dir: PathBuf::from(
+                toml_harness.memory_dir.unwrap_or_else(|| "harness".into()),
+            ),
+            judge_model: toml_harness.judge_model.unwrap_or_else(|| "claude-opus-4-6".into()),
         },
         data_dir: data_dir.to_path_buf(),
     })

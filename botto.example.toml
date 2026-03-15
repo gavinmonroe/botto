@@ -50,3 +50,14 @@ api_key = ""
 [cache]
 # review_ttl_days = 7
 # max_cached_reviews = 500  # per project
+
+[harness]
+# Self-evolving prompt engineering harness. Disabled by default.
+# enabled = false
+# max_rounds = 10             # evolution rounds per run
+# variants_per_round = 4      # prompt variants tested per round
+# concurrency = 3             # parallel sandbox instances
+# test_cases = 5              # test cases per variant
+# gitlab_seed_orgs = ["gitlab-org"]
+# memory_dir = "harness"      # directory for prompts, learnings, test cases
+# judge_model = "claude-opus-4-6"

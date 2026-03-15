@@ -22,6 +22,8 @@ use crate::services::ai::client::{
     self as ai_client, AiClientConfig, ChatCompletionRequest, ChatMessage,
 };
 use crate::services::events::{Event, EventBus, EventType};
+use crate::services::harness::prompts::SandboxPrompts;
+use crate::services::harness::types::{ConversationEntry, IterationBreakdown};
 use crate::services::sandbox::detector::{self, FixStrategy};
 use crate::types::state::MrRef;
 use bollard::container::{
@@ -34,11 +36,45 @@ use futures::StreamExt;
 use serde_json::json;
 use sqlx::SqlitePool;
 use std::sync::Arc;
-use tokio::sync::Semaphore;
+use tokio::sync::{Mutex, Semaphore};
 use tracing::{debug, info, warn};
 
 /// Default sandbox timeout — 30 minutes for the full pipeline.
 const DEFAULT_SANDBOX_TIMEOUT_SECS: u64 = 1800;
+
+/// Telemetry collector for harness runs. Zero-cost when None.
+/// The sandbox manager writes to this during agent loops so the harness
+/// runner can read iteration counts and conversation logs after the run.
+pub struct HarnessTelemetry {
+    pub setup_steps: std::sync::atomic::AtomicU32,
+    pub fix_steps: std::sync::atomic::AtomicU32,
+    pub retry_steps: std::sync::atomic::AtomicU32,
+    pub conversation_log: Mutex<Vec<ConversationEntry>>,
+}
+
+impl HarnessTelemetry {
+    pub fn new() -> Self {
+        Self {
+            setup_steps: std::sync::atomic::AtomicU32::new(0),
+            fix_steps: std::sync::atomic::AtomicU32::new(0),
+            retry_steps: std::sync::atomic::AtomicU32::new(0),
+            conversation_log: Mutex::new(Vec::new()),
+        }
+    }
+
+    pub fn iteration_breakdown(&self) -> IterationBreakdown {
+        IterationBreakdown {
+            setup_steps: self.setup_steps.load(std::sync::atomic::Ordering::Relaxed),
+            fix_steps: self.fix_steps.load(std::sync::atomic::Ordering::Relaxed),
+            retry_steps: self.retry_steps.load(std::sync::atomic::Ordering::Relaxed),
+        }
+    }
+
+    pub fn total_steps(&self) -> u32 {
+        let b = self.iteration_breakdown();
+        b.setup_steps + b.fix_steps + b.retry_steps
+    }
+}
 
 /// Manages sandbox container lifecycle with concurrency control.
 pub struct SandboxManager {
@@ -50,6 +86,12 @@ pub struct SandboxManager {
     semaphore: Semaphore,
     /// Broadcast function for sending progress to connected Ottos.
     broadcaster: Arc<dyn Fn(&MrRef, &str) + Send + Sync>,
+    /// Injectable prompt templates + code params. Defaults to production prompts.
+    prompts: SandboxPrompts,
+    /// When true, skip git push (used by harness runs).
+    harness_mode: bool,
+    /// Optional telemetry collector for harness runs.
+    telemetry: Option<Arc<HarnessTelemetry>>,
 }
 
 /// Input for a fix request.
@@ -100,6 +142,20 @@ impl SandboxManager {
         event_bus: EventBus,
         broadcaster: Arc<dyn Fn(&MrRef, &str) + Send + Sync>,
     ) -> Option<Self> {
+        Self::with_prompts(cfg, pool, event_bus, broadcaster, SandboxPrompts::default(), false, None)
+    }
+
+    /// Create a sandbox manager with custom prompts and optional harness mode.
+    /// Used by the harness runner to inject prompt variants and disable push.
+    pub fn with_prompts(
+        cfg: BottoConfig,
+        pool: SqlitePool,
+        event_bus: EventBus,
+        broadcaster: Arc<dyn Fn(&MrRef, &str) + Send + Sync>,
+        prompts: SandboxPrompts,
+        harness_mode: bool,
+        telemetry: Option<Arc<HarnessTelemetry>>,
+    ) -> Option<Self> {
         if !cfg.sandbox.enabled {
             return None;
         }
@@ -119,6 +175,9 @@ impl SandboxManager {
             docker,
             event_bus,
             broadcaster,
+            prompts,
+            harness_mode,
+            telemetry,
         })
     }
 
@@ -300,7 +359,14 @@ impl SandboxManager {
         strategy: &FixStrategy,
         mr_ref: &MrRef,
     ) -> FixResult {
-        let timeout = std::time::Duration::from_secs(self.cfg.sandbox.timeout_seconds);
+        // Harness runs get 25 minutes — real projects (Rust, Java) need time
+        // for cargo check, mvn compile, etc. Production uses the configured timeout.
+        let timeout_secs = if self.harness_mode {
+            1500 // 25 minutes
+        } else {
+            self.cfg.sandbox.timeout_seconds
+        };
+        let timeout = std::time::Duration::from_secs(timeout_secs);
         let deadline = tokio::time::Instant::now() + timeout;
 
         // Step 0: Ensure git, python3, and CA certificates are available.
@@ -357,27 +423,12 @@ impl SandboxManager {
 
             let setup_system = ChatMessage {
                 role: "system".into(),
-                content: Some(format!(
-                    "You are a senior DevOps engineer setting up a project inside a Docker container.\n\
-                     The repo has been cloned to /workspace. Your job is to get the project ready to run tests.\n\n\
-                     Project: {project}\n\
-                     File being modified: {file_path}\n\
-                     Detected test command: `{test_cmd}`\n\n\
-                     Steps you should take:\n\
-                     1. Read the project structure (ls, cat package.json / Gemfile / requirements.txt / etc.)\n\
-                     2. Install the correct runtime and dependencies\n\
-                     3. Set up any required environment (env vars, configs, databases, etc.)\n\
-                     4. Verify the test infrastructure works\n\n\
-                     On each turn, respond with ONE of:\n\
-                     - A shell command to run\n\
-                     - `SETUP_DONE` — when the environment is ready for testing\n\
-                     - `UNFIXABLE` — if the project cannot be set up in this container\n\n\
-                     Do NOT run the full test suite yet. Just get the environment ready.\n\
-                     Do NOT respond with explanations — only a command, SETUP_DONE, or UNFIXABLE.",
-                    project = req.project_path,
-                    file_path = req.file_path,
-                    test_cmd = test_cmd_preview,
-                )),
+                content: Some(
+                    self.prompts.setup_system
+                        .replace("{project}", &req.project_path)
+                        .replace("{file_path}", &req.file_path)
+                        .replace("{test_cmd}", &test_cmd_preview),
+                ),
                 tool_calls: None,
                 tool_call_id: None,
             };
@@ -404,14 +455,17 @@ impl SandboxManager {
                 }
 
                 setup_step += 1;
+                if let Some(ref t) = self.telemetry {
+                    t.setup_steps.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 let detail = format!("AI setting up project (step {})...", setup_step);
                 self.send_progress(&req.job_id, &req.comment_id, mr_ref, "setting_up", &detail);
 
                 let ai_request = ChatCompletionRequest {
                     model: self.cfg.ai.models.fix.clone(),
                     messages: setup_messages.clone(),
-                    temperature: Some(0.1),
-                    max_tokens: Some(1000),
+                    temperature: Some(self.prompts.code_params.setup.temperature),
+                    max_tokens: Some(self.prompts.code_params.setup.max_tokens),
                     stream: None,
                     tools: None,
                     tool_choice: None,
@@ -478,9 +532,10 @@ impl SandboxManager {
                 });
 
                 // Trim history if too long
-                if setup_messages.len() > 42 {
+                if setup_messages.len() > self.prompts.code_params.history_trim_threshold as usize {
                     let system = setup_messages[0].clone();
-                    let recent: Vec<_> = setup_messages[setup_messages.len() - 40..].to_vec();
+                    let keep = self.prompts.code_params.history_keep_count as usize;
+                    let recent: Vec<_> = setup_messages[setup_messages.len() - keep..].to_vec();
                     setup_messages = std::iter::once(system).chain(recent).collect();
                 }
             }
@@ -576,26 +631,13 @@ impl SandboxManager {
 
             let system_msg = ChatMessage {
                 role: "system".into(),
-                content: Some(format!(
-                    "You are a senior software engineer autonomously fixing code inside a Docker container.\n\
-                     You have full shell access. The working directory is /workspace (the cloned repo).\n\n\
-                     {context}\n\n\
-                     ## Original code (being replaced)\n```\n{original}\n```\n\n\
-                     ## Suggested replacement\n```\n{suggestion}\n```\n\n\
-                     ## Test command\n`{test_cmd}`\n\n\
-                     The fix has already been applied to the file. Tests are failing.\n\
-                     Your goal: make the tests pass while addressing the review comment's concern.\n\n\
-                     You control the flow. On each turn, respond with ONE of:\n\
-                     1. A shell command to run (setup env, install deps, read files, edit code, investigate errors, etc.)\n\
-                     2. `RUN_TESTS` — when you're ready for me to run the test suite\n\
-                     3. `UNFIXABLE` — if you've determined the situation cannot be resolved\n\n\
-                     Take your time. Set up the environment first if needed. Investigate errors thoroughly.\n\
-                     Do NOT respond with explanations — only a command, RUN_TESTS, or UNFIXABLE.",
-                    context = context_sections.join("\n\n"),
-                    original = req.original_code,
-                    suggestion = current_suggestion,
-                    test_cmd = test_cmd,
-                )),
+                content: Some(
+                    self.prompts.fix_system
+                        .replace("{context}", &context_sections.join("\n\n"))
+                        .replace("{original}", &req.original_code)
+                        .replace("{suggestion}", &current_suggestion)
+                        .replace("{test_cmd}", &test_cmd),
+                ),
                 tool_calls: None,
                 tool_call_id: None,
             };
@@ -624,6 +666,9 @@ impl SandboxManager {
                 }
 
                 step_count += 1;
+                if let Some(ref t) = self.telemetry {
+                    t.fix_steps.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 let detail = format!("AI working on fix (step {})...", step_count);
                 self.send_progress(&req.job_id, &req.comment_id, mr_ref, "testing", &detail);
 
@@ -631,8 +676,8 @@ impl SandboxManager {
                 let ai_request = ChatCompletionRequest {
                     model: self.cfg.ai.models.fix.clone(),
                     messages: messages.clone(),
-                    temperature: Some(0.2),
-                    max_tokens: Some(2000),
+                    temperature: Some(self.prompts.code_params.fix.temperature),
+                    max_tokens: Some(self.prompts.code_params.fix.max_tokens),
                     stream: None,
                     tools: None,
                     tool_choice: None,
@@ -731,10 +776,11 @@ impl SandboxManager {
                     });
                 }
 
-                // Trim conversation history if it gets too long (keep system + last 40 messages)
-                if messages.len() > 42 {
+                // Trim conversation history if it gets too long
+                if messages.len() > self.prompts.code_params.history_trim_threshold as usize {
                     let system = messages[0].clone();
-                    let recent: Vec<_> = messages[messages.len() - 40..].to_vec();
+                    let keep = self.prompts.code_params.history_keep_count as usize;
+                    let recent: Vec<_> = messages[messages.len() - keep..].to_vec();
                     messages = std::iter::once(system).chain(recent).collect();
                 }
             }
@@ -751,8 +797,20 @@ impl SandboxManager {
         }
 
         // Step 5: Commit + push
+        // In harness mode, skip push entirely — we just care about test results.
         // Try git push first. If it fails (e.g., fork-based MR where bot can't
         // push), fall back to the GitLab Commits API.
+        if self.harness_mode {
+            info!("harness mode: skipping git push");
+            return FixResult {
+                job_id: req.job_id.clone(),
+                success: true,
+                commit_sha: None,
+                test_output: Some(test_output),
+                error: None,
+            };
+        }
+
         self.send_progress(&req.job_id, &req.comment_id, mr_ref, "pushing", "committing and pushing...");
         self.update_job_status(&req.job_id, "pushing").await;
 
@@ -918,15 +976,10 @@ impl SandboxManager {
 
                 let system_msg = ChatMessage {
                     role: "system".into(),
-                    content: Some(format!(
-                        "You are a DevOps expert fixing issues inside a Docker container during an automated code fix pipeline.\n\n\
-                         {}\n\n\
-                         When you identify a fix, respond with ONLY a single shell command (no explanation, no markdown fences).\n\
-                         The command must work non-interactively (use -y flags, no prompts).\n\
-                         If after reviewing the full history you determine the issue is truly unfixable from inside the container, \
-                         respond with exactly: UNFIXABLE",
-                        context_parts.join("\n"),
-                    )),
+                    content: Some(
+                        self.prompts.retry_system
+                            .replace("{context}", &context_parts.join("\n")),
+                    ),
                     tool_calls: None,
                     tool_call_id: None,
                 };
@@ -955,6 +1008,9 @@ impl SandboxManager {
                     }
 
                     step_count += 1;
+                    if let Some(ref t) = self.telemetry {
+                        t.retry_steps.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                     let detail = format!(
                         "AI fixing {} (step {})...",
                         step_name, step_count
@@ -970,8 +1026,8 @@ impl SandboxManager {
                     let ai_request = ChatCompletionRequest {
                         model: self.cfg.ai.models.fix.clone(),
                         messages: messages.clone(),
-                        temperature: Some(0.1),
-                        max_tokens: Some(500),
+                        temperature: Some(self.prompts.code_params.retry.temperature),
+                        max_tokens: Some(self.prompts.code_params.retry.max_tokens),
                         stream: None,
                         tools: None,
                         tool_choice: None,
@@ -1065,9 +1121,10 @@ impl SandboxManager {
                     });
 
                     // Trim conversation history if too long
-                    if messages.len() > 42 {
+                    if messages.len() > self.prompts.code_params.history_trim_threshold as usize {
                         let system = messages[0].clone();
-                        let recent: Vec<_> = messages[messages.len() - 40..].to_vec();
+                        let keep = self.prompts.code_params.history_keep_count as usize;
+                        let recent: Vec<_> = messages[messages.len() - keep..].to_vec();
                         messages = std::iter::once(system).chain(recent).collect();
                     }
                 }

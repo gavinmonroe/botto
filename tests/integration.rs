@@ -47,6 +47,16 @@ fn test_config(port: u16) -> BottoConfig {
             review_ttl_days: 7,
             max_cached_reviews: 100,
         },
+        harness: HarnessConfig {
+            enabled: false,
+            max_rounds: 1,
+            variants_per_round: 2,
+            concurrency: 1,
+            test_cases: 1,
+            gitlab_seed_orgs: vec![],
+            memory_dir: PathBuf::from("/tmp/harness"),
+            judge_model: "claude-opus-4-6".into(),
+        },
         data_dir: PathBuf::from("/tmp"),
     }
 }
