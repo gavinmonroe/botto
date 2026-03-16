@@ -20,6 +20,8 @@ Works with gitlab.com, self-hosted GitLab instances, and any OpenAI-compatible A
 - **No duplicate AI calls** — SQLite-backed, gzip-compressed, diff-hash-keyed cache eliminates redundant work
 - **Real-time sync** — comment actions, presence, review progress broadcast to all viewers via WebSocket
 - **Sandbox auto-fix** — Docker containers that clone the repo, apply a suggested fix, run tests, and push on success
+- **Follow-up fix** — fixes triggered from comment follow-up analysis, not just Botto review findings
+- **Admin settings page** — embedded web UI at `/admin` for live config changes (hot-swap, no restart needed for most settings)
 - **Self-evolving prompts** — built-in harness that autonomously improves sandbox fix prompts through evolution loops
 - **Priority queue** — reviews scored and executed in priority order, with pause/resume/cancel
 - **Works with any model** — OpenAI, Anthropic, Mistral, Ollama, or any OpenAI-compatible endpoint
@@ -310,7 +312,10 @@ max_concurrent = 2          # auto-detected from CPU cores
 timeout_seconds = 300
 max_memory_mb = 2048        # auto-detected from system memory
 max_disk_mb = 4096
+fix_branch_mode = "same_branch"  # "same_branch" or "new_branch"
 ```
+
+When `fix_branch_mode` is set to `"new_branch"`, Botto creates a dedicated branch (e.g., `botto/fix/mr-42-add-auth-abc123`) and opens a merge request targeting the original source branch, instead of pushing directly to the MR branch.
 
 ### Cache Configuration
 
@@ -336,6 +341,28 @@ judge_model = "claude-opus-4-6"
 
 See [botto.example.toml](botto.example.toml) for the full annotated config template.
 
+### Admin Settings Page
+
+Botto includes an embedded web UI for managing configuration at runtime. Access it at:
+
+```
+http://your-botto-host:7700/admin?key=YOUR_API_KEY
+```
+
+The page is protected by the same API key used for Otto WebSocket auth. In dev mode (empty API key), no key is needed.
+
+Settings are organized into collapsible sections: Server, Authentication, GitLab, AI, AI Models, Sandbox, Cache, and Harness. Changes are hot-swapped in memory and persisted to `botto.toml` immediately. Fields that require a server restart (host, port, concurrency limits) are marked with a badge.
+
+The admin API is also available programmatically:
+
+| Route | Method | Description |
+|-------|--------|-------------|
+| `/api/admin/config` | GET | Current config (secrets redacted) |
+| `/api/admin/config` | PUT | Update config (partial, hot-swap + persist) |
+| `/api/admin/status` | GET | Live server status (connections, reviews, Docker) |
+
+Secrets (API keys, tokens) are never returned in full — the GET response shows masked values like `••••xxxx`. Sending a masked value back in a PUT preserves the existing secret.
+
 ## Connecting Otto
 
 1. Open Otto settings (extension options page)
@@ -355,6 +382,10 @@ Or use auto-discovery: if Botto is accessible at the same domain as your GitLab 
 | `/ready` | GET | Readiness probe (DB + capabilities check) |
 | `/api/webhooks/gitlab` | POST | GitLab webhook receiver (MR, push, note events) |
 | `/.well-known/botto` | GET | Auto-discovery for Otto extensions |
+| `/admin` | GET | Admin settings page (API key protected) |
+| `/api/admin/config` | GET | Current config with redacted secrets |
+| `/api/admin/config` | PUT | Update config (hot-swap + persist to TOML) |
+| `/api/admin/status` | GET | Live server status |
 
 ## Architecture
 
@@ -431,7 +462,7 @@ Outbound (Botto → Otto):
 | Logging | tracing + tracing-subscriber (env-filter, JSON) |
 | CLI | clap 4 (derive) |
 | Error handling | anyhow + thiserror |
-| Concurrency | DashMap, tokio broadcast/watch/mpsc, Semaphore |
+| Concurrency | DashMap, tokio broadcast/watch/mpsc, Semaphore, arc-swap |
 | Compression | flate2 (gzip) |
 | SSE streaming | reqwest-eventsource + hand-rolled SSE parser |
 | System info | sysinfo 0.33 |
@@ -448,7 +479,8 @@ src/
 │   ├── ws.rs                       # WebSocket gateway (auth, multiplexing, presence)
 │   ├── health.rs                   # /health and /ready endpoints
 │   ├── webhooks.rs                 # GitLab webhook receiver (MR, push, note events)
-│   └── discovery.rs                # /.well-known/botto auto-discovery
+│   ├── discovery.rs                # /.well-known/botto auto-discovery
+│   └── admin.rs                    # Admin settings page + REST API (hot-swap config)
 ├── router/
 │   ├── mod.rs                      # Message dispatch (request/response + streaming)
 │   └── handlers.rs                 # 20+ request handlers
