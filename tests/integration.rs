@@ -42,6 +42,7 @@ fn test_config(port: u16) -> BottoConfig {
             timeout_seconds: 60,
             max_memory_mb: 512,
             max_disk_mb: 1024,
+            fix_branch_mode: botto::config::FixBranchMode::SameBranch,
         },
         cache: CacheConfig {
             review_ttl_days: 7,

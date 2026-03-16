@@ -1,0 +1,444 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Botto — Settings</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#0d1117;--surface:#161b22;--surface2:#21262d;
+  --border:#30363d;--text:#c9d1d9;--text2:#8b949e;
+  --primary:#58a6ff;--danger:#f78166;--success:#3fb950;
+  --input-bg:#0d1117;--radius:6px;--font:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;
+}
+@media(prefers-color-scheme:light){
+  :root{
+    --bg:#f6f8fa;--surface:#ffffff;--surface2:#f0f2f5;
+    --border:#d0d7de;--text:#1f2328;--text2:#656d76;
+    --primary:#0969da;--danger:#cf222e;--success:#1a7f37;
+    --input-bg:#ffffff;
+  }
+}
+body{font-family:var(--font);font-size:14px;color:var(--text);background:var(--bg);line-height:1.5}
+a{color:var(--primary);text-decoration:none}
+
+.wrap{max-width:720px;margin:0 auto;padding:24px 16px 64px}
+.top{display:flex;align-items:center;justify-content:space-between;margin-bottom:24px;padding-bottom:16px;border-bottom:1px solid var(--border)}
+.top h1{font-size:18px;font-weight:600}
+.top .ver{font-size:12px;color:var(--text2)}
+
+.status-bar{display:flex;gap:16px;font-size:12px;color:var(--text2);margin-bottom:20px;padding:8px 12px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius)}
+.status-bar .dot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:4px;vertical-align:middle}
+.dot-ok{background:var(--success)}.dot-off{background:var(--text2)}
+
+.section{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);margin-bottom:12px}
+.section-head{display:flex;align-items:center;justify-content:space-between;padding:10px 14px;cursor:pointer;user-select:none}
+.section-head h2{font-size:14px;font-weight:600}
+.section-head .arrow{font-size:11px;color:var(--text2);transition:transform .15s}
+.section.collapsed .section-body{display:none}
+.section.collapsed .arrow{transform:rotate(-90deg)}
+.section-body{padding:0 14px 14px;display:grid;grid-template-columns:1fr 1fr;gap:10px 16px}
+.section-body.single{grid-template-columns:1fr}
+
+.field{display:flex;flex-direction:column;gap:3px}
+.field.full{grid-column:1/-1}
+.field label{font-size:12px;font-weight:500;color:var(--text2)}
+.field .hint{font-size:11px;color:var(--text2);font-style:italic}
+.badge-restart{font-size:10px;color:var(--danger);border:1px solid var(--danger);border-radius:3px;padding:0 4px;margin-left:6px;font-weight:500}
+
+input,select{font-family:var(--font);font-size:13px;padding:6px 8px;background:var(--input-bg);color:var(--text);border:1px solid var(--border);border-radius:4px;outline:none;width:100%}
+input:focus,select:focus{border-color:var(--primary)}
+input[type="checkbox"]{width:auto;margin-right:4px}
+
+.check-row{display:flex;align-items:center;gap:4px;padding-top:4px}
+.check-row label{font-size:13px;color:var(--text);font-weight:400}
+
+.actions{display:flex;gap:8px;margin-top:16px}
+.btn{font-family:var(--font);font-size:13px;font-weight:500;padding:6px 14px;border-radius:var(--radius);cursor:pointer;border:1px solid var(--border);background:var(--surface);color:var(--text)}
+.btn:hover{background:var(--surface2)}
+.btn-primary{background:var(--primary);color:#fff;border-color:var(--primary)}
+.btn-primary:hover{opacity:.9}
+
+.toast{position:fixed;bottom:20px;right:20px;padding:8px 14px;border-radius:var(--radius);font-size:13px;color:#fff;opacity:0;transition:opacity .2s;pointer-events:none;z-index:100}
+.toast.show{opacity:1}
+.toast-ok{background:var(--success)}.toast-err{background:var(--danger)}
+
+.restart-banner{display:none;padding:8px 14px;margin-bottom:12px;background:var(--surface);border:1px solid var(--danger);border-radius:var(--radius);font-size:12px;color:var(--danger)}
+.restart-banner.show{display:block}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="top">
+    <h1>Botto Settings</h1>
+    <span class="ver" id="version"></span>
+  </div>
+
+  <div class="status-bar" id="status-bar"></div>
+  <div class="restart-banner" id="restart-banner">Some changes require a server restart to take effect.</div>
+
+  <form id="cfg-form" autocomplete="off">
+
+    <!-- Server -->
+    <div class="section" id="sec-server">
+      <div class="section-head" onclick="toggle('sec-server')">
+        <h2>Server</h2><span class="arrow">▼</span>
+      </div>
+      <div class="section-body">
+        <div class="field">
+          <label>Host <span class="badge-restart">restart</span></label>
+          <input name="server.host" id="server.host">
+        </div>
+        <div class="field">
+          <label>Port <span class="badge-restart">restart</span></label>
+          <input name="server.port" id="server.port" type="number">
+        </div>
+        <div class="field">
+          <label>Max concurrent reviews <span class="badge-restart">restart</span></label>
+          <input name="server.max_concurrent_reviews" id="server.max_concurrent_reviews" type="number">
+        </div>
+        <div class="field">
+          <label>Max concurrent AI calls <span class="badge-restart">restart</span></label>
+          <input name="server.max_concurrent_ai_calls" id="server.max_concurrent_ai_calls" type="number">
+        </div>
+      </div>
+    </div>
+
+    <!-- Auth -->
+    <div class="section" id="sec-auth">
+      <div class="section-head" onclick="toggle('sec-auth')">
+        <h2>Authentication</h2><span class="arrow">▼</span>
+      </div>
+      <div class="section-body single">
+        <div class="field">
+          <label>API key</label>
+          <input name="auth.api_key" id="auth.api_key" type="password">
+          <span class="hint">Shared secret for Otto extensions. Leave empty for dev mode (no auth).</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- GitLab -->
+    <div class="section" id="sec-gitlab">
+      <div class="section-head" onclick="toggle('sec-gitlab')">
+        <h2>GitLab</h2><span class="arrow">▼</span>
+      </div>
+      <div class="section-body">
+        <div class="field full">
+          <label>URL</label>
+          <input name="gitlab.url" id="gitlab.url" placeholder="https://gitlab.com">
+        </div>
+        <div class="field">
+          <label>Bot token</label>
+          <input name="gitlab.bot_token" id="gitlab.bot_token" type="password">
+        </div>
+        <div class="field">
+          <label>Webhook secret</label>
+          <input name="gitlab.webhook_secret" id="gitlab.webhook_secret" type="password">
+        </div>
+      </div>
+    </div>
+
+    <!-- AI -->
+    <div class="section" id="sec-ai">
+      <div class="section-head" onclick="toggle('sec-ai')">
+        <h2>AI</h2><span class="arrow">▼</span>
+      </div>
+      <div class="section-body">
+        <div class="field full">
+          <label>Base URL</label>
+          <input name="ai.base_url" id="ai.base_url" placeholder="https://api.openai.com/v1">
+        </div>
+        <div class="field full">
+          <label>API key</label>
+          <input name="ai.api_key" id="ai.api_key" type="password">
+        </div>
+      </div>
+    </div>
+
+    <!-- AI Models -->
+    <div class="section" id="sec-models">
+      <div class="section-head" onclick="toggle('sec-models')">
+        <h2>AI Models</h2><span class="arrow">▼</span>
+      </div>
+      <div class="section-body">
+        <div class="field"><label>Summary</label><input name="ai.models.summary" id="ai.models.summary"></div>
+        <div class="field"><label>Code review</label><input name="ai.models.code_review" id="ai.models.code_review"></div>
+        <div class="field"><label>Edge cases</label><input name="ai.models.edge_cases" id="ai.models.edge_cases"></div>
+        <div class="field"><label>Related files</label><input name="ai.models.related_files" id="ai.models.related_files"></div>
+        <div class="field"><label>Follow-up</label><input name="ai.models.follow_up" id="ai.models.follow_up"></div>
+        <div class="field"><label>Chat</label><input name="ai.models.chat" id="ai.models.chat"></div>
+        <div class="field"><label>AC validation</label><input name="ai.models.ac_validation" id="ai.models.ac_validation"></div>
+        <div class="field"><label>Adversarial tests</label><input name="ai.models.adversarial_tests" id="ai.models.adversarial_tests"></div>
+        <div class="field"><label>Contracts</label><input name="ai.models.contracts" id="ai.models.contracts"></div>
+        <div class="field"><label>Behavioral delta</label><input name="ai.models.behavioral_delta" id="ai.models.behavioral_delta"></div>
+        <div class="field"><label>Fix (sandbox)</label><input name="ai.models.fix" id="ai.models.fix"></div>
+      </div>
+    </div>
+
+    <!-- Sandbox -->
+    <div class="section" id="sec-sandbox">
+      <div class="section-head" onclick="toggle('sec-sandbox')">
+        <h2>Sandbox</h2><span class="arrow">▼</span>
+      </div>
+      <div class="section-body">
+        <div class="field full">
+          <div class="check-row">
+            <input type="checkbox" name="sandbox.enabled" id="sandbox.enabled">
+            <label for="sandbox.enabled">Enabled</label>
+          </div>
+        </div>
+        <div class="field">
+          <label>Max concurrent</label>
+          <input name="sandbox.max_concurrent" id="sandbox.max_concurrent" type="number">
+        </div>
+        <div class="field">
+          <label>Timeout (seconds)</label>
+          <input name="sandbox.timeout_seconds" id="sandbox.timeout_seconds" type="number">
+        </div>
+        <div class="field">
+          <label>Max memory (MB)</label>
+          <input name="sandbox.max_memory_mb" id="sandbox.max_memory_mb" type="number">
+        </div>
+        <div class="field">
+          <label>Max disk (MB)</label>
+          <input name="sandbox.max_disk_mb" id="sandbox.max_disk_mb" type="number">
+        </div>
+        <div class="field full">
+          <label>Fix branch mode</label>
+          <select name="sandbox.fix_branch_mode" id="sandbox.fix_branch_mode">
+            <option value="SameBranch">Same branch (push to MR branch)</option>
+            <option value="NewBranch">New branch (create fix branch + MR)</option>
+          </select>
+        </div>
+      </div>
+    </div>
+
+    <!-- Cache -->
+    <div class="section" id="sec-cache">
+      <div class="section-head" onclick="toggle('sec-cache')">
+        <h2>Cache</h2><span class="arrow">▼</span>
+      </div>
+      <div class="section-body">
+        <div class="field">
+          <label>Review TTL (days)</label>
+          <input name="cache.review_ttl_days" id="cache.review_ttl_days" type="number">
+        </div>
+        <div class="field">
+          <label>Max cached reviews</label>
+          <input name="cache.max_cached_reviews" id="cache.max_cached_reviews" type="number">
+        </div>
+      </div>
+    </div>
+
+    <!-- Harness -->
+    <div class="section" id="sec-harness">
+      <div class="section-head" onclick="toggle('sec-harness')">
+        <h2>Harness</h2><span class="arrow">▼</span>
+      </div>
+      <div class="section-body">
+        <div class="field full">
+          <div class="check-row">
+            <input type="checkbox" name="harness.enabled" id="harness.enabled">
+            <label for="harness.enabled">Enabled</label>
+          </div>
+        </div>
+        <div class="field"><label>Max rounds</label><input name="harness.max_rounds" id="harness.max_rounds" type="number"></div>
+        <div class="field"><label>Variants per round</label><input name="harness.variants_per_round" id="harness.variants_per_round" type="number"></div>
+        <div class="field"><label>Concurrency</label><input name="harness.concurrency" id="harness.concurrency" type="number"></div>
+        <div class="field"><label>Test cases</label><input name="harness.test_cases" id="harness.test_cases" type="number"></div>
+        <div class="field full"><label>Seed orgs (comma-separated)</label><input name="harness.gitlab_seed_orgs" id="harness.gitlab_seed_orgs"></div>
+        <div class="field"><label>Memory directory</label><input name="harness.memory_dir" id="harness.memory_dir"></div>
+        <div class="field"><label>Judge model</label><input name="harness.judge_model" id="harness.judge_model"></div>
+      </div>
+    </div>
+
+    <div class="actions">
+      <button type="submit" class="btn btn-primary">Save</button>
+      <button type="button" class="btn" onclick="loadConfig()">Reset</button>
+    </div>
+  </form>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const KEY = new URLSearchParams(location.search).get('key') || '';
+const headers = {'Content-Type':'application/json'};
+if (KEY) headers['Authorization'] = 'Bearer ' + KEY;
+
+function toast(msg, ok) {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.className = 'toast show ' + (ok ? 'toast-ok' : 'toast-err');
+  setTimeout(() => el.className = 'toast', 2500);
+}
+
+function toggle(id) {
+  document.getElementById(id).classList.toggle('collapsed');
+}
+
+function setVal(id, val) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  if (el.type === 'checkbox') el.checked = !!val;
+  else el.value = val ?? '';
+}
+
+function getVal(id) {
+  const el = document.getElementById(id);
+  if (!el) return undefined;
+  if (el.type === 'checkbox') return el.checked;
+  if (el.type === 'number') return el.value === '' ? undefined : Number(el.value);
+  return el.value;
+}
+
+async function loadConfig() {
+  try {
+    const r = await fetch('/api/admin/config', {headers});
+    if (r.status === 401) { toast('Unauthorized', false); return; }
+    const c = await r.json();
+
+    setVal('server.host', c.server.host);
+    setVal('server.port', c.server.port);
+    setVal('server.max_concurrent_reviews', c.server.max_concurrent_reviews);
+    setVal('server.max_concurrent_ai_calls', c.server.max_concurrent_ai_calls);
+
+    setVal('auth.api_key', c.auth.api_key);
+
+    setVal('gitlab.url', c.gitlab.url);
+    setVal('gitlab.bot_token', c.gitlab.bot_token);
+    setVal('gitlab.webhook_secret', c.gitlab.webhook_secret || '');
+
+    setVal('ai.base_url', c.ai.base_url);
+    setVal('ai.api_key', c.ai.api_key);
+
+    setVal('ai.models.summary', c.ai.models.summary);
+    setVal('ai.models.code_review', c.ai.models.code_review);
+    setVal('ai.models.edge_cases', c.ai.models.edge_cases);
+    setVal('ai.models.related_files', c.ai.models.related_files);
+    setVal('ai.models.follow_up', c.ai.models.follow_up);
+    setVal('ai.models.chat', c.ai.models.chat);
+    setVal('ai.models.ac_validation', c.ai.models.ac_validation);
+    setVal('ai.models.adversarial_tests', c.ai.models.adversarial_tests);
+    setVal('ai.models.contracts', c.ai.models.contracts);
+    setVal('ai.models.behavioral_delta', c.ai.models.behavioral_delta);
+    setVal('ai.models.fix', c.ai.models.fix);
+
+    setVal('sandbox.enabled', c.sandbox.enabled);
+    setVal('sandbox.max_concurrent', c.sandbox.max_concurrent);
+    setVal('sandbox.timeout_seconds', c.sandbox.timeout_seconds);
+    setVal('sandbox.max_memory_mb', c.sandbox.max_memory_mb);
+    setVal('sandbox.max_disk_mb', c.sandbox.max_disk_mb);
+    setVal('sandbox.fix_branch_mode', c.sandbox.fix_branch_mode);
+
+    setVal('cache.review_ttl_days', c.cache.review_ttl_days);
+    setVal('cache.max_cached_reviews', c.cache.max_cached_reviews);
+
+    setVal('harness.enabled', c.harness.enabled);
+    setVal('harness.max_rounds', c.harness.max_rounds);
+    setVal('harness.variants_per_round', c.harness.variants_per_round);
+    setVal('harness.concurrency', c.harness.concurrency);
+    setVal('harness.test_cases', c.harness.test_cases);
+    setVal('harness.gitlab_seed_orgs', (c.harness.gitlab_seed_orgs || []).join(', '));
+    setVal('harness.memory_dir', c.harness.memory_dir);
+    setVal('harness.judge_model', c.harness.judge_model);
+  } catch(e) {
+    toast('Failed to load config', false);
+  }
+}
+
+async function loadStatus() {
+  try {
+    const r = await fetch('/api/admin/status', {headers});
+    if (!r.ok) return;
+    const s = await r.json();
+    document.getElementById('version').textContent = 'v' + s.version;
+    const bar = document.getElementById('status-bar');
+    const dot = s.sandbox.docker_available ? 'dot-ok' : 'dot-off';
+    bar.innerHTML =
+      '<span>' + s.connections.authenticated + ' connected</span>' +
+      '<span>' + s.reviews.active + '/' + s.reviews.max_concurrent + ' reviews</span>' +
+      '<span><span class="dot ' + dot + '"></span>Docker ' + (s.sandbox.docker_available ? 'available' : 'unavailable') + '</span>';
+  } catch(e) {}
+}
+
+async function saveConfig(e) {
+  e.preventDefault();
+  const orgs = getVal('harness.gitlab_seed_orgs');
+  const body = {
+    server: {
+      host: getVal('server.host'),
+      port: getVal('server.port'),
+      max_concurrent_reviews: getVal('server.max_concurrent_reviews'),
+      max_concurrent_ai_calls: getVal('server.max_concurrent_ai_calls'),
+    },
+    auth: { api_key: getVal('auth.api_key') },
+    gitlab: {
+      url: getVal('gitlab.url'),
+      bot_token: getVal('gitlab.bot_token'),
+      webhook_secret: getVal('gitlab.webhook_secret') || undefined,
+    },
+    ai: {
+      base_url: getVal('ai.base_url'),
+      api_key: getVal('ai.api_key'),
+      models: {
+        summary: getVal('ai.models.summary'),
+        code_review: getVal('ai.models.code_review'),
+        edge_cases: getVal('ai.models.edge_cases'),
+        related_files: getVal('ai.models.related_files'),
+        follow_up: getVal('ai.models.follow_up'),
+        chat: getVal('ai.models.chat'),
+        ac_validation: getVal('ai.models.ac_validation'),
+        adversarial_tests: getVal('ai.models.adversarial_tests'),
+        contracts: getVal('ai.models.contracts'),
+        behavioral_delta: getVal('ai.models.behavioral_delta'),
+        fix: getVal('ai.models.fix'),
+      },
+    },
+    sandbox: {
+      enabled: getVal('sandbox.enabled'),
+      max_concurrent: getVal('sandbox.max_concurrent'),
+      timeout_seconds: getVal('sandbox.timeout_seconds'),
+      max_memory_mb: getVal('sandbox.max_memory_mb'),
+      max_disk_mb: getVal('sandbox.max_disk_mb'),
+      fix_branch_mode: getVal('sandbox.fix_branch_mode'),
+    },
+    cache: {
+      review_ttl_days: getVal('cache.review_ttl_days'),
+      max_cached_reviews: getVal('cache.max_cached_reviews'),
+    },
+    harness: {
+      enabled: getVal('harness.enabled'),
+      max_rounds: getVal('harness.max_rounds'),
+      variants_per_round: getVal('harness.variants_per_round'),
+      concurrency: getVal('harness.concurrency'),
+      test_cases: getVal('harness.test_cases'),
+      gitlab_seed_orgs: typeof orgs === 'string' ? orgs.split(',').map(s => s.trim()).filter(Boolean) : undefined,
+      memory_dir: getVal('harness.memory_dir'),
+      judge_model: getVal('harness.judge_model'),
+    },
+  };
+
+  try {
+    const r = await fetch('/api/admin/config', {method:'PUT', headers, body: JSON.stringify(body)});
+    if (r.status === 401) { toast('Unauthorized', false); return; }
+    const res = await r.json();
+    if (res.error) { toast(res.error, false); return; }
+    toast('Settings saved', true);
+    if (res.restart_required) {
+      document.getElementById('restart-banner').classList.add('show');
+    }
+  } catch(e) {
+    toast('Save failed: ' + e.message, false);
+  }
+}
+
+document.getElementById('cfg-form').addEventListener('submit', saveConfig);
+loadConfig();
+loadStatus();
+setInterval(loadStatus, 15000);
+</script>
+</body>
+</html>

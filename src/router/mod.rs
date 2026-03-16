@@ -297,6 +297,7 @@ pub async fn handle_fix_request(
             comment_id: comment_id.to_string(),
             commit_sha: None,
             error: Some("sandbox is not enabled on this server".into()),
+            fix_mr_url: None,
         };
         let _ = tx.send(serde_json::to_string(&msg).unwrap());
         return;
@@ -346,7 +347,7 @@ pub async fn handle_fix_request(
     };
 
     let sandbox_mgr = crate::services::sandbox::manager::SandboxManager::new(
-        state.config().clone(),
+        (*state.config()).clone(),
         state.pool().clone(),
         state.event_bus().clone(),
         broadcaster,
@@ -455,11 +456,14 @@ pub async fn handle_fix_request(
                     } else {
                         "this review comment"
                     };
+                    let mr_link = result.fix_mr_url.as_ref()
+                        .map(|url| format!("\nFix MR: {}", url))
+                        .unwrap_or_default();
                     let comment_body = format!(
                         "🔧 **Botto applied a fix** for {}.\n\n\
-                         Commit: {}\n\n\
+                         Commit: {}{}\n\n\
                          The fix was applied and tests passed in a sandboxed Docker container.",
-                        fix_source, sha,
+                        fix_source, sha, mr_link,
                     );
                     if let Some(pid) = project_id {
                         // Try to find the discussion thread for the original comment.
@@ -508,6 +512,7 @@ pub async fn handle_fix_request(
                 comment_id: comment_id.to_string(),
                 commit_sha: result.commit_sha,
                 error: result.error,
+                fix_mr_url: result.fix_mr_url,
             };
             // Broadcast to all MR viewers (includes the requester).
             // Don't also send via tx — that would double-deliver to the requester.
@@ -520,6 +525,7 @@ pub async fn handle_fix_request(
                 comment_id: comment_id.to_string(),
                 commit_sha: None,
                 error: Some("failed to initialize sandbox (Docker not available?)".into()),
+                fix_mr_url: None,
             };
             let _ = tx.send(serde_json::to_string(&msg).unwrap());
         }

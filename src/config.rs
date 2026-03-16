@@ -7,7 +7,7 @@
 // ---------------------------------------------------------------------------
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
@@ -15,7 +15,7 @@ use tracing::{info, warn};
 // Config schema (matches botto.toml structure)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct BottoConfig {
     pub server: ServerConfig,
     pub auth: AuthConfig,
@@ -27,7 +27,7 @@ pub struct BottoConfig {
     pub data_dir: PathBuf,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
@@ -37,13 +37,13 @@ pub struct ServerConfig {
     pub max_concurrent_ai_calls: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct AuthConfig {
     /// Shared API key that Otto extensions use to authenticate with Botto.
     pub api_key: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct GitLabConfig {
     pub url: String,
     pub bot_token: String,
@@ -51,14 +51,14 @@ pub struct GitLabConfig {
     pub webhook_secret: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct AiConfig {
     pub base_url: String,
     pub api_key: String,
     pub models: AiModelConfig,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct AiModelConfig {
     pub summary: String,
     pub code_review: String,
@@ -92,7 +92,7 @@ impl Default for AiModelConfig {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SandboxConfig {
     pub enabled: bool,
     pub docker_available: bool,
@@ -100,15 +100,27 @@ pub struct SandboxConfig {
     pub timeout_seconds: u64,
     pub max_memory_mb: u64,
     pub max_disk_mb: u64,
+    /// How to push fix commits: directly to the source branch, or to a new branch with an MR.
+    pub fix_branch_mode: FixBranchMode,
 }
 
-#[derive(Debug, Clone)]
+/// Controls where sandbox fix commits are pushed.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub enum FixBranchMode {
+    /// Push directly to the MR's source branch (default, current behavior).
+    SameBranch,
+    /// Create a new branch (e.g., `botto/fix/mr-42-add-auth`) and open an MR
+    /// targeting the original source branch.
+    NewBranch,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct CacheConfig {
     pub review_ttl_days: u32,
     pub max_cached_reviews: u32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct HarnessConfig {
     pub enabled: bool,
     /// Max evolution rounds per run.
@@ -191,6 +203,8 @@ struct TomlSandbox {
     timeout_seconds: Option<u64>,
     max_memory_mb: Option<u64>,
     max_disk_mb: Option<u64>,
+    /// "same_branch" (default) or "new_branch"
+    fix_branch_mode: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -345,6 +359,10 @@ pub async fn load(config_path: &Option<PathBuf>, data_dir: &Path) -> Result<Bott
             timeout_seconds: toml_sandbox.timeout_seconds.unwrap_or(300),
             max_memory_mb: toml_sandbox.max_memory_mb.unwrap_or(auto_memory),
             max_disk_mb: toml_sandbox.max_disk_mb.unwrap_or(4096),
+            fix_branch_mode: match toml_sandbox.fix_branch_mode.as_deref() {
+                Some("new_branch") => FixBranchMode::NewBranch,
+                _ => FixBranchMode::SameBranch,
+            },
         },
         cache: CacheConfig {
             review_ttl_days: toml_cache.review_ttl_days.unwrap_or(7),
@@ -392,4 +410,715 @@ pub fn print_summary(cfg: &BottoConfig) {
     );
     info!("cache:  ttl={}d, max={}/project", cfg.cache.review_ttl_days, cfg.cache.max_cached_reviews);
     info!("data:   {}", cfg.data_dir.display());
+}
+
+// ---------------------------------------------------------------------------
+// Admin API types — redacted config for GET, partial update for PUT
+// ---------------------------------------------------------------------------
+
+/// Redact a secret string: show last 4 chars with a mask prefix.
+/// Returns empty string for empty secrets.
+fn redact_secret(s: &str) -> String {
+    if s.is_empty() {
+        String::new()
+    } else if s.len() <= 4 {
+        "••••".to_string()
+    } else {
+        format!("••••{}", &s[s.len() - 4..])
+    }
+}
+
+/// Check if a value is a redacted placeholder (starts with "••").
+fn is_redacted(s: &str) -> bool {
+    s.starts_with("••")
+}
+
+/// Config response with secrets redacted. Safe to send over the wire.
+#[derive(Debug, Serialize)]
+pub struct ConfigResponse {
+    pub server: ServerConfig,
+    pub auth: AuthConfigRedacted,
+    pub gitlab: GitLabConfigRedacted,
+    pub ai: AiConfigRedacted,
+    pub sandbox: SandboxConfig,
+    pub cache: CacheConfig,
+    pub harness: HarnessConfigRedacted,
+    pub data_dir: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AuthConfigRedacted {
+    pub api_key: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct GitLabConfigRedacted {
+    pub url: String,
+    pub bot_token: String,
+    pub webhook_secret: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AiConfigRedacted {
+    pub base_url: String,
+    pub api_key: String,
+    pub models: AiModelConfig,
+}
+
+#[derive(Debug, Serialize)]
+pub struct HarnessConfigRedacted {
+    pub enabled: bool,
+    pub max_rounds: u32,
+    pub variants_per_round: u32,
+    pub concurrency: u32,
+    pub test_cases: u32,
+    pub gitlab_seed_orgs: Vec<String>,
+    pub memory_dir: String,
+    pub judge_model: String,
+}
+
+impl ConfigResponse {
+    pub fn from_config(cfg: &BottoConfig) -> Self {
+        Self {
+            server: cfg.server.clone(),
+            auth: AuthConfigRedacted {
+                api_key: redact_secret(&cfg.auth.api_key),
+            },
+            gitlab: GitLabConfigRedacted {
+                url: cfg.gitlab.url.clone(),
+                bot_token: redact_secret(&cfg.gitlab.bot_token),
+                webhook_secret: cfg.gitlab.webhook_secret.as_ref().map(|s| redact_secret(s)),
+            },
+            ai: AiConfigRedacted {
+                base_url: cfg.ai.base_url.clone(),
+                api_key: redact_secret(&cfg.ai.api_key),
+                models: cfg.ai.models.clone(),
+            },
+            sandbox: cfg.sandbox.clone(),
+            cache: cfg.cache.clone(),
+            harness: HarnessConfigRedacted {
+                enabled: cfg.harness.enabled,
+                max_rounds: cfg.harness.max_rounds,
+                variants_per_round: cfg.harness.variants_per_round,
+                concurrency: cfg.harness.concurrency,
+                test_cases: cfg.harness.test_cases,
+                gitlab_seed_orgs: cfg.harness.gitlab_seed_orgs.clone(),
+                memory_dir: cfg.harness.memory_dir.display().to_string(),
+                judge_model: cfg.harness.judge_model.clone(),
+            },
+            data_dir: cfg.data_dir.display().to_string(),
+        }
+    }
+}
+
+/// Partial config update from the admin UI. All fields optional —
+/// only provided fields are applied. Redacted secret values (starting
+/// with "••") are ignored, preserving the existing secret.
+#[derive(Debug, Deserialize)]
+pub struct ConfigUpdate {
+    pub server: Option<ServerConfigUpdate>,
+    pub auth: Option<AuthConfigUpdate>,
+    pub gitlab: Option<GitLabConfigUpdate>,
+    pub ai: Option<AiConfigUpdate>,
+    pub sandbox: Option<SandboxConfigUpdate>,
+    pub cache: Option<CacheConfigUpdate>,
+    pub harness: Option<HarnessConfigUpdate>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ServerConfigUpdate {
+    pub host: Option<String>,
+    pub port: Option<u16>,
+    pub max_concurrent_reviews: Option<usize>,
+    pub max_concurrent_ai_calls: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AuthConfigUpdate {
+    pub api_key: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GitLabConfigUpdate {
+    pub url: Option<String>,
+    pub bot_token: Option<String>,
+    pub webhook_secret: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AiConfigUpdate {
+    pub base_url: Option<String>,
+    pub api_key: Option<String>,
+    pub models: Option<AiModelConfigUpdate>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AiModelConfigUpdate {
+    pub summary: Option<String>,
+    pub code_review: Option<String>,
+    pub edge_cases: Option<String>,
+    pub related_files: Option<String>,
+    pub follow_up: Option<String>,
+    pub chat: Option<String>,
+    pub ac_validation: Option<String>,
+    pub adversarial_tests: Option<String>,
+    pub contracts: Option<String>,
+    pub behavioral_delta: Option<String>,
+    pub fix: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SandboxConfigUpdate {
+    pub enabled: Option<bool>,
+    pub max_concurrent: Option<u32>,
+    pub timeout_seconds: Option<u64>,
+    pub max_memory_mb: Option<u64>,
+    pub max_disk_mb: Option<u64>,
+    pub fix_branch_mode: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CacheConfigUpdate {
+    pub review_ttl_days: Option<u32>,
+    pub max_cached_reviews: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct HarnessConfigUpdate {
+    pub enabled: Option<bool>,
+    pub max_rounds: Option<u32>,
+    pub variants_per_round: Option<u32>,
+    pub concurrency: Option<u32>,
+    pub test_cases: Option<u32>,
+    pub gitlab_seed_orgs: Option<Vec<String>>,
+    pub memory_dir: Option<String>,
+    pub judge_model: Option<String>,
+}
+
+/// Fields that require a server restart to take effect.
+const RESTART_FIELDS: &[&str] = &[
+    "server.host",
+    "server.port",
+    "server.max_concurrent_reviews",
+    "server.max_concurrent_ai_calls",
+];
+
+/// Apply a ConfigUpdate to an existing BottoConfig, returning the new config
+/// and a list of changed fields that require restart.
+pub fn apply_update(current: &BottoConfig, update: ConfigUpdate) -> (BottoConfig, Vec<String>) {
+    let mut cfg = current.clone();
+    let mut restart_needed = Vec::new();
+
+    if let Some(s) = update.server {
+        if let Some(v) = s.host {
+            if v != cfg.server.host {
+                restart_needed.push("server.host".into());
+                cfg.server.host = v;
+            }
+        }
+        if let Some(v) = s.port {
+            if v != cfg.server.port {
+                restart_needed.push("server.port".into());
+                cfg.server.port = v;
+            }
+        }
+        if let Some(v) = s.max_concurrent_reviews {
+            if v != cfg.server.max_concurrent_reviews {
+                restart_needed.push("server.max_concurrent_reviews".into());
+                cfg.server.max_concurrent_reviews = v;
+            }
+        }
+        if let Some(v) = s.max_concurrent_ai_calls {
+            if v != cfg.server.max_concurrent_ai_calls {
+                restart_needed.push("server.max_concurrent_ai_calls".into());
+                cfg.server.max_concurrent_ai_calls = v;
+            }
+        }
+    }
+
+    if let Some(a) = update.auth {
+        if let Some(v) = a.api_key {
+            if !is_redacted(&v) { cfg.auth.api_key = v; }
+        }
+    }
+
+    if let Some(g) = update.gitlab {
+        if let Some(v) = g.url { cfg.gitlab.url = v; }
+        if let Some(v) = g.bot_token {
+            if !is_redacted(&v) { cfg.gitlab.bot_token = v; }
+        }
+        if let Some(v) = g.webhook_secret {
+            if is_redacted(&v) {
+                // keep existing
+            } else if v.is_empty() {
+                cfg.gitlab.webhook_secret = None;
+            } else {
+                cfg.gitlab.webhook_secret = Some(v);
+            }
+        }
+    }
+
+    if let Some(a) = update.ai {
+        if let Some(v) = a.base_url { cfg.ai.base_url = v; }
+        if let Some(v) = a.api_key {
+            if !is_redacted(&v) { cfg.ai.api_key = v; }
+        }
+        if let Some(m) = a.models {
+            if let Some(v) = m.summary { cfg.ai.models.summary = v; }
+            if let Some(v) = m.code_review { cfg.ai.models.code_review = v; }
+            if let Some(v) = m.edge_cases { cfg.ai.models.edge_cases = v; }
+            if let Some(v) = m.related_files { cfg.ai.models.related_files = v; }
+            if let Some(v) = m.follow_up { cfg.ai.models.follow_up = v; }
+            if let Some(v) = m.chat { cfg.ai.models.chat = v; }
+            if let Some(v) = m.ac_validation { cfg.ai.models.ac_validation = v; }
+            if let Some(v) = m.adversarial_tests { cfg.ai.models.adversarial_tests = v; }
+            if let Some(v) = m.contracts { cfg.ai.models.contracts = v; }
+            if let Some(v) = m.behavioral_delta { cfg.ai.models.behavioral_delta = v; }
+            if let Some(v) = m.fix { cfg.ai.models.fix = v; }
+        }
+    }
+
+    if let Some(s) = update.sandbox {
+        if let Some(v) = s.enabled { cfg.sandbox.enabled = v; }
+        if let Some(v) = s.max_concurrent { cfg.sandbox.max_concurrent = v; }
+        if let Some(v) = s.timeout_seconds { cfg.sandbox.timeout_seconds = v; }
+        if let Some(v) = s.max_memory_mb { cfg.sandbox.max_memory_mb = v; }
+        if let Some(v) = s.max_disk_mb { cfg.sandbox.max_disk_mb = v; }
+        if let Some(v) = s.fix_branch_mode {
+            cfg.sandbox.fix_branch_mode = match v.as_str() {
+                "new_branch" => FixBranchMode::NewBranch,
+                _ => FixBranchMode::SameBranch,
+            };
+        }
+    }
+
+    if let Some(c) = update.cache {
+        if let Some(v) = c.review_ttl_days { cfg.cache.review_ttl_days = v; }
+        if let Some(v) = c.max_cached_reviews { cfg.cache.max_cached_reviews = v; }
+    }
+
+    if let Some(h) = update.harness {
+        if let Some(v) = h.enabled { cfg.harness.enabled = v; }
+        if let Some(v) = h.max_rounds { cfg.harness.max_rounds = v; }
+        if let Some(v) = h.variants_per_round { cfg.harness.variants_per_round = v; }
+        if let Some(v) = h.concurrency { cfg.harness.concurrency = v; }
+        if let Some(v) = h.test_cases { cfg.harness.test_cases = v; }
+        if let Some(v) = h.gitlab_seed_orgs { cfg.harness.gitlab_seed_orgs = v; }
+        if let Some(v) = h.memory_dir { cfg.harness.memory_dir = PathBuf::from(v); }
+        if let Some(v) = h.judge_model { cfg.harness.judge_model = v; }
+    }
+
+    (cfg, restart_needed)
+}
+
+/// Serialize a BottoConfig to TOML for writing back to botto.toml.
+/// Secrets are written in full (this is the server-side config file).
+pub fn to_toml_string(cfg: &BottoConfig) -> Result<String> {
+    // Build a TOML-friendly intermediate that maps cleanly to the file format.
+    #[derive(Serialize)]
+    struct TomlOut<'a> {
+        server: &'a ServerConfig,
+        auth: &'a AuthConfig,
+        gitlab: GitLabOut<'a>,
+        ai: AiOut<'a>,
+        sandbox: SandboxOut<'a>,
+        cache: &'a CacheConfig,
+        harness: HarnessOut<'a>,
+    }
+
+    #[derive(Serialize)]
+    struct GitLabOut<'a> {
+        url: &'a str,
+        bot_token: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        webhook_secret: Option<&'a str>,
+    }
+
+    #[derive(Serialize)]
+    struct AiOut<'a> {
+        base_url: &'a str,
+        api_key: &'a str,
+        models: &'a AiModelConfig,
+    }
+
+    #[derive(Serialize)]
+    struct SandboxOut<'a> {
+        enabled: bool,
+        max_concurrent: u32,
+        timeout_seconds: u64,
+        max_memory_mb: u64,
+        max_disk_mb: u64,
+        fix_branch_mode: &'a str,
+    }
+
+    #[derive(Serialize)]
+    struct HarnessOut<'a> {
+        enabled: bool,
+        max_rounds: u32,
+        variants_per_round: u32,
+        concurrency: u32,
+        test_cases: u32,
+        gitlab_seed_orgs: &'a [String],
+        memory_dir: String,
+        judge_model: &'a str,
+    }
+
+    let out = TomlOut {
+        server: &cfg.server,
+        auth: &cfg.auth,
+        gitlab: GitLabOut {
+            url: &cfg.gitlab.url,
+            bot_token: &cfg.gitlab.bot_token,
+            webhook_secret: cfg.gitlab.webhook_secret.as_deref(),
+        },
+        ai: AiOut {
+            base_url: &cfg.ai.base_url,
+            api_key: &cfg.ai.api_key,
+            models: &cfg.ai.models,
+        },
+        sandbox: SandboxOut {
+            enabled: cfg.sandbox.enabled,
+            max_concurrent: cfg.sandbox.max_concurrent,
+            timeout_seconds: cfg.sandbox.timeout_seconds,
+            max_memory_mb: cfg.sandbox.max_memory_mb,
+            max_disk_mb: cfg.sandbox.max_disk_mb,
+            fix_branch_mode: match cfg.sandbox.fix_branch_mode {
+                FixBranchMode::SameBranch => "same_branch",
+                FixBranchMode::NewBranch => "new_branch",
+            },
+        },
+        cache: &cfg.cache,
+        harness: HarnessOut {
+            enabled: cfg.harness.enabled,
+            max_rounds: cfg.harness.max_rounds,
+            variants_per_round: cfg.harness.variants_per_round,
+            concurrency: cfg.harness.concurrency,
+            test_cases: cfg.harness.test_cases,
+            gitlab_seed_orgs: &cfg.harness.gitlab_seed_orgs,
+            memory_dir: cfg.harness.memory_dir.display().to_string(),
+            judge_model: &cfg.harness.judge_model,
+        },
+    };
+
+    toml::to_string_pretty(&out).map_err(|e| anyhow::anyhow!("TOML serialize error: {}", e))
+}
+
+/// Write config to the botto.toml file in the data directory.
+pub async fn save_to_file(cfg: &BottoConfig) -> Result<()> {
+    let toml_str = to_toml_string(cfg)?;
+    let path = cfg.data_dir.join("botto.toml");
+    tokio::fs::write(&path, toml_str)
+        .await
+        .with_context(|| format!("failed to write config to {}", path.display()))?;
+    info!("config saved to {}", path.display());
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a minimal test config for use in tests.
+    fn test_config() -> BottoConfig {
+        BottoConfig {
+            server: ServerConfig {
+                host: "0.0.0.0".into(),
+                port: 7700,
+                max_concurrent_reviews: 3,
+                max_concurrent_ai_calls: 6,
+            },
+            auth: AuthConfig {
+                api_key: "test-secret-key-1234".into(),
+            },
+            gitlab: GitLabConfig {
+                url: "https://gitlab.com".into(),
+                bot_token: "glpat-xxxxxxxxxxxxxxxxxxxx".into(),
+                webhook_secret: Some("webhook-secret-abcd".into()),
+            },
+            ai: AiConfig {
+                base_url: "https://api.example.com".into(),
+                api_key: "sk-ai-key-5678".into(),
+                models: AiModelConfig::default(),
+            },
+            sandbox: SandboxConfig {
+                enabled: true,
+                docker_available: true,
+                max_concurrent: 2,
+                timeout_seconds: 300,
+                max_memory_mb: 2048,
+                max_disk_mb: 4096,
+                fix_branch_mode: FixBranchMode::SameBranch,
+            },
+            cache: CacheConfig {
+                review_ttl_days: 7,
+                max_cached_reviews: 500,
+            },
+            harness: HarnessConfig {
+                enabled: false,
+                max_rounds: 10,
+                variants_per_round: 4,
+                concurrency: 3,
+                test_cases: 5,
+                gitlab_seed_orgs: vec!["gitlab-org".into()],
+                memory_dir: PathBuf::from("harness"),
+                judge_model: "claude-opus-4-6".into(),
+            },
+            data_dir: PathBuf::from("/tmp/botto-test"),
+        }
+    }
+
+    // -- redact_secret --
+
+    #[test]
+    fn redact_empty_secret() {
+        assert_eq!(redact_secret(""), "");
+    }
+
+    #[test]
+    fn redact_short_secret() {
+        assert_eq!(redact_secret("abc"), "••••");
+        assert_eq!(redact_secret("abcd"), "••••");
+    }
+
+    #[test]
+    fn redact_normal_secret() {
+        assert_eq!(redact_secret("glpat-xxxxxxxxxxxxxxxxxxxx"), "••••xxxx");
+        assert_eq!(redact_secret("sk-ai-key-5678"), "••••5678");
+    }
+
+    // -- is_redacted --
+
+    #[test]
+    fn is_redacted_detects_mask() {
+        assert!(is_redacted("••••xxxx"));
+        assert!(is_redacted("••••"));
+        assert!(!is_redacted("real-secret"));
+        assert!(!is_redacted(""));
+    }
+
+    // -- ConfigResponse --
+
+    #[test]
+    fn config_response_redacts_secrets() {
+        let cfg = test_config();
+        let resp = ConfigResponse::from_config(&cfg);
+
+        // Secrets are redacted
+        assert_eq!(resp.auth.api_key, "••••1234");
+        assert_eq!(resp.gitlab.bot_token, "••••xxxx");
+        assert_eq!(resp.gitlab.webhook_secret, Some("••••abcd".into()));
+        assert_eq!(resp.ai.api_key, "••••5678");
+
+        // Non-secrets are preserved
+        assert_eq!(resp.server.host, "0.0.0.0");
+        assert_eq!(resp.server.port, 7700);
+        assert_eq!(resp.gitlab.url, "https://gitlab.com");
+        assert_eq!(resp.ai.base_url, "https://api.example.com");
+    }
+
+    // -- apply_update --
+
+    #[test]
+    fn apply_update_changes_non_secret_fields() {
+        let cfg = test_config();
+        let update = ConfigUpdate {
+            server: None,
+            auth: None,
+            gitlab: Some(GitLabConfigUpdate {
+                url: Some("https://gitlab.example.com".into()),
+                bot_token: None,
+                webhook_secret: None,
+            }),
+            ai: Some(AiConfigUpdate {
+                base_url: Some("https://new-api.example.com".into()),
+                api_key: None,
+                models: Some(AiModelConfigUpdate {
+                    summary: Some("gpt-4o".into()),
+                    code_review: None, edge_cases: None, related_files: None,
+                    follow_up: None, chat: None, ac_validation: None,
+                    adversarial_tests: None, contracts: None, behavioral_delta: None,
+                    fix: None,
+                }),
+            }),
+            sandbox: None,
+            cache: None,
+            harness: None,
+        };
+
+        let (new_cfg, restart_fields) = apply_update(&cfg, update);
+        assert_eq!(new_cfg.gitlab.url, "https://gitlab.example.com");
+        assert_eq!(new_cfg.ai.base_url, "https://new-api.example.com");
+        assert_eq!(new_cfg.ai.models.summary, "gpt-4o");
+        // Unchanged fields preserved
+        assert_eq!(new_cfg.ai.models.code_review, "claude-sonnet-4-5");
+        assert!(restart_fields.is_empty());
+    }
+
+    #[test]
+    fn apply_update_preserves_redacted_secrets() {
+        let cfg = test_config();
+        let update = ConfigUpdate {
+            server: None,
+            auth: Some(AuthConfigUpdate {
+                api_key: Some("••••1234".into()), // redacted — should be ignored
+            }),
+            gitlab: Some(GitLabConfigUpdate {
+                url: None,
+                bot_token: Some("••••xxxx".into()), // redacted
+                webhook_secret: Some("••••abcd".into()), // redacted
+            }),
+            ai: Some(AiConfigUpdate {
+                base_url: None,
+                api_key: Some("••••5678".into()), // redacted
+                models: None,
+            }),
+            sandbox: None,
+            cache: None,
+            harness: None,
+        };
+
+        let (new_cfg, _) = apply_update(&cfg, update);
+        // All secrets should be unchanged
+        assert_eq!(new_cfg.auth.api_key, "test-secret-key-1234");
+        assert_eq!(new_cfg.gitlab.bot_token, "glpat-xxxxxxxxxxxxxxxxxxxx");
+        assert_eq!(new_cfg.gitlab.webhook_secret, Some("webhook-secret-abcd".into()));
+        assert_eq!(new_cfg.ai.api_key, "sk-ai-key-5678");
+    }
+
+    #[test]
+    fn apply_update_accepts_new_secrets() {
+        let cfg = test_config();
+        let update = ConfigUpdate {
+            server: None,
+            auth: Some(AuthConfigUpdate {
+                api_key: Some("brand-new-key".into()),
+            }),
+            gitlab: Some(GitLabConfigUpdate {
+                url: None,
+                bot_token: Some("glpat-new-token".into()),
+                webhook_secret: None,
+            }),
+            ai: None,
+            sandbox: None,
+            cache: None,
+            harness: None,
+        };
+
+        let (new_cfg, _) = apply_update(&cfg, update);
+        assert_eq!(new_cfg.auth.api_key, "brand-new-key");
+        assert_eq!(new_cfg.gitlab.bot_token, "glpat-new-token");
+    }
+
+    #[test]
+    fn apply_update_reports_restart_fields() {
+        let cfg = test_config();
+        let update = ConfigUpdate {
+            server: Some(ServerConfigUpdate {
+                host: Some("127.0.0.1".into()),
+                port: Some(8080),
+                max_concurrent_reviews: None,
+                max_concurrent_ai_calls: None,
+            }),
+            auth: None,
+            gitlab: None,
+            ai: None,
+            sandbox: None,
+            cache: None,
+            harness: None,
+        };
+
+        let (new_cfg, restart_fields) = apply_update(&cfg, update);
+        assert_eq!(new_cfg.server.host, "127.0.0.1");
+        assert_eq!(new_cfg.server.port, 8080);
+        assert!(restart_fields.contains(&"server.host".to_string()));
+        assert!(restart_fields.contains(&"server.port".to_string()));
+        assert_eq!(restart_fields.len(), 2);
+    }
+
+    #[test]
+    fn apply_update_no_restart_for_same_values() {
+        let cfg = test_config();
+        let update = ConfigUpdate {
+            server: Some(ServerConfigUpdate {
+                host: Some("0.0.0.0".into()), // same as current
+                port: Some(7700),             // same as current
+                max_concurrent_reviews: None,
+                max_concurrent_ai_calls: None,
+            }),
+            auth: None,
+            gitlab: None,
+            ai: None,
+            sandbox: None,
+            cache: None,
+            harness: None,
+        };
+
+        let (_, restart_fields) = apply_update(&cfg, update);
+        assert!(restart_fields.is_empty());
+    }
+
+    #[test]
+    fn apply_update_sandbox_fix_branch_mode() {
+        let cfg = test_config();
+        let update = ConfigUpdate {
+            server: None, auth: None, gitlab: None, ai: None,
+            sandbox: Some(SandboxConfigUpdate {
+                enabled: None,
+                max_concurrent: None,
+                timeout_seconds: None,
+                max_memory_mb: None,
+                max_disk_mb: None,
+                fix_branch_mode: Some("new_branch".into()),
+            }),
+            cache: None,
+            harness: None,
+        };
+
+        let (new_cfg, _) = apply_update(&cfg, update);
+        assert_eq!(new_cfg.sandbox.fix_branch_mode, FixBranchMode::NewBranch);
+    }
+
+    #[test]
+    fn apply_update_clears_webhook_secret() {
+        let cfg = test_config();
+        let update = ConfigUpdate {
+            server: None, auth: None,
+            gitlab: Some(GitLabConfigUpdate {
+                url: None,
+                bot_token: None,
+                webhook_secret: Some("".into()), // empty = clear
+            }),
+            ai: None, sandbox: None, cache: None, harness: None,
+        };
+
+        let (new_cfg, _) = apply_update(&cfg, update);
+        assert_eq!(new_cfg.gitlab.webhook_secret, None);
+    }
+
+    // -- to_toml_string --
+
+    #[test]
+    fn to_toml_roundtrip() {
+        let cfg = test_config();
+        let toml_str = to_toml_string(&cfg).unwrap();
+
+        // Should contain key sections
+        assert!(toml_str.contains("[server]"));
+        assert!(toml_str.contains("[auth]"));
+        assert!(toml_str.contains("[gitlab]"));
+        assert!(toml_str.contains("[ai]"));
+        assert!(toml_str.contains("[sandbox]"));
+        assert!(toml_str.contains("[cache]"));
+        assert!(toml_str.contains("[harness]"));
+
+        // Should contain actual values
+        assert!(toml_str.contains("port = 7700"));
+        assert!(toml_str.contains("\"https://gitlab.com\""));
+        assert!(toml_str.contains("fix_branch_mode = \"same_branch\""));
+        assert!(toml_str.contains("review_ttl_days = 7"));
+    }
 }

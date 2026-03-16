@@ -638,6 +638,9 @@ pub enum WsOutbound {
         comment_id: String,
         commit_sha: Option<String>,
         error: Option<String>,
+        /// URL of the auto-created MR when fix_branch_mode is "new_branch".
+        #[serde(skip_serializing_if = "Option::is_none")]
+        fix_mr_url: Option<String>,
     },
 
     /// Cached review delivered on MR join.

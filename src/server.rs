@@ -7,6 +7,10 @@
 //   GET  /ready                 → Readiness check (DB + optional Docker)
 //   POST /api/webhooks/gitlab   → GitLab webhook receiver
 //   GET  /.well-known/botto     → Discovery endpoint
+//   GET  /admin                 → Admin settings page
+//   GET  /api/admin/config      → Get current config (secrets redacted)
+//   PUT  /api/admin/config      → Update config (hot-swap + persist)
+//   GET  /api/admin/status      → Live server status
 //
 // Graceful shutdown on SIGTERM/SIGINT — drains active connections before exit.
 // ---------------------------------------------------------------------------
@@ -29,6 +33,9 @@ pub async fn run(state: AppState) -> Result<()> {
         .route("/ready", get(api::health::ready))
         .route("/api/webhooks/gitlab", post(api::webhooks::gitlab_webhook))
         .route("/.well-known/botto", get(api::discovery::well_known))
+        .route("/admin", get(api::admin::page))
+        .route("/api/admin/config", get(api::admin::get_config).put(api::admin::update_config))
+        .route("/api/admin/status", get(api::admin::get_status))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state.clone());

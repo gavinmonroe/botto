@@ -747,6 +747,45 @@ pub struct CommitResponse {
     pub title: String,
 }
 
+/// Create a merge request.
+/// Used when fix_branch_mode is "new_branch" — Botto pushes to a new branch
+/// and opens an MR targeting the original source branch.
+pub async fn create_merge_request(
+    cfg: &GitLabConfig,
+    project_id: i64,
+    source_branch: &str,
+    target_branch: &str,
+    title: &str,
+    description: &str,
+) -> Result<MergeRequest, GitLabError> {
+    let url = format!(
+        "{}/api/v4/projects/{}/merge_requests",
+        cfg.base_url, project_id
+    );
+    let client = build_client();
+
+    let body = serde_json::json!({
+        "source_branch": source_branch,
+        "target_branch": target_branch,
+        "title": title,
+        "description": description,
+        "remove_source_branch_when_merged": true,
+    });
+
+    let resp = client
+        .post(&url)
+        .headers(auth_headers(&cfg.token))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| GitLabError::Network(e.to_string()))?;
+
+    let resp = check_response(resp, "create_merge_request").await?;
+    resp.json()
+        .await
+        .map_err(|e| GitLabError::Parse(e.to_string()))
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

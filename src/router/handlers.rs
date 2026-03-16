@@ -766,7 +766,7 @@ pub async fn stream_review(
     let tasks = orchestrator::all_tasks();
     let ai_sem = state.ai_semaphore().clone();
     let _result = orchestrator::execute_review(
-        state.config(),
+        &state.config(),
         state.pool(),
         &mr_context,
         &tasks,
@@ -890,7 +890,7 @@ pub async fn stream_chat(
         }
     });
 
-    match service::generate_chat_response(state.config(), messages, &delta_tx, cancel_token).await {
+    match service::generate_chat_response(&state.config(), messages, &delta_tx, cancel_token).await {
         Ok(full_response) => {
             drop(delta_tx);
             let _ = forwarder.await;

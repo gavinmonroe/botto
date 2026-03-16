@@ -8,6 +8,7 @@
 
 use crate::config::BottoConfig;
 use crate::services::events::EventBus;
+use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use serde_json::Value;
 use sqlx::SqlitePool;
@@ -95,7 +96,7 @@ pub struct AppState {
 }
 
 pub struct AppStateInner {
-    pub config: BottoConfig,
+    pub config: ArcSwap<BottoConfig>,
     pub pool: SqlitePool,
     /// Active WebSocket connections, keyed by connection ID.
     pub connections: DashMap<String, Connection>,
@@ -116,7 +117,7 @@ impl AppState {
         let ai_semaphore = Arc::new(Semaphore::new(config.server.max_concurrent_ai_calls));
         Self {
             inner: Arc::new(AppStateInner {
-                config,
+                config: ArcSwap::from_pointee(config),
                 pool,
                 connections: DashMap::new(),
                 event_bus: EventBus::new(),
@@ -127,8 +128,17 @@ impl AppState {
         }
     }
 
-    pub fn config(&self) -> &BottoConfig {
-        &self.inner.config
+    /// Get the current config snapshot. Returns an Arc so it's safe to hold
+    /// across await points — no guard lifetime issues.
+    pub fn config(&self) -> Arc<BottoConfig> {
+        self.inner.config.load_full()
+    }
+
+    /// Hot-swap the config. Takes effect immediately for all subsequent
+    /// `config()` calls. In-flight operations that already loaded the old
+    /// config will finish with the old values (which is correct).
+    pub fn swap_config(&self, new_config: BottoConfig) {
+        self.inner.config.store(Arc::new(new_config));
     }
 
     pub fn pool(&self) -> &SqlitePool {

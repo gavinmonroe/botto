@@ -133,6 +133,8 @@ pub struct FixResult {
     pub commit_sha: Option<String>,
     pub test_output: Option<String>,
     pub error: Option<String>,
+    /// When fix_branch_mode is "new_branch", the URL of the auto-created MR.
+    pub fix_mr_url: Option<String>,
 }
 
 impl SandboxManager {
@@ -193,6 +195,7 @@ impl SandboxManager {
                     commit_sha: None,
                     test_output: None,
                     error: Some("sandbox semaphore closed".into()),
+                    fix_mr_url: None,
                 };
             }
         };
@@ -221,6 +224,7 @@ impl SandboxManager {
                     commit_sha: None,
                     test_output: None,
                     error: Some(format!("failed to resolve project: {}", e)),
+                    fix_mr_url: None,
                 };
             }
         };
@@ -308,6 +312,7 @@ impl SandboxManager {
                     commit_sha: None,
                     test_output: None,
                     error: Some(format!("failed to create container: {}", e)),
+                    fix_mr_url: None,
                 };
             }
         };
@@ -328,6 +333,7 @@ impl SandboxManager {
                 commit_sha: None,
                 test_output: None,
                 error: Some(format!("failed to start container: {}", e)),
+                fix_mr_url: None,
             };
         }
 
@@ -431,6 +437,7 @@ impl SandboxManager {
                 commit_sha: None,
                 test_output: e.output,
                 error: Some(e.error),
+                fix_mr_url: None,
             };
         }
 
@@ -546,6 +553,7 @@ impl SandboxManager {
                         commit_sha: None,
                         test_output: None,
                         error: Some("AI could not set up the project environment".into()),
+                        fix_mr_url: None,
                     };
                 }
 
@@ -622,6 +630,7 @@ impl SandboxManager {
                             "pre-validate failed: file '{}' not found in cloned repo (branch may have been rebased or file renamed)",
                             req.file_path
                         )),
+                        fix_mr_url: None,
                     };
                 }
             }
@@ -665,6 +674,7 @@ else:
                             "pre-validate failed: original code snippet not found in '{}' (source branch may have been updated since review)",
                             req.file_path
                         )),
+                        fix_mr_url: None,
                     };
                 }
                 _ => {
@@ -690,6 +700,7 @@ else:
                 commit_sha: None,
                 test_output: e.output,
                 error: Some(e.error),
+                fix_mr_url: None,
             };
         }
 
@@ -928,6 +939,7 @@ else:
                 commit_sha: None,
                 test_output: Some(test_output),
                 error: Some("tests failed after applying fix".into()),
+                fix_mr_url: None,
             };
         }
 
@@ -943,6 +955,7 @@ else:
                 commit_sha: None,
                 test_output: Some(test_output),
                 error: None,
+                fix_mr_url: None,
             };
         }
 
@@ -954,14 +967,38 @@ else:
             req.comment_id
         );
 
-        let git_cmds = format!(
-            "cd /workspace && git config user.name 'Botto' && git config user.email 'botto@bot' && git add -A && git commit -m {} && git push origin {}",
-            shell_escape(&commit_msg),
-            shell_escape(&req.source_branch),
-        );
+        // Determine the target branch to push to based on fix_branch_mode.
+        let use_new_branch = self.cfg.sandbox.fix_branch_mode == crate::config::FixBranchMode::NewBranch;
+        let push_branch = if use_new_branch {
+            generate_fix_branch_name(
+                req.mr_iid,
+                req.mr_title.as_deref(),
+                &req.file_path,
+                &req.comment_id,
+            )
+        } else {
+            req.source_branch.clone()
+        };
+
+        // In new_branch mode, create the branch from source_branch before pushing
+        let git_cmds = if use_new_branch {
+            format!(
+                "cd /workspace && git config user.name 'Botto' && git config user.email 'botto@bot' && git checkout -b {} && git add -A && git commit -m {} && git push origin {}",
+                shell_escape(&push_branch),
+                shell_escape(&commit_msg),
+                shell_escape(&push_branch),
+            )
+        } else {
+            format!(
+                "cd /workspace && git config user.name 'Botto' && git config user.email 'botto@bot' && git add -A && git commit -m {} && git push origin {}",
+                shell_escape(&commit_msg),
+                shell_escape(&req.source_branch),
+            )
+        };
 
         let push_result = self.exec_in_container(container_id, &git_cmds, deadline).await;
         let mut commit_sha = None;
+        let mut fix_mr_url = None;
 
         match push_result {
             Ok(output) if output.exit_code == 0 => {
@@ -971,6 +1008,13 @@ else:
                     Ok(o) => Some(o.stdout.trim().to_string()),
                     Err(_) => None,
                 };
+
+                // In new_branch mode, create an MR targeting the original source branch
+                if use_new_branch {
+                    fix_mr_url = self.create_fix_mr(
+                        &req, &push_branch, &commit_msg,
+                    ).await;
+                }
             }
             _ => {
                 // Git push failed — try GitLab Commits API fallback
@@ -1012,20 +1056,62 @@ else:
                         content: Some(content),
                     };
 
+                    // For new_branch mode via API, we need start_branch to create the branch.
+                    // The create_commit API supports a `start_branch` param to branch from.
+                    let api_branch = if use_new_branch { &push_branch } else { &req.source_branch };
+
                     let mut api_success = false;
                     for pid in &target_project_ids {
-                        match crate::services::gitlab::client::create_commit(
-                            &gl_cfg,
-                            *pid,
-                            &req.source_branch,
-                            &commit_msg,
-                            vec![action.clone()],
-                        ).await {
+                        // Build the commit body — include start_branch for new_branch mode
+                        let body = if use_new_branch {
+                            serde_json::json!({
+                                "branch": api_branch,
+                                "start_branch": req.source_branch,
+                                "commit_message": commit_msg,
+                                "actions": [action.clone()],
+                            })
+                        } else {
+                            serde_json::json!({
+                                "branch": api_branch,
+                                "commit_message": commit_msg,
+                                "actions": [action.clone()],
+                            })
+                        };
+
+                        let url = format!(
+                            "{}/api/v4/projects/{}/repository/commits",
+                            gl_cfg.base_url, pid
+                        );
+                        let client = reqwest::Client::builder()
+                            .timeout(std::time::Duration::from_secs(30))
+                            .build()
+                            .expect("failed to build HTTP client");
+
+                        let mut headers = reqwest::header::HeaderMap::new();
+                        headers.insert(
+                            "PRIVATE-TOKEN",
+                            reqwest::header::HeaderValue::from_str(&gl_cfg.token)
+                                .unwrap_or_else(|_| reqwest::header::HeaderValue::from_static("")),
+                        );
+
+                        match client.post(&url).headers(headers).json(&body).send().await {
+                            Ok(resp) if resp.status().is_success() => {
+                                if let Ok(cr) = resp.json::<crate::services::gitlab::client::CommitResponse>().await {
+                                    info!("GitLab API commit succeeded: {} on project {}", cr.id, pid);
+                                    commit_sha = Some(cr.id);
+                                    api_success = true;
+
+                                    // Create MR in new_branch mode
+                                    if use_new_branch {
+                                        fix_mr_url = self.create_fix_mr(
+                                            &req, &push_branch, &commit_msg,
+                                        ).await;
+                                    }
+                                    break;
+                                }
+                            }
                             Ok(resp) => {
-                                info!("GitLab API commit succeeded: {} on project {}", resp.id, pid);
-                                commit_sha = Some(resp.id);
-                                api_success = true;
-                                break;
+                                warn!("GitLab API commit failed on project {}: status {}", pid, resp.status());
                             }
                             Err(e) => {
                                 warn!("GitLab API commit failed on project {}: {}", pid, e);
@@ -1040,6 +1126,7 @@ else:
                             commit_sha: None,
                             test_output: Some(test_output),
                             error: Some("push failed: git push and API commit both failed (bot may lack write access to fork)".into()),
+                            fix_mr_url: None,
                         };
                     }
                 } else {
@@ -1049,6 +1136,7 @@ else:
                         commit_sha: None,
                         test_output: Some(test_output),
                         error: Some("push failed: could not read modified file from container".into()),
+                        fix_mr_url: None,
                     };
                 }
             }
@@ -1060,6 +1148,73 @@ else:
             commit_sha,
             test_output: Some(test_output),
             error: None,
+            fix_mr_url,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // New-branch MR creation
+    // -----------------------------------------------------------------------
+
+    /// Create a merge request from the fix branch back to the original source branch.
+    /// Returns the MR web URL on success, None on failure (logged but non-fatal).
+    async fn create_fix_mr(
+        &self,
+        req: &FixRequest,
+        fix_branch: &str,
+        commit_msg: &str,
+    ) -> Option<String> {
+        let gl_cfg = crate::services::gitlab::client::GitLabConfig {
+            base_url: self.cfg.gitlab.url.clone(),
+            token: self.cfg.gitlab.bot_token.clone(),
+        };
+
+        // Resolve the project ID to push the MR to.
+        // For fork-based MRs, create the MR on the fork (source project).
+        let project_path = req.source_project_path.as_deref().unwrap_or(&req.project_path);
+        let project_id = match crate::services::gitlab::client::fetch_project(&gl_cfg, project_path).await {
+            Ok(p) => p.id,
+            Err(e) => {
+                warn!("failed to resolve project for fix MR: {}", e);
+                return None;
+            }
+        };
+
+        let title = format!(
+            "fix: {} (Botto sandbox fix for !{})",
+            req.comment_title.as_deref().unwrap_or(&req.file_path),
+            req.mr_iid,
+        );
+
+        let description = format!(
+            "Automated fix applied by Botto's sandbox.\n\n\
+             **Source MR:** !{}\n\
+             **File:** `{}`\n\
+             **Commit message:** {}\n\n\
+             This branch was auto-created because `fix_branch_mode = \"new_branch\"` is configured.\n\
+             Merge this into `{}` to apply the fix.",
+            req.mr_iid,
+            req.file_path,
+            commit_msg,
+            req.source_branch,
+        );
+
+        match crate::services::gitlab::client::create_merge_request(
+            &gl_cfg,
+            project_id,
+            fix_branch,
+            &req.source_branch,
+            &title,
+            &description,
+        ).await {
+            Ok(mr) => {
+                info!("created fix MR: {} ({})", mr.iid, mr.web_url);
+                Some(mr.web_url)
+            }
+            Err(e) => {
+                warn!("failed to create fix MR: {}", e);
+                None
+            }
         }
     }
 
@@ -1884,4 +2039,91 @@ else:
 /// Simple shell escaping — wraps in single quotes.
 fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Generate a branch name for new_branch fix mode.
+/// Format: `botto/fix/mr-{iid}-{slug}[-{suffix}]`
+/// The slug is derived from the MR title (or file path as fallback),
+/// lowercased, non-alphanumeric chars replaced with hyphens, truncated to 40 chars.
+fn generate_fix_branch_name(mr_iid: u64, mr_title: Option<&str>, file_path: &str, comment_id: &str) -> String {
+    let raw = mr_title.unwrap_or(file_path);
+
+    let slug: String = raw
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect::<String>()
+        .split('-')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+
+    // Truncate slug and add a short suffix from comment_id for uniqueness
+    // (multiple fixes on the same MR get different branches)
+    let slug_truncated = if slug.len() > 40 { &slug[..40] } else { &slug };
+    let suffix: String = comment_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(6)
+        .collect();
+
+    format!("botto/fix/mr-{}-{}-{}", mr_iid, slug_truncated, suffix)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn branch_name_from_mr_title() {
+        let name = generate_fix_branch_name(42, Some("Add user authentication"), "src/auth.rs", "abc123");
+        assert_eq!(name, "botto/fix/mr-42-add-user-authentication-abc123");
+    }
+
+    #[test]
+    fn branch_name_falls_back_to_file_path() {
+        let name = generate_fix_branch_name(7, None, "src/utils/parser.ts", "def456");
+        assert_eq!(name, "botto/fix/mr-7-src-utils-parser-ts-def456");
+    }
+
+    #[test]
+    fn branch_name_truncates_long_titles() {
+        let long_title = "This is a very long merge request title that exceeds the forty character slug limit by quite a lot";
+        let name = generate_fix_branch_name(99, Some(long_title), "file.rs", "xyz789");
+        // Slug should be truncated to 40 chars
+        assert!(name.starts_with("botto/fix/mr-99-"));
+        assert!(name.ends_with("-xyz789"));
+        // Total slug portion should be <= 40 chars
+        let slug_part = name.strip_prefix("botto/fix/mr-99-").unwrap()
+            .strip_suffix("-xyz789").unwrap();
+        assert!(slug_part.len() <= 40);
+    }
+
+    #[test]
+    fn branch_name_strips_special_chars() {
+        let name = generate_fix_branch_name(1, Some("fix: handle `None` case (edge-case)"), "lib.rs", "aaa111");
+        // Special chars become hyphens, consecutive hyphens collapsed
+        assert_eq!(name, "botto/fix/mr-1-fix-handle-none-case-edge-case-aaa111");
+    }
+
+    #[test]
+    fn branch_name_suffix_from_followup_key() {
+        // Follow-up fix keys look like "followup-99887766-0"
+        let name = generate_fix_branch_name(42, Some("Add auth"), "src/auth.rs", "followup-99887766-0");
+        // Suffix takes first 6 alphanumeric chars: "follow"
+        assert_eq!(name, "botto/fix/mr-42-add-auth-follow");
+    }
+
+    #[test]
+    fn branch_name_suffix_from_numeric_comment_id() {
+        let name = generate_fix_branch_name(42, Some("Fix bug"), "src/main.rs", "55443322");
+        assert_eq!(name, "botto/fix/mr-42-fix-bug-554433");
+    }
+
+    #[test]
+    fn branch_name_unique_per_comment() {
+        let name1 = generate_fix_branch_name(42, Some("Fix bug"), "src/main.rs", "aaa111");
+        let name2 = generate_fix_branch_name(42, Some("Fix bug"), "src/main.rs", "bbb222");
+        assert_ne!(name1, name2);
+    }
 }
