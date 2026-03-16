@@ -443,6 +443,7 @@ async fn handle_message(
             target_branch,
             start_line,
             end_line,
+            gitlab_note_id,
         } => {
             let state = state.clone();
             let conn_id = conn_id.to_string();
@@ -466,6 +467,7 @@ async fn handle_message(
                     target_branch.as_deref(),
                     start_line,
                     end_line,
+                    gitlab_note_id,
                     &tx,
                 )
                 .await;
@@ -564,6 +566,12 @@ pub enum WsInbound {
         target_branch: Option<String>,
         start_line: Option<u32>,
         end_line: Option<u32>,
+        /// GitLab note ID for reply threading. When a fix originates from a
+        /// follow-up comment analysis (not a Botto review comment), the
+        /// `comment_id` is an Otto-internal tracking key. This field carries
+        /// the real GitLab note ID so the post-fix comment replies to the
+        /// correct discussion thread.
+        gitlab_note_id: Option<i64>,
     },
 }
 
@@ -666,4 +674,222 @@ pub struct ServerCapabilities {
     pub max_concurrent_reviews: u32,
     pub shared_triage_available: bool,
     pub version: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // REQUEST_FIX deserialization — verify gitlab_note_id handling
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn request_fix_without_gitlab_note_id() {
+        let json = r#"{
+            "type": "REQUEST_FIX",
+            "project_path": "mygroup/myproject",
+            "mr_iid": 42,
+            "comment_id": "abc-123",
+            "suggestion": "let x = 1;",
+            "file_path": "src/main.rs",
+            "original_code": "let x = 0;"
+        }"#;
+        let msg: WsInbound = serde_json::from_str(json).unwrap();
+        match msg {
+            WsInbound::RequestFix {
+                project_path,
+                mr_iid,
+                comment_id,
+                suggestion,
+                file_path,
+                original_code,
+                gitlab_note_id,
+                ..
+            } => {
+                assert_eq!(project_path, "mygroup/myproject");
+                assert_eq!(mr_iid, 42);
+                assert_eq!(comment_id, "abc-123");
+                assert_eq!(suggestion, "let x = 1;");
+                assert_eq!(file_path, "src/main.rs");
+                assert_eq!(original_code, "let x = 0;");
+                assert_eq!(gitlab_note_id, None);
+            }
+            other => panic!("expected RequestFix, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn request_fix_with_gitlab_note_id() {
+        let json = r#"{
+            "type": "REQUEST_FIX",
+            "project_path": "mygroup/myproject",
+            "mr_iid": 42,
+            "comment_id": "followup-99887766-0",
+            "suggestion": "let x = 1;",
+            "file_path": "src/main.rs",
+            "original_code": "let x = 0;",
+            "gitlab_note_id": 99887766
+        }"#;
+        let msg: WsInbound = serde_json::from_str(json).unwrap();
+        match msg {
+            WsInbound::RequestFix {
+                comment_id,
+                gitlab_note_id,
+                ..
+            } => {
+                assert_eq!(comment_id, "followup-99887766-0");
+                assert_eq!(gitlab_note_id, Some(99887766));
+            }
+            other => panic!("expected RequestFix, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn request_fix_with_null_gitlab_note_id() {
+        let json = r#"{
+            "type": "REQUEST_FIX",
+            "project_path": "mygroup/myproject",
+            "mr_iid": 42,
+            "comment_id": "abc-123",
+            "suggestion": "let x = 1;",
+            "file_path": "src/main.rs",
+            "original_code": "let x = 0;",
+            "gitlab_note_id": null
+        }"#;
+        let msg: WsInbound = serde_json::from_str(json).unwrap();
+        match msg {
+            WsInbound::RequestFix { gitlab_note_id, .. } => {
+                assert_eq!(gitlab_note_id, None);
+            }
+            other => panic!("expected RequestFix, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn request_fix_with_all_optional_fields() {
+        let json = r#"{
+            "type": "REQUEST_FIX",
+            "project_path": "org/repo",
+            "mr_iid": 7,
+            "comment_id": "followup-12345-2",
+            "suggestion": "fn fixed() {}",
+            "file_path": "lib.rs",
+            "original_code": "fn broken() {}",
+            "source_branch": "feature-branch",
+            "comment_body": "Follow-up fix explanation",
+            "comment_title": "Follow-up fix: lib.rs",
+            "severity": "warning",
+            "target_branch": "main",
+            "start_line": 10,
+            "end_line": 15,
+            "gitlab_note_id": 12345
+        }"#;
+        let msg: WsInbound = serde_json::from_str(json).unwrap();
+        match msg {
+            WsInbound::RequestFix {
+                project_path,
+                mr_iid,
+                comment_id,
+                suggestion,
+                file_path,
+                original_code,
+                source_branch,
+                comment_body,
+                comment_title,
+                severity,
+                target_branch,
+                start_line,
+                end_line,
+                gitlab_note_id,
+            } => {
+                assert_eq!(project_path, "org/repo");
+                assert_eq!(mr_iid, 7);
+                assert_eq!(comment_id, "followup-12345-2");
+                assert_eq!(suggestion, "fn fixed() {}");
+                assert_eq!(file_path, "lib.rs");
+                assert_eq!(original_code, "fn broken() {}");
+                assert_eq!(source_branch, Some("feature-branch".into()));
+                assert_eq!(comment_body, Some("Follow-up fix explanation".into()));
+                assert_eq!(comment_title, Some("Follow-up fix: lib.rs".into()));
+                assert_eq!(severity, Some("warning".into()));
+                assert_eq!(target_branch, Some("main".into()));
+                assert_eq!(start_line, Some(10));
+                assert_eq!(end_line, Some(15));
+                assert_eq!(gitlab_note_id, Some(12345));
+            }
+            other => panic!("expected RequestFix, got {:?}", other),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Backward compatibility — existing review comment fix (no gitlab_note_id)
+    // still works with numeric comment_id parsed as note ID in the router.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn request_fix_review_comment_backward_compat() {
+        // This is what Otto sends today for a Botto review comment fix.
+        // comment_id is the numeric GitLab note ID as a string.
+        // gitlab_note_id is absent — the router falls back to parsing comment_id.
+        let json = r#"{
+            "type": "REQUEST_FIX",
+            "project_path": "mygroup/myproject",
+            "mr_iid": 42,
+            "comment_id": "55443322",
+            "suggestion": "let x = 1;",
+            "file_path": "src/main.rs",
+            "original_code": "let x = 0;",
+            "source_branch": "fix-branch"
+        }"#;
+        let msg: WsInbound = serde_json::from_str(json).unwrap();
+        match msg {
+            WsInbound::RequestFix {
+                comment_id,
+                gitlab_note_id,
+                ..
+            } => {
+                assert_eq!(comment_id, "55443322");
+                assert_eq!(gitlab_note_id, None);
+                // Router will do: gitlab_note_id.or_else(|| comment_id.parse().ok())
+                // => Some(55443322) — backward compatible
+                let resolved: Option<i64> = gitlab_note_id.or_else(|| comment_id.parse().ok());
+                assert_eq!(resolved, Some(55443322));
+            }
+            other => panic!("expected RequestFix, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn request_fix_followup_note_id_resolution() {
+        // Follow-up fix: comment_id is a tracking key, gitlab_note_id is the real note.
+        let json = r#"{
+            "type": "REQUEST_FIX",
+            "project_path": "mygroup/myproject",
+            "mr_iid": 42,
+            "comment_id": "followup-99887766-0",
+            "suggestion": "let x = 1;",
+            "file_path": "src/main.rs",
+            "original_code": "let x = 0;",
+            "gitlab_note_id": 99887766
+        }"#;
+        let msg: WsInbound = serde_json::from_str(json).unwrap();
+        match msg {
+            WsInbound::RequestFix {
+                comment_id,
+                gitlab_note_id,
+                ..
+            } => {
+                // comment_id is NOT a valid i64 — it's a tracking key
+                assert!(comment_id.parse::<i64>().is_err());
+                // gitlab_note_id carries the real note ID
+                assert_eq!(gitlab_note_id, Some(99887766));
+                // Router will do: gitlab_note_id.or_else(|| comment_id.parse().ok())
+                // => Some(99887766) — uses the explicit field
+                let resolved: Option<i64> = gitlab_note_id.or_else(|| comment_id.parse().ok());
+                assert_eq!(resolved, Some(99887766));
+            }
+            other => panic!("expected RequestFix, got {:?}", other),
+        }
+    }
 }

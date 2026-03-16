@@ -288,6 +288,7 @@ pub async fn handle_fix_request(
     target_branch: Option<&str>,
     start_line: Option<u32>,
     end_line: Option<u32>,
+    gitlab_note_id: Option<i64>,
     tx: &broadcast::Sender<String>,
 ) {
     if !state.config().sandbox.enabled {
@@ -448,15 +449,23 @@ pub async fn handle_fix_request(
             // Falls back to a top-level MR note if the discussion can't be found.
             if result.success {
                 if let Some(ref sha) = result.commit_sha {
+                    // Distinguish follow-up fixes from review comment fixes in the message.
+                    let fix_source = if gitlab_note_id.is_some() && comment_id.starts_with("followup-") {
+                        "a follow-up comment"
+                    } else {
+                        "this review comment"
+                    };
                     let comment_body = format!(
-                        "🔧 **Botto applied a fix** for this review comment.\n\n\
+                        "🔧 **Botto applied a fix** for {}.\n\n\
                          Commit: {}\n\n\
                          The fix was applied and tests passed in a sandboxed Docker container.",
-                        sha,
+                        fix_source, sha,
                     );
                     if let Some(pid) = project_id {
-                        // Try to find the discussion thread for the original comment
-                        let note_id: Option<i64> = comment_id.parse().ok();
+                        // Try to find the discussion thread for the original comment.
+                        // Prefer the explicit gitlab_note_id (set for follow-up fixes)
+                        // over parsing comment_id (which may be an Otto-internal key).
+                        let note_id: Option<i64> = gitlab_note_id.or_else(|| comment_id.parse().ok());
                         let mut posted = false;
 
                         if let Some(nid) = note_id {
