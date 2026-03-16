@@ -911,3 +911,29 @@ pub async fn stream_chat(
 
     let _ = tx.send(serde_json::to_string(&WsOutbound::StreamEnd { stream_id: stream_id.to_string() }).unwrap());
 }
+
+// ---------------------------------------------------------------------------
+// Team digest
+// ---------------------------------------------------------------------------
+
+pub async fn get_team_digest(state: &AppState, payload: &Value) -> Value {
+    let project_path = match extract_str(payload, "project_path") {
+        Some(p) => p,
+        None => return err("missing project_path"),
+    };
+
+    let period_str = extract_str(payload, "period").unwrap_or("weekly");
+    let period = match period_str {
+        "daily" => crate::services::digest::DigestPeriod::Daily,
+        "weekly" => crate::services::digest::DigestPeriod::Weekly,
+        _ => return err("invalid period — must be 'daily' or 'weekly'"),
+    };
+
+    match crate::services::digest::get_team_digest(state, project_path, period).await {
+        Ok(digest) => ok(serde_json::to_value(digest).unwrap_or_default()),
+        Err(e) => {
+            warn!("digest computation failed for {}: {}", project_path, e);
+            err(&format!("failed to compute digest: {}", e))
+        }
+    }
+}

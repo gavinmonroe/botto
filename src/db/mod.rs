@@ -48,6 +48,11 @@ async fn migrate(pool: &SqlitePool) -> Result<()> {
         .await
         .context("migration 001 failed")?;
 
+    sqlx::query(MIGRATION_002)
+        .execute(pool)
+        .await
+        .context("migration 002 failed")?;
+
     info!("migrations complete");
     Ok(())
 }
@@ -167,4 +172,17 @@ CREATE INDEX IF NOT EXISTS idx_events_mr
 
 -- Clear ephemeral connections on startup
 DELETE FROM connections;
+"#;
+
+const MIGRATION_002: &str = r#"
+-- Team activity digests (cached, with TTL)
+CREATE TABLE IF NOT EXISTS digests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_path TEXT NOT NULL,
+    period TEXT NOT NULL,
+    digest BLOB NOT NULL,
+    generated_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    UNIQUE(project_path, period)
+);
 "#;

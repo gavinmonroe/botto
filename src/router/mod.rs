@@ -61,6 +61,7 @@ pub async fn handle_request(state: &AppState, payload: &Value) -> Value {
         "RESUME_REVIEW" => handlers::resume_review(state, effective_payload).await,
         "CANCEL_REVIEW" => handlers::cancel_review(state, effective_payload).await,
         "GET_SANDBOX_JOB" => handlers::get_sandbox_job(state, effective_payload).await,
+        "GET_TEAM_DIGEST" => handlers::get_team_digest(state, effective_payload).await,
         _ => {
             warn!("unknown request type: {}", msg_type);
             serde_json::json!({
@@ -202,6 +203,16 @@ pub async fn handle_viewing_mr(
             payload: Some(serde_json::json!({ "user_id": user_id, "viewer_count": viewers.len() })),
         };
         state.broadcast_to_mr_except(mr, &serde_json::to_string(&msg).unwrap(), conn_id);
+    }
+
+    // Send presence snapshot — all other viewers' file positions.
+    // This is the initial state; subsequent changes arrive as PRESENCE_UPDATE deltas.
+    let presence = state.get_mr_presence(mr, Some(conn_id));
+    if !presence.is_empty() {
+        let msg = crate::api::ws::WsOutbound::PresenceSnapshot {
+            viewers: presence,
+        };
+        let _ = tx.send(serde_json::to_string(&msg).unwrap());
     }
 
     Ok(())

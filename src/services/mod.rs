@@ -1,4 +1,5 @@
 pub mod ai;
+pub mod digest;
 pub mod events;
 pub mod gitlab;
 pub mod harness;

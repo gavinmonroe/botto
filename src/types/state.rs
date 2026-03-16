@@ -10,18 +10,38 @@ use crate::config::BottoConfig;
 use crate::services::events::EventBus;
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::SqlitePool;
+use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::{broadcast, watch, Semaphore};
+
+/// A file (and optional line range) a user is currently viewing in a diff.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ViewingFile {
+    pub path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_line: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_line: Option<u32>,
+}
 
 /// A connected Otto extension instance.
 #[derive(Debug, Clone)]
 pub struct Connection {
     pub id: String,
     pub user_id: Option<String>,
+    /// Full display name from GitLab (e.g. "Gavin Smith"). Resolved on AUTH.
+    pub display_name: Option<String>,
+    /// GitLab avatar URL. Resolved on AUTH.
+    pub avatar_url: Option<String>,
     pub authenticated: bool,
     pub viewing_mr: Option<MrRef>,
+    /// Files currently visible in the user's viewport (updated via VIEWING_FILES).
+    pub viewing_files: Vec<ViewingFile>,
+    /// Last time viewing_files was updated — used for server-side rate limiting.
+    pub files_updated_at: Option<tokio::time::Instant>,
     pub tx: broadcast::Sender<String>,
 }
 
@@ -100,6 +120,11 @@ pub struct AppStateInner {
     pub pool: SqlitePool,
     /// Active WebSocket connections, keyed by connection ID.
     pub connections: DashMap<String, Connection>,
+    /// Secondary index: MrRef::key() → set of connection IDs viewing that MR.
+    /// Maintained alongside `connections` on VIEWING_MR / LEFT_MR / disconnect.
+    /// Makes broadcast_to_mr O(k) where k = viewers of that MR, instead of
+    /// O(n) over all connections.
+    pub mr_viewers: DashMap<String, HashSet<String>>,
     /// Event bus for cross-connection broadcasting.
     pub event_bus: EventBus,
     /// In-flight reviews, keyed by MrRef::key(). Prevents duplicate reviews
@@ -120,6 +145,7 @@ impl AppState {
                 config: ArcSwap::from_pointee(config),
                 pool,
                 connections: DashMap::new(),
+                mr_viewers: DashMap::new(),
                 event_bus: EventBus::new(),
                 in_flight: DashMap::new(),
                 review_semaphore,
@@ -166,31 +192,22 @@ impl AppState {
     }
 
     /// Get all connection IDs currently viewing a specific MR.
+    /// O(k) where k = viewers of that MR (uses secondary index).
     pub fn viewers_of(&self, mr: &MrRef) -> Vec<String> {
         self.inner
-            .connections
-            .iter()
-            .filter_map(|entry| {
-                let conn = entry.value();
-                if conn.authenticated {
-                    if let Some(ref viewing) = conn.viewing_mr {
-                        if viewing == mr {
-                            return Some(conn.id.clone());
-                        }
-                    }
-                }
-                None
-            })
-            .collect()
+            .mr_viewers
+            .get(&mr.key())
+            .map(|set| set.iter().cloned().collect())
+            .unwrap_or_default()
     }
 
     /// Broadcast a JSON message to all authenticated connections viewing a specific MR.
+    /// O(k) where k = viewers of that MR.
     pub fn broadcast_to_mr(&self, mr: &MrRef, message: &str) {
-        for entry in self.inner.connections.iter() {
-            let conn = entry.value();
-            if conn.authenticated {
-                if let Some(ref viewing) = conn.viewing_mr {
-                    if viewing == mr {
+        if let Some(viewer_ids) = self.inner.mr_viewers.get(&mr.key()) {
+            for conn_id in viewer_ids.iter() {
+                if let Some(conn) = self.inner.connections.get(conn_id) {
+                    if conn.authenticated {
                         let _ = conn.tx.send(message.to_owned());
                     }
                 }
@@ -199,16 +216,123 @@ impl AppState {
     }
 
     /// Broadcast a JSON message to all authenticated connections except the sender.
+    /// O(k) where k = viewers of that MR.
     pub fn broadcast_to_mr_except(&self, mr: &MrRef, message: &str, except_id: &str) {
-        for entry in self.inner.connections.iter() {
-            let conn = entry.value();
-            if conn.authenticated && conn.id != except_id {
-                if let Some(ref viewing) = conn.viewing_mr {
-                    if viewing == mr {
-                        let _ = conn.tx.send(message.to_owned());
+        if let Some(viewer_ids) = self.inner.mr_viewers.get(&mr.key()) {
+            for conn_id in viewer_ids.iter() {
+                if conn_id != except_id {
+                    if let Some(conn) = self.inner.connections.get(conn_id) {
+                        if conn.authenticated {
+                            let _ = conn.tx.send(message.to_owned());
+                        }
                     }
                 }
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Secondary index maintenance — call these whenever viewing_mr changes.
+    // -----------------------------------------------------------------------
+
+    /// Track a connection as viewing an MR. Removes from old MR if switching.
+    /// Returns the old MrRef if the connection was previously viewing a different MR.
+    pub fn track_viewer(&self, conn_id: &str, new_mr: &MrRef) -> Option<MrRef> {
+        let old_mr = if let Some(mut conn) = self.inner.connections.get_mut(conn_id) {
+            let old = conn.viewing_mr.take();
+            conn.viewing_mr = Some(new_mr.clone());
+            // Clear file-level presence when switching MRs
+            conn.viewing_files.clear();
+            conn.files_updated_at = None;
+            old
+        } else {
+            return None;
+        };
+
+        // Remove from old MR's viewer set
+        if let Some(ref old) = old_mr {
+            if let Some(mut set) = self.inner.mr_viewers.get_mut(&old.key()) {
+                set.remove(conn_id);
+                if set.is_empty() {
+                    drop(set);
+                    self.inner.mr_viewers.remove(&old.key());
+                }
+            }
+        }
+
+        // Add to new MR's viewer set
+        self.inner
+            .mr_viewers
+            .entry(new_mr.key())
+            .or_insert_with(HashSet::new)
+            .insert(conn_id.to_string());
+
+        old_mr
+    }
+
+    /// Remove a connection from its current MR viewer set.
+    /// Returns the MrRef it was viewing, if any.
+    pub fn untrack_viewer(&self, conn_id: &str) -> Option<MrRef> {
+        let old_mr = if let Some(mut conn) = self.inner.connections.get_mut(conn_id) {
+            let old = conn.viewing_mr.take();
+            conn.viewing_files.clear();
+            conn.files_updated_at = None;
+            old
+        } else {
+            return None;
+        };
+
+        if let Some(ref mr) = old_mr {
+            if let Some(mut set) = self.inner.mr_viewers.get_mut(&mr.key()) {
+                set.remove(conn_id);
+                if set.is_empty() {
+                    drop(set);
+                    self.inner.mr_viewers.remove(&mr.key());
+                }
+            }
+        }
+
+        old_mr
+    }
+
+    /// Remove a connection entirely (on disconnect). Cleans up the viewer index.
+    pub fn remove_connection(&self, conn_id: &str) -> Option<Connection> {
+        let removed = self.inner.connections.remove(conn_id);
+        if let Some((_, ref conn)) = removed {
+            if let Some(ref mr) = conn.viewing_mr {
+                if let Some(mut set) = self.inner.mr_viewers.get_mut(&mr.key()) {
+                    set.remove(conn_id);
+                    if set.is_empty() {
+                        drop(set);
+                        self.inner.mr_viewers.remove(&mr.key());
+                    }
+                }
+            }
+        }
+        removed.map(|(_, c)| c)
+    }
+
+    /// Get the current file-level presence for all viewers of an MR (excluding one connection).
+    /// Used to build PRESENCE_SNAPSHOT on join and PRESENCE_UPDATE on file changes.
+    pub fn get_mr_presence(&self, mr: &MrRef, except_id: Option<&str>) -> Vec<Value> {
+        let mut result = Vec::new();
+        if let Some(viewer_ids) = self.inner.mr_viewers.get(&mr.key()) {
+            for conn_id in viewer_ids.iter() {
+                if except_id == Some(conn_id.as_str()) {
+                    continue;
+                }
+                if let Some(conn) = self.inner.connections.get(conn_id) {
+                    if conn.authenticated && !conn.viewing_files.is_empty() {
+                        result.push(serde_json::json!({
+                            "user_id": conn.user_id,
+                            "display_name": conn.display_name,
+                            "avatar_url": conn.avatar_url,
+                            "files": conn.viewing_files,
+                        }));
+                    }
+                }
+            }
+        }
+        result
     }
 }

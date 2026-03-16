@@ -95,7 +95,7 @@ async fn check_response(resp: Response, context: &str) -> Result<Response, GitLa
     }
 }
 
-async fn get_json<T: DeserializeOwned>(
+pub(crate) async fn get_json<T: DeserializeOwned>(
     cfg: &GitLabConfig,
     path: &str,
     query: &[(&str, &str)],
@@ -618,6 +618,22 @@ pub struct GitLabUser {
     pub id: i64,
     pub username: String,
     pub name: String,
+    #[serde(default)]
+    pub avatar_url: Option<String>,
+}
+
+/// Fetch a GitLab user by username. Returns None if not found.
+pub async fn fetch_user_by_username(
+    cfg: &GitLabConfig,
+    username: &str,
+) -> Result<Option<GitLabUser>, GitLabError> {
+    let users: Vec<GitLabUser> = get_json(
+        cfg,
+        "/users",
+        &[("username", username)],
+    )
+    .await?;
+    Ok(users.into_iter().next())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

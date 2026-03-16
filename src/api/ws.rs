@@ -19,7 +19,7 @@
 // ---------------------------------------------------------------------------
 
 use crate::router;
-use crate::types::state::{AppState, Connection, MrRef};
+use crate::types::state::{AppState, Connection, MrRef, ViewingFile};
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{State, WebSocketUpgrade};
 use axum::response::IntoResponse;
@@ -36,6 +36,10 @@ const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 
 /// How long to wait for the AUTH message before closing.
 const AUTH_TIMEOUT_SECS: u64 = 10;
+
+/// Minimum interval between VIEWING_FILES updates from a single connection.
+/// Server-side safety net behind the client's 3s throttle.
+const VIEWING_FILES_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
 pub async fn handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
     ws.max_message_size(MAX_MESSAGE_SIZE)
@@ -85,12 +89,32 @@ async fn handle_connection(socket: WebSocket, state: AppState) {
         }
     };
 
-    // Register connection
+    // Register connection — resolve GitLab profile for display name + avatar
+    let (display_name, avatar_url) = {
+        let cfg = state.config();
+        if !cfg.gitlab.bot_token.is_empty() && !cfg.gitlab.url.is_empty() {
+            let gl_cfg = crate::services::gitlab::client::GitLabConfig {
+                base_url: cfg.gitlab.url.clone(),
+                token: cfg.gitlab.bot_token.clone(),
+            };
+            match crate::services::gitlab::client::fetch_user_by_username(&gl_cfg, &user_id).await {
+                Ok(Some(gl_user)) => (Some(gl_user.name), gl_user.avatar_url),
+                _ => (None, None),
+            }
+        } else {
+            (None, None)
+        }
+    };
+
     let conn = Connection {
         id: conn_id.clone(),
         user_id: Some(user_id.clone()),
+        display_name,
+        avatar_url,
         authenticated: true,
         viewing_mr: None,
+        viewing_files: Vec::new(),
+        files_updated_at: None,
         tx: tx.clone(),
     };
     state.connections().insert(conn_id.clone(), conn);
@@ -204,7 +228,7 @@ async fn handle_connection(socket: WebSocket, state: AppState) {
     }
     drop(streams);
 
-    // Publish leave event if viewing an MR
+    // Publish leave event if viewing an MR, and broadcast presence removal
     if let Some(entry) = state.connections().get(&conn_id) {
         if let Some(ref mr) = entry.viewing_mr {
             state.event_bus().publish(crate::services::events::Event {
@@ -214,11 +238,19 @@ async fn handle_connection(socket: WebSocket, state: AppState) {
                 user_id: Some(user_id.clone()),
                 payload: None,
             });
+            // Broadcast empty presence so other viewers remove this user's avatars
+            let msg = WsOutbound::PresenceUpdate {
+                user_id: user_id.clone(),
+                display_name: entry.display_name.clone(),
+                avatar_url: entry.avatar_url.clone(),
+                files: vec![],
+            };
+            state.broadcast_to_mr_except(mr, &serde_json::to_string(&msg).unwrap(), &conn_id);
         }
     }
 
-    // Remove from connections
-    state.connections().remove(&conn_id);
+    // Remove from connections + secondary index
+    state.remove_connection(&conn_id);
     let _ = crate::db::queries::remove_connection(state.pool(), &conn_id).await;
 
     info!("ws disconnected: {} user={}", conn_id, user_id);
@@ -295,19 +327,18 @@ async fn handle_message(
                 mr_iid,
             };
 
-            // Update connection state
-            if let Some(mut entry) = state.connections().get_mut(conn_id) {
-                // Publish leave for previous MR if any
-                if let Some(ref old_mr) = entry.viewing_mr {
-                    state.event_bus().publish(crate::services::events::Event {
-                        event_type: crate::services::events::EventType::UserLeftMr,
-                        project_path: old_mr.project_path.clone(),
-                        mr_iid: Some(old_mr.mr_iid),
-                        user_id: Some(user_id.to_string()),
-                        payload: None,
-                    });
-                }
-                entry.viewing_mr = Some(mr_ref.clone());
+            // Update connection state + secondary index (returns old MR if switching)
+            let old_mr = state.track_viewer(conn_id, &mr_ref);
+
+            // Publish leave for previous MR if switching
+            if let Some(ref old) = old_mr {
+                state.event_bus().publish(crate::services::events::Event {
+                    event_type: crate::services::events::EventType::UserLeftMr,
+                    project_path: old.project_path.clone(),
+                    mr_iid: Some(old.mr_iid),
+                    user_id: Some(user_id.to_string()),
+                    payload: None,
+                });
             }
 
             let _ = crate::db::queries::update_viewing_mr(
@@ -326,25 +357,78 @@ async fn handle_message(
                 payload: None,
             });
 
-            // Send back any existing cached review + comment actions
+            // Send back any existing cached review + comment actions + presence snapshot
             let _ = router::handle_viewing_mr(state, conn_id, user_id, &mr_ref, tx).await;
         }
 
         WsInbound::LeftMr => {
-            if let Some(mut entry) = state.connections().get_mut(conn_id) {
-                if let Some(ref mr) = entry.viewing_mr {
-                    state.event_bus().publish(crate::services::events::Event {
-                        event_type: crate::services::events::EventType::UserLeftMr,
-                        project_path: mr.project_path.clone(),
-                        mr_iid: Some(mr.mr_iid),
-                        user_id: Some(user_id.to_string()),
-                        payload: None,
-                    });
-                }
-                entry.viewing_mr = None;
+            // Grab display info before untracking (which clears viewing_mr)
+            let (display_name, avatar_url) = state.connections().get(conn_id)
+                .map(|c| (c.display_name.clone(), c.avatar_url.clone()))
+                .unwrap_or((None, None));
+
+            let old_mr = state.untrack_viewer(conn_id);
+            if let Some(ref mr) = old_mr {
+                state.event_bus().publish(crate::services::events::Event {
+                    event_type: crate::services::events::EventType::UserLeftMr,
+                    project_path: mr.project_path.clone(),
+                    mr_iid: Some(mr.mr_iid),
+                    user_id: Some(user_id.to_string()),
+                    payload: None,
+                });
+                // Broadcast presence removal to remaining viewers
+                let msg = WsOutbound::PresenceUpdate {
+                    user_id: user_id.to_string(),
+                    display_name,
+                    avatar_url,
+                    files: vec![],
+                };
+                state.broadcast_to_mr_except(mr, &serde_json::to_string(&msg).unwrap(), conn_id);
             }
             let _ =
                 crate::db::queries::update_viewing_mr(state.pool(), conn_id, None).await;
+        }
+
+        WsInbound::ViewingFiles { files } => {
+            // Rate limit: ignore if last update was less than 2s ago
+            let now = tokio::time::Instant::now();
+            let should_process = if let Some(conn) = state.connections().get(conn_id) {
+                match conn.files_updated_at {
+                    Some(last) => now.duration_since(last) >= VIEWING_FILES_MIN_INTERVAL,
+                    None => true,
+                }
+            } else {
+                false
+            };
+
+            if !should_process {
+                // Silently drop — client will send again in a few seconds
+                return;
+            }
+
+            // Get the MR this connection is viewing (needed for broadcast targeting)
+            let mr_ref = state.connections().get(conn_id)
+                .and_then(|c| c.viewing_mr.clone());
+
+            if let Some(ref mr) = mr_ref {
+                // Update connection state and grab display info
+                let (display_name, avatar_url) = if let Some(mut conn) = state.connections().get_mut(conn_id) {
+                    conn.viewing_files = files.clone();
+                    conn.files_updated_at = Some(now);
+                    (conn.display_name.clone(), conn.avatar_url.clone())
+                } else {
+                    (None, None)
+                };
+
+                // Broadcast delta to other viewers of the same MR
+                let msg = WsOutbound::PresenceUpdate {
+                    user_id: user_id.to_string(),
+                    display_name,
+                    avatar_url,
+                    files,
+                };
+                state.broadcast_to_mr_except(mr, &serde_json::to_string(&msg).unwrap(), conn_id);
+            }
         }
 
         WsInbound::Request { request_id, payload } => {
@@ -522,6 +606,13 @@ pub enum WsInbound {
     #[serde(rename = "LEFT_MR")]
     LeftMr,
 
+    /// File-level presence: which files are visible in the user's viewport.
+    /// Rate-limited server-side to max once per 2s per connection.
+    #[serde(rename = "VIEWING_FILES")]
+    ViewingFiles {
+        files: Vec<ViewingFile>,
+    },
+
     /// One-shot request/response (maps to Otto's sendMessage pattern).
     #[serde(rename = "REQUEST")]
     Request {
@@ -668,6 +759,26 @@ pub enum WsOutbound {
         project_path: String,
         mr_iid: Option<u64>,
         payload: Option<serde_json::Value>,
+    },
+
+    /// File-level presence delta: one user's current viewport files changed.
+    /// Sent to all other viewers of the same MR. Empty `files` means the user
+    /// left the MR or disconnected — remove their presence indicators.
+    #[serde(rename = "PRESENCE_UPDATE")]
+    PresenceUpdate {
+        user_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        display_name: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        avatar_url: Option<String>,
+        files: Vec<ViewingFile>,
+    },
+
+    /// Full presence snapshot: all viewers' file positions for an MR.
+    /// Sent once to a user when they join an MR (same pattern as COMMENT_ACTIONS_SYNC).
+    #[serde(rename = "PRESENCE_SNAPSHOT")]
+    PresenceSnapshot {
+        viewers: Vec<serde_json::Value>,
     },
 }
 
