@@ -818,7 +818,9 @@ impl SandboxManager {
                             // should fall back to the AI.
                             let replay_deadline = tokio::time::Instant::now()
                                 + std::time::Duration::from_secs(300);
+                            let replay_start = std::time::Instant::now();
                             let mut replay_ok = true;
+                            let mut steps_completed = 0u32;
 
                             for (i, cmd) in commands.iter().enumerate() {
                                 if tokio::time::Instant::now() >= replay_deadline {
@@ -835,9 +837,10 @@ impl SandboxManager {
                                     &req.job_id, &req.comment_id, mr_ref, "setting_up", &detail,
                                 );
 
-                                match self.exec_in_container(container_id, cmd, replay_deadline).await {
+                                match self.exec_in_container_streaming(container_id, cmd, replay_deadline, &output_ctx).await {
                                     Ok(output) if output.exit_code == 0 => {
                                         debug!("recipe step {}/{} succeeded", i + 1, commands.len());
+                                        steps_completed += 1;
                                     }
                                     Ok(output) => {
                                         warn!(
@@ -856,15 +859,23 @@ impl SandboxManager {
                                 }
                             }
 
+                            let replay_elapsed = replay_start.elapsed();
+
                             if replay_ok {
-                                info!("sandbox fix: recipe replay succeeded for {}", req.project_path);
+                                info!(
+                                    "sandbox fix: recipe replay succeeded for {} — {} steps in {:.1}s (cache hit, use_count={})",
+                                    req.project_path, steps_completed, replay_elapsed.as_secs_f64(), use_count + 1,
+                                );
                                 recipe_hit = true;
                                 // Bump usage stats
                                 let _ = crate::db::queries::touch_setup_recipe(
                                     &self.pool, &req.project_path, &base_image,
                                 ).await;
                             } else {
-                                info!("sandbox fix: recipe replay failed, deleting stale recipe and falling through to AI setup");
+                                info!(
+                                    "sandbox fix: recipe replay failed for {} — {}/{} steps in {:.1}s (cache miss, invalidating)",
+                                    req.project_path, steps_completed, commands.len(), replay_elapsed.as_secs_f64(),
+                                );
                                 let _ = crate::db::queries::delete_setup_recipe(
                                     &self.pool, &req.project_path, &base_image,
                                 ).await;
@@ -1007,7 +1018,9 @@ impl SandboxManager {
                 // Capture successful commands for the recipe cache.
                 // Only exit_code == 0 commands are worth replaying — failed ones
                 // are the AI probing or hitting errors it then recovers from.
-                if cmd_exit == 0 {
+                // Skip read-only exploratory commands (ls, cat, head, etc.) that
+                // the AI uses to understand the project but don't set anything up.
+                if cmd_exit == 0 && !is_exploratory_command(&cmd) {
                     recipe_commands.push(cmd.clone());
                 }
 
@@ -2213,6 +2226,44 @@ fn truncate_output(s: &str, max_bytes: usize) -> &str {
     }
 }
 
+/// Check if a command is purely exploratory (read-only) and not worth caching
+/// in a setup recipe. The AI often starts with `ls`, `cat`, `head`, `which`,
+/// `node --version` etc. to understand the project. These succeed but don't
+/// install or configure anything — replaying them wastes time.
+///
+/// Only filters simple commands. If the command contains chaining operators
+/// (`&&`, `||`, `;`, `|`) it might be doing real work alongside the read,
+/// so we keep it.
+fn is_exploratory_command(cmd: &str) -> bool {
+    let trimmed = cmd.trim();
+
+    // If the command chains multiple operations, it's likely doing real work
+    if trimmed.contains("&&") || trimmed.contains("||") || trimmed.contains(" | ") || trimmed.contains(';') {
+        return false;
+    }
+
+    // Extract the base command (first word, ignoring cd prefix)
+    let base = trimmed
+        .strip_prefix("cd /workspace && ")
+        .or_else(|| trimmed.strip_prefix("cd /workspace; "))
+        .unwrap_or(trimmed);
+
+    let first_word = base.split_whitespace().next().unwrap_or("");
+
+    matches!(first_word,
+        "ls" | "cat" | "head" | "tail" | "less" | "more" | "file" | "wc" |
+        "find" | "tree" | "which" | "whereis" | "type" | "command" |
+        "echo" | "printf" | "pwd" | "env" | "printenv" | "id" | "whoami" |
+        "uname" | "hostname" | "date" | "df" | "du" | "free" | "top" |
+        "ps" | "test" | "stat" | "readlink" | "realpath" | "basename" | "dirname"
+    ) || (
+        // Version check commands: `node --version`, `ruby -v`, `python3 -V`, etc.
+        base.split_whitespace().count() == 2 && base.split_whitespace().nth(1)
+            .map(|arg| arg == "--version" || arg == "-v" || arg == "-V" || arg == "--help")
+            .unwrap_or(false)
+    )
+}
+
 /// Strip markdown code fences and optional language identifiers from AI responses.
 fn strip_markdown_fences(s: &str) -> String {
     let trimmed = s.trim();
@@ -2723,5 +2774,55 @@ mod tests {
         let name1 = generate_fix_branch_name(42, Some("Fix bug"), "src/main.rs", "aaa111");
         let name2 = generate_fix_branch_name(42, Some("Fix bug"), "src/main.rs", "bbb222");
         assert_ne!(name1, name2);
+    }
+
+    // --- is_exploratory_command tests ---
+
+    #[test]
+    fn exploratory_simple_read_commands() {
+        assert!(is_exploratory_command("ls /workspace"));
+        assert!(is_exploratory_command("cat package.json"));
+        assert!(is_exploratory_command("head -20 Gemfile"));
+        assert!(is_exploratory_command("which node"));
+        assert!(is_exploratory_command("find /workspace -name '*.rb'"));
+        assert!(is_exploratory_command("pwd"));
+        assert!(is_exploratory_command("wc -l src/main.rs"));
+        assert!(is_exploratory_command("file /workspace/Makefile"));
+    }
+
+    #[test]
+    fn exploratory_version_checks() {
+        assert!(is_exploratory_command("node --version"));
+        assert!(is_exploratory_command("ruby -v"));
+        assert!(is_exploratory_command("python3 -V"));
+        assert!(is_exploratory_command("go --version"));
+        assert!(is_exploratory_command("cargo --help"));
+    }
+
+    #[test]
+    fn not_exploratory_install_commands() {
+        assert!(!is_exploratory_command("npm ci"));
+        assert!(!is_exploratory_command("bundle install"));
+        assert!(!is_exploratory_command("pip install -r requirements.txt"));
+        assert!(!is_exploratory_command("apt-get update && apt-get install -y git"));
+        assert!(!is_exploratory_command("cd /workspace && npm ci"));
+        assert!(!is_exploratory_command("mkdir -p /tmp/build"));
+        assert!(!is_exploratory_command("chmod +x scripts/setup.sh"));
+    }
+
+    #[test]
+    fn not_exploratory_chained_commands() {
+        // Even if first command is read-only, chaining means real work
+        assert!(!is_exploratory_command("ls /workspace && npm install"));
+        assert!(!is_exploratory_command("cat package.json || echo 'no package.json'"));
+        assert!(!is_exploratory_command("node --version; nvm install 20"));
+        assert!(!is_exploratory_command("which python3 | head -1"));
+    }
+
+    #[test]
+    fn not_exploratory_multiline_scripts() {
+        assert!(!is_exploratory_command("export NODE_ENV=test"));
+        assert!(!is_exploratory_command("nvm install 20"));
+        assert!(!is_exploratory_command("curl -fsSL https://example.com/setup.sh"));
     }
 }
