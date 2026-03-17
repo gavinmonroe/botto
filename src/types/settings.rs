@@ -21,6 +21,12 @@ pub enum AiTaskType {
     Contracts,
     BehavioralDelta,
     Inquiry,
+    /// AI-powered semantic conflict analysis (opt-in).
+    SemanticConflict,
+    /// Unified narrative across clustered MRs.
+    ClusterSummary,
+    /// Ordered phases for cross-MR guided walkthrough.
+    ClusterReviewOrder,
 }
 
 /// Per-task AI configuration (model, temperature, max_tokens).
@@ -45,5 +51,8 @@ pub fn default_temperature(task: AiTaskType) -> f32 {
         AiTaskType::Contracts => 0.2,
         AiTaskType::BehavioralDelta => 0.3,
         AiTaskType::Inquiry => 0.3,
+        AiTaskType::SemanticConflict => 0.2,
+        AiTaskType::ClusterSummary => 0.3,
+        AiTaskType::ClusterReviewOrder => 0.2,
     }
 }

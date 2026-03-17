@@ -334,7 +334,14 @@ impl SandboxManager {
         broadcaster: Arc<dyn Fn(&MrRef, &str) + Send + Sync>,
         warm_pool: Option<Arc<WarmPool>>,
     ) -> Option<Self> {
-        Self::with_prompts(cfg, pool, event_bus, broadcaster, SandboxPrompts::default(), false, None, warm_pool)
+        // Use team custom prompts if configured, otherwise fall back to baseline defaults.
+        let mut prompts = SandboxPrompts::default();
+        if let Some(p) = cfg.ai.custom_prompts.get("fix") {
+            prompts.fix_system = p.to_string();
+        }
+        // No custom setup prompt key yet — setup uses the "fix" task's prompt slot
+        // because setup is part of the fix pipeline, not a separate AI task.
+        Self::with_prompts(cfg, pool, event_bus, broadcaster, prompts, false, None, warm_pool)
     }
 
     /// Create a sandbox manager with custom prompts and optional harness mode.

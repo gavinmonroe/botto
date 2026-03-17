@@ -68,6 +68,46 @@ async fn migrate(pool: &SqlitePool) -> Result<()> {
         .await
         .context("migration 005 failed")?;
 
+    sqlx::query(MIGRATION_006)
+        .execute(pool)
+        .await
+        .context("migration 006 failed")?;
+
+    // Migration 006 addendum: add category/severity columns to comment_actions.
+    // ALTER TABLE ADD COLUMN isn't idempotent, so we check first.
+    let has_category: bool = sqlx::query_scalar::<_, i32>(
+        "SELECT COUNT(*) FROM pragma_table_info('comment_actions') WHERE name = 'category'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap_or(0)
+        > 0;
+
+    if !has_category {
+        sqlx::query("ALTER TABLE comment_actions ADD COLUMN category TEXT")
+            .execute(pool)
+            .await
+            .context("migration 006: add category column")?;
+        sqlx::query("ALTER TABLE comment_actions ADD COLUMN severity TEXT")
+            .execute(pool)
+            .await
+            .context("migration 006: add severity column")?;
+    }
+
+    // Index for preference aggregation — safe to run every time (IF NOT EXISTS).
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_comment_actions_prefs
+         ON comment_actions(project_path, category, severity, action)",
+    )
+    .execute(pool)
+    .await
+    .context("migration 006: create prefs index")?;
+
+    sqlx::query(MIGRATION_007)
+        .execute(pool)
+        .await
+        .context("migration 007 failed")?;
+
     info!("migrations complete");
     Ok(())
 }
@@ -250,4 +290,49 @@ CREATE TABLE IF NOT EXISTS project_knowledge (
     updated_at      INTEGER NOT NULL,
     PRIMARY KEY (project_path, base_image)
 );
+"#;
+
+const MIGRATION_006: &str = "";
+// Migration 006 is handled programmatically below (ALTER TABLE isn't idempotent).
+
+const MIGRATION_007: &str = r#"
+-- MR changed files index — shared foundation for Conflict Radar and Cross-MR Clusters.
+-- Populated from webhook events (MR open/update) and review pipeline side-effects.
+-- Rows are deleted when an MR is merged or closed.
+CREATE TABLE IF NOT EXISTS mr_changed_files (
+    project_id INTEGER NOT NULL,
+    mr_iid INTEGER NOT NULL,
+    file_path TEXT NOT NULL,
+    old_path TEXT,
+    change_type TEXT NOT NULL,
+    diff_hash TEXT NOT NULL,
+    hunks TEXT NOT NULL DEFAULT '[]',
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (project_id, mr_iid, file_path)
+);
+CREATE INDEX IF NOT EXISTS idx_mcf_project_file
+    ON mr_changed_files(project_id, file_path);
+CREATE INDEX IF NOT EXISTS idx_mcf_project_mr
+    ON mr_changed_files(project_id, mr_iid);
+
+-- Cross-MR clusters — groups of related MRs (by ticket or file overlap).
+-- summary_json and review_order_json are gzip-compressed, generated on demand.
+CREATE TABLE IF NOT EXISTS mr_clusters (
+    id TEXT PRIMARY KEY,
+    project_id INTEGER NOT NULL,
+    ticket_key TEXT,
+    member_mrs TEXT NOT NULL,
+    signals TEXT NOT NULL,
+    relevance_score REAL NOT NULL,
+    summary_json BLOB,
+    summary_diff_hash TEXT,
+    review_order_json BLOB,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_clusters_project
+    ON mr_clusters(project_id);
+CREATE INDEX IF NOT EXISTS idx_clusters_ticket
+    ON mr_clusters(ticket_key);
 "#;

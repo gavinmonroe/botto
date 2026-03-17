@@ -8,6 +8,7 @@
 
 use crate::config::BottoConfig;
 use crate::services::events::EventBus;
+use crate::services::queue::manager::QueueManager;
 use crate::services::sandbox::manager::WarmPool;
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
@@ -15,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::SqlitePool;
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::sync::{broadcast, watch, Semaphore};
 use tracing::info;
 
@@ -139,6 +140,19 @@ pub struct AppStateInner {
     /// Warm container pool for sandbox fix reuse across fixes on the same MR.
     /// None if Docker is not available or warm containers are disabled.
     pub warm_pool: Option<Arc<WarmPool>>,
+    /// Background review queue manager. Set once after construction via
+    /// `set_queue_manager()` — OnceLock because QueueManager needs a
+    /// broadcaster closure that captures AppState (chicken-and-egg).
+    pub queue_manager: OnceLock<Arc<QueueManager>>,
+    /// Lightweight cache: project_path → project_id. Avoids redundant GitLab
+    /// API calls when resolving project IDs for conflict/cluster features.
+    /// This mapping is stable (project paths don't change IDs), so no TTL needed.
+    pub project_id_cache: DashMap<String, i64>,
+    /// Per-MR mutex for webhook background tasks. Prevents concurrent file index
+    /// writes for the same MR when rapid pushes trigger multiple webhooks.
+    /// Keyed by "project_id:mr_iid". Entries are lightweight (Arc<Mutex<()>>)
+    /// and bounded by the number of concurrently-active MR webhooks.
+    pub mr_webhook_locks: DashMap<String, Arc<tokio::sync::Mutex<()>>>,
 }
 
 impl AppState {
@@ -170,6 +184,9 @@ impl AppState {
                 review_semaphore,
                 ai_semaphore,
                 warm_pool,
+                queue_manager: OnceLock::new(),
+                project_id_cache: DashMap::new(),
+                mr_webhook_locks: DashMap::new(),
             }),
         }
     }
@@ -213,6 +230,52 @@ impl AppState {
 
     pub fn warm_pool(&self) -> Option<&Arc<WarmPool>> {
         self.inner.warm_pool.as_ref()
+    }
+
+    /// Store the queue manager after construction. Called once from main.rs
+    /// after both AppState and QueueManager are created.
+    /// Panics if called more than once (programming error).
+    pub fn set_queue_manager(&self, qm: Arc<QueueManager>) {
+        if self.inner.queue_manager.set(qm).is_err() {
+            panic!("queue_manager already set — set_queue_manager called twice");
+        }
+    }
+
+    /// Get the queue manager, if set. Returns None only during the brief
+    /// window between AppState creation and set_queue_manager() in main.rs.
+    pub fn queue_manager(&self) -> Option<&Arc<QueueManager>> {
+        self.inner.queue_manager.get()
+    }
+
+    /// Resolve a project_path to a project_id, using the in-memory cache.
+    /// Falls back to a GitLab API call on cache miss. The mapping is stable
+    /// (project paths don't change IDs), so entries never expire.
+    pub async fn resolve_project_id(
+        &self,
+        project_path: &str,
+    ) -> Option<i64> {
+        // Check cache first
+        if let Some(id) = self.inner.project_id_cache.get(project_path) {
+            return Some(*id);
+        }
+
+        // Cache miss — fetch from GitLab
+        let cfg = self.config();
+        let gl_cfg = crate::services::gitlab::client::GitLabConfig {
+            base_url: cfg.gitlab.url.clone(),
+            token: cfg.gitlab.bot_token.clone(),
+        };
+
+        match crate::services::gitlab::client::fetch_project(&gl_cfg, project_path).await {
+            Ok(project) => {
+                self.inner.project_id_cache.insert(project_path.to_string(), project.id);
+                Some(project.id)
+            }
+            Err(e) => {
+                tracing::warn!("failed to resolve project_id for {}: {}", project_path, e);
+                None
+            }
+        }
     }
 
     /// Get all connection IDs currently viewing a specific MR.

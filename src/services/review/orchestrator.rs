@@ -105,6 +105,41 @@ pub async fn execute_review(
         .collect();
     let current_file_hashes = cache::compute_file_diff_hashes(&file_pairs);
 
+    // --- Populate the shared file index as a side-effect ---
+    // This ensures conflict radar and cluster detection have data even if
+    // webhooks weren't configured when the MR was opened. Non-blocking:
+    // spawned so it doesn't delay the review pipeline.
+    if let Some(project_id) = mr.project_id {
+        let pool_clone = pool.clone();
+        let diff_files = mr.diff_files.clone();
+        let mr_iid = mr.mr_iid;
+        tokio::spawn(async move {
+            for file in &diff_files {
+                let change_type = crate::types::cluster::change_type_from_diff(
+                    file.is_new,
+                    file.is_deleted,
+                    file.is_renamed,
+                );
+                let hunks = crate::types::cluster::parse_hunks(&file.diff);
+                let file_hash = crate::util::hash::djb2(&file.diff);
+                let hunks_json = serde_json::to_string(&hunks).unwrap_or_else(|_| "[]".into());
+
+                let _ = crate::db::queries::upsert_mr_changed_file(
+                    &pool_clone,
+                    project_id,
+                    mr_iid as i64,
+                    &file.file_path,
+                    file.old_path.as_deref(),
+                    change_type.as_str(),
+                    &file_hash,
+                    &hunks_json,
+                )
+                .await;
+            }
+            debug!("file index: populated {} files for !{} (review side-effect)", diff_files.len(), mr_iid);
+        });
+    }
+
     // --- Check cache (skip if forced regeneration) ---
     if !skip_cache {
         if let Some((cached, _hashes)) = cache::load_exact(pool, &mr.project_path, mr.mr_iid, &diff_hash).await {
@@ -350,6 +385,20 @@ pub async fn execute_review(
     // =====================================================================
     // File activity is now available to inject into per-file review context.
 
+    // Fetch team-wide reviewer preferences (learned from accept/dismiss patterns).
+    // Done once before the file loop — same prefs apply to all files in this MR.
+    let team_prefs = if tasks.contains(&ReviewTask::CodeReview) {
+        match super::prefs::get_team_prefs(pool, &mr.project_path).await {
+            Ok(prefs) => prefs,
+            Err(e) => {
+                debug!("failed to load team prefs (non-fatal): {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     if tasks.contains(&ReviewTask::CodeReview) && !files_to_review.is_empty() {
         let total_files = files_to_review.len();
         let _ = send
@@ -386,11 +435,13 @@ pub async fn execute_review(
 
                 // Clone repo config text for the spawned task ('static requirement)
                 let repo_config_owned = repo_config_text.clone();
+                let team_prefs_owned = team_prefs.clone();
 
                 let handle = tokio::spawn(async move {
                     let context = FileReviewContext {
                         file_activity: file_activity_ctx,
                         repo_config: repo_config_owned,
+                        reviewer_prefs: team_prefs_owned,
                         ..FileReviewContext::default()
                     };
 

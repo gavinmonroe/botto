@@ -23,7 +23,10 @@ pub struct BottoConfig {
     pub ai: AiConfig,
     pub sandbox: SandboxConfig,
     pub cache: CacheConfig,
+    pub review: ReviewConfig,
     pub harness: HarnessConfig,
+    pub cluster: ClusterConfig,
+    pub conflict: ConflictConfig,
     pub data_dir: PathBuf,
 }
 
@@ -56,6 +59,7 @@ pub struct AiConfig {
     pub base_url: String,
     pub api_key: String,
     pub models: AiModelConfig,
+    pub custom_prompts: AiCustomPrompts,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -73,6 +77,12 @@ pub struct AiModelConfig {
     /// Model for sandbox fix iterations — needs strong reasoning for autonomous fixing.
     pub fix: String,
     pub inquiry: String,
+    /// Model for semantic conflict analysis between overlapping MR diffs.
+    pub semantic_conflict: String,
+    /// Model for cross-MR cluster summary generation.
+    pub cluster_summary: String,
+    /// Model for cross-MR guided review order generation.
+    pub cluster_review_order: String,
 }
 
 impl Default for AiModelConfig {
@@ -90,7 +100,66 @@ impl Default for AiModelConfig {
             behavioral_delta: "claude-sonnet-4-5".into(),
             fix: "claude-opus-4-6".into(),
             inquiry: "claude-sonnet-4-5".into(),
+            semantic_conflict: "claude-sonnet-4-5".into(),
+            cluster_summary: "claude-sonnet-4-5".into(),
+            cluster_review_order: "claude-haiku-4-5".into(),
         }
+    }
+}
+
+/// Per-task custom system prompt overrides. Empty string = use built-in default.
+/// These are team-level overrides configured via the admin page or botto.toml.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct AiCustomPrompts {
+    pub summary: String,
+    pub code_review: String,
+    pub edge_cases: String,
+    pub related_files: String,
+    pub follow_up: String,
+    pub chat: String,
+    pub ac_validation: String,
+    pub adversarial_tests: String,
+    pub contracts: String,
+    pub behavioral_delta: String,
+    pub fix: String,
+    pub inquiry: String,
+}
+
+impl AiCustomPrompts {
+    /// Get the custom prompt for a task, returning None if empty (use default).
+    pub fn get(&self, task: &str) -> Option<&str> {
+        let s = match task {
+            "summary" => &self.summary,
+            "code_review" => &self.code_review,
+            "edge_cases" => &self.edge_cases,
+            "related_files" => &self.related_files,
+            "follow_up" => &self.follow_up,
+            "chat" => &self.chat,
+            "ac_validation" => &self.ac_validation,
+            "adversarial_tests" => &self.adversarial_tests,
+            "contracts" => &self.contracts,
+            "behavioral_delta" => &self.behavioral_delta,
+            "fix" => &self.fix,
+            "inquiry" => &self.inquiry,
+            _ => return None,
+        };
+        if s.is_empty() { None } else { Some(s) }
+    }
+
+    /// Returns true if all prompts are empty (used to skip TOML serialization).
+    pub fn is_all_empty(&self) -> bool {
+        self.summary.is_empty()
+            && self.code_review.is_empty()
+            && self.edge_cases.is_empty()
+            && self.related_files.is_empty()
+            && self.follow_up.is_empty()
+            && self.chat.is_empty()
+            && self.ac_validation.is_empty()
+            && self.adversarial_tests.is_empty()
+            && self.contracts.is_empty()
+            && self.behavioral_delta.is_empty()
+            && self.fix.is_empty()
+            && self.inquiry.is_empty()
     }
 }
 
@@ -143,6 +212,22 @@ pub struct CacheConfig {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct ReviewConfig {
+    /// Automatically enqueue a review when new commits are pushed to an open MR.
+    /// Draft MRs are skipped. Bot pushes (sandbox fix commits) are ignored to
+    /// prevent infinite review loops.
+    pub auto_review_on_push: bool,
+}
+
+impl Default for ReviewConfig {
+    fn default() -> Self {
+        Self {
+            auto_review_on_push: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct HarnessConfig {
     pub enabled: bool,
     /// Max evolution rounds per run.
@@ -161,6 +246,49 @@ pub struct HarnessConfig {
     pub judge_model: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct ClusterConfig {
+    /// Enable cross-MR cluster detection.
+    pub enabled: bool,
+    /// Maximum number of MRs in a single cluster.
+    pub max_cluster_size: usize,
+    /// Minimum Jaccard similarity for file-overlap clustering (0.0–1.0).
+    pub file_overlap_threshold: f64,
+    /// TTL for cluster entries (days).
+    pub summary_ttl_days: u32,
+}
+
+impl Default for ClusterConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_cluster_size: 8,
+            file_overlap_threshold: 0.15,
+            summary_ttl_days: 7,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ConflictConfig {
+    /// Enable conflict radar (file/line overlap detection).
+    pub enabled: bool,
+    /// Enable AI-powered semantic conflict analysis (expensive, opt-in).
+    pub semantic_analysis: bool,
+    /// TTL for cached semantic analysis results (days).
+    pub semantic_cache_ttl_days: u32,
+}
+
+impl Default for ConflictConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            semantic_analysis: false,
+            semantic_cache_ttl_days: 3,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // TOML file schema (optional fields — everything has defaults)
 // ---------------------------------------------------------------------------
@@ -173,7 +301,10 @@ struct TomlConfig {
     ai: Option<TomlAi>,
     sandbox: Option<TomlSandbox>,
     cache: Option<TomlCache>,
+    review: Option<TomlReview>,
     harness: Option<TomlHarness>,
+    cluster: Option<TomlCluster>,
+    conflict: Option<TomlConflict>,
 }
 
 #[derive(Deserialize, Default)]
@@ -201,10 +332,30 @@ struct TomlAi {
     base_url: Option<String>,
     api_key: Option<String>,
     models: Option<TomlAiModels>,
+    custom_prompts: Option<TomlAiCustomPrompts>,
 }
 
 #[derive(Deserialize, Default)]
 struct TomlAiModels {
+    summary: Option<String>,
+    code_review: Option<String>,
+    edge_cases: Option<String>,
+    related_files: Option<String>,
+    follow_up: Option<String>,
+    chat: Option<String>,
+    ac_validation: Option<String>,
+    adversarial_tests: Option<String>,
+    contracts: Option<String>,
+    behavioral_delta: Option<String>,
+    fix: Option<String>,
+    inquiry: Option<String>,
+    semantic_conflict: Option<String>,
+    cluster_summary: Option<String>,
+    cluster_review_order: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct TomlAiCustomPrompts {
     summary: Option<String>,
     code_review: Option<String>,
     edge_cases: Option<String>,
@@ -246,6 +397,11 @@ struct TomlCache {
 }
 
 #[derive(Deserialize, Default)]
+struct TomlReview {
+    auto_review_on_push: Option<bool>,
+}
+
+#[derive(Deserialize, Default)]
 struct TomlHarness {
     enabled: Option<bool>,
     max_rounds: Option<u32>,
@@ -255,6 +411,21 @@ struct TomlHarness {
     gitlab_seed_orgs: Option<Vec<String>>,
     memory_dir: Option<String>,
     judge_model: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct TomlCluster {
+    enabled: Option<bool>,
+    max_cluster_size: Option<usize>,
+    file_overlap_threshold: Option<f64>,
+    summary_ttl_days: Option<u32>,
+}
+
+#[derive(Deserialize, Default)]
+struct TomlConflict {
+    enabled: Option<bool>,
+    semantic_analysis: Option<bool>,
+    semantic_cache_ttl_days: Option<u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -328,8 +499,12 @@ pub async fn load(config_path: &Option<PathBuf>, data_dir: &Path) -> Result<Bott
     let toml_ai = toml_cfg.ai.unwrap_or_default();
     let toml_sandbox = toml_cfg.sandbox.unwrap_or_default();
     let toml_cache = toml_cfg.cache.unwrap_or_default();
+    let toml_review = toml_cfg.review.unwrap_or_default();
     let toml_harness = toml_cfg.harness.unwrap_or_default();
+    let toml_cluster = toml_cfg.cluster.unwrap_or_default();
+    let toml_conflict = toml_cfg.conflict.unwrap_or_default();
     let toml_models = toml_ai.models.unwrap_or_default();
+    let toml_custom_prompts = toml_ai.custom_prompts.unwrap_or_default();
     let default_models = AiModelConfig::default();
 
     let api_key = env_api_key
@@ -383,6 +558,23 @@ pub async fn load(config_path: &Option<PathBuf>, data_dir: &Path) -> Result<Bott
                 behavioral_delta: toml_models.behavioral_delta.unwrap_or(default_models.behavioral_delta),
                 fix: toml_models.fix.unwrap_or(default_models.fix),
                 inquiry: toml_models.inquiry.unwrap_or(default_models.inquiry),
+                semantic_conflict: toml_models.semantic_conflict.unwrap_or(default_models.semantic_conflict),
+                cluster_summary: toml_models.cluster_summary.unwrap_or(default_models.cluster_summary),
+                cluster_review_order: toml_models.cluster_review_order.unwrap_or(default_models.cluster_review_order),
+            },
+            custom_prompts: AiCustomPrompts {
+                summary: toml_custom_prompts.summary.unwrap_or_default(),
+                code_review: toml_custom_prompts.code_review.unwrap_or_default(),
+                edge_cases: toml_custom_prompts.edge_cases.unwrap_or_default(),
+                related_files: toml_custom_prompts.related_files.unwrap_or_default(),
+                follow_up: toml_custom_prompts.follow_up.unwrap_or_default(),
+                chat: toml_custom_prompts.chat.unwrap_or_default(),
+                ac_validation: toml_custom_prompts.ac_validation.unwrap_or_default(),
+                adversarial_tests: toml_custom_prompts.adversarial_tests.unwrap_or_default(),
+                contracts: toml_custom_prompts.contracts.unwrap_or_default(),
+                behavioral_delta: toml_custom_prompts.behavioral_delta.unwrap_or_default(),
+                fix: toml_custom_prompts.fix.unwrap_or_default(),
+                inquiry: toml_custom_prompts.inquiry.unwrap_or_default(),
             },
         },
         sandbox: SandboxConfig {
@@ -410,6 +602,9 @@ pub async fn load(config_path: &Option<PathBuf>, data_dir: &Path) -> Result<Bott
             review_ttl_days: toml_cache.review_ttl_days.unwrap_or(7),
             max_cached_reviews: toml_cache.max_cached_reviews.unwrap_or(500),
         },
+        review: ReviewConfig {
+            auto_review_on_push: toml_review.auto_review_on_push.unwrap_or(false),
+        },
         harness: HarnessConfig {
             enabled: toml_harness.enabled.unwrap_or(false),
             max_rounds: toml_harness.max_rounds.unwrap_or(10),
@@ -423,6 +618,17 @@ pub async fn load(config_path: &Option<PathBuf>, data_dir: &Path) -> Result<Bott
                 toml_harness.memory_dir.unwrap_or_else(|| "harness".into()),
             ),
             judge_model: toml_harness.judge_model.unwrap_or_else(|| "claude-opus-4-6".into()),
+        },
+        cluster: ClusterConfig {
+            enabled: toml_cluster.enabled.unwrap_or(true),
+            max_cluster_size: toml_cluster.max_cluster_size.unwrap_or(8),
+            file_overlap_threshold: toml_cluster.file_overlap_threshold.unwrap_or(0.15),
+            summary_ttl_days: toml_cluster.summary_ttl_days.unwrap_or(7),
+        },
+        conflict: ConflictConfig {
+            enabled: toml_conflict.enabled.unwrap_or(true),
+            semantic_analysis: toml_conflict.semantic_analysis.unwrap_or(false),
+            semantic_cache_ttl_days: toml_conflict.semantic_cache_ttl_days.unwrap_or(3),
         },
         data_dir: data_dir.to_path_buf(),
     })
@@ -453,6 +659,7 @@ pub fn print_summary(cfg: &BottoConfig) {
         cfg.server.max_concurrent_ai_calls,
     );
     info!("cache:  ttl={}d, max={}/project", cfg.cache.review_ttl_days, cfg.cache.max_cached_reviews);
+    info!("review: auto_on_push={}", if cfg.review.auto_review_on_push { "on" } else { "off" });
     info!("data:   {}", cfg.data_dir.display());
 }
 
@@ -486,7 +693,10 @@ pub struct ConfigResponse {
     pub ai: AiConfigRedacted,
     pub sandbox: SandboxConfig,
     pub cache: CacheConfig,
+    pub review: ReviewConfig,
     pub harness: HarnessConfigRedacted,
+    pub cluster: ClusterConfig,
+    pub conflict: ConflictConfig,
     pub data_dir: String,
 }
 
@@ -507,6 +717,7 @@ pub struct AiConfigRedacted {
     pub base_url: String,
     pub api_key: String,
     pub models: AiModelConfig,
+    pub custom_prompts: AiCustomPrompts,
 }
 
 #[derive(Debug, Serialize)]
@@ -537,9 +748,11 @@ impl ConfigResponse {
                 base_url: cfg.ai.base_url.clone(),
                 api_key: redact_secret(&cfg.ai.api_key),
                 models: cfg.ai.models.clone(),
+                custom_prompts: cfg.ai.custom_prompts.clone(),
             },
             sandbox: cfg.sandbox.clone(),
             cache: cfg.cache.clone(),
+            review: cfg.review.clone(),
             harness: HarnessConfigRedacted {
                 enabled: cfg.harness.enabled,
                 max_rounds: cfg.harness.max_rounds,
@@ -550,6 +763,8 @@ impl ConfigResponse {
                 memory_dir: cfg.harness.memory_dir.display().to_string(),
                 judge_model: cfg.harness.judge_model.clone(),
             },
+            cluster: cfg.cluster.clone(),
+            conflict: cfg.conflict.clone(),
             data_dir: cfg.data_dir.display().to_string(),
         }
     }
@@ -566,7 +781,10 @@ pub struct ConfigUpdate {
     pub ai: Option<AiConfigUpdate>,
     pub sandbox: Option<SandboxConfigUpdate>,
     pub cache: Option<CacheConfigUpdate>,
+    pub review: Option<ReviewConfigUpdate>,
     pub harness: Option<HarnessConfigUpdate>,
+    pub cluster: Option<ClusterConfigUpdate>,
+    pub conflict: Option<ConflictConfigUpdate>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -594,10 +812,30 @@ pub struct AiConfigUpdate {
     pub base_url: Option<String>,
     pub api_key: Option<String>,
     pub models: Option<AiModelConfigUpdate>,
+    pub custom_prompts: Option<AiCustomPromptsUpdate>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct AiModelConfigUpdate {
+    pub summary: Option<String>,
+    pub code_review: Option<String>,
+    pub edge_cases: Option<String>,
+    pub related_files: Option<String>,
+    pub follow_up: Option<String>,
+    pub chat: Option<String>,
+    pub ac_validation: Option<String>,
+    pub adversarial_tests: Option<String>,
+    pub contracts: Option<String>,
+    pub behavioral_delta: Option<String>,
+    pub fix: Option<String>,
+    pub inquiry: Option<String>,
+    pub semantic_conflict: Option<String>,
+    pub cluster_summary: Option<String>,
+    pub cluster_review_order: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AiCustomPromptsUpdate {
     pub summary: Option<String>,
     pub code_review: Option<String>,
     pub edge_cases: Option<String>,
@@ -638,6 +876,11 @@ pub struct CacheConfigUpdate {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct ReviewConfigUpdate {
+    pub auto_review_on_push: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct HarnessConfigUpdate {
     pub enabled: Option<bool>,
     pub max_rounds: Option<u32>,
@@ -647,6 +890,21 @@ pub struct HarnessConfigUpdate {
     pub gitlab_seed_orgs: Option<Vec<String>>,
     pub memory_dir: Option<String>,
     pub judge_model: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ClusterConfigUpdate {
+    pub enabled: Option<bool>,
+    pub max_cluster_size: Option<usize>,
+    pub file_overlap_threshold: Option<f64>,
+    pub summary_ttl_days: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ConflictConfigUpdate {
+    pub enabled: Option<bool>,
+    pub semantic_analysis: Option<bool>,
+    pub semantic_cache_ttl_days: Option<u32>,
 }
 
 /// Fields that require a server restart to take effect.
@@ -730,6 +988,23 @@ pub fn apply_update(current: &BottoConfig, update: ConfigUpdate) -> (BottoConfig
             if let Some(v) = m.behavioral_delta { cfg.ai.models.behavioral_delta = v; }
             if let Some(v) = m.fix { cfg.ai.models.fix = v; }
             if let Some(v) = m.inquiry { cfg.ai.models.inquiry = v; }
+            if let Some(v) = m.semantic_conflict { cfg.ai.models.semantic_conflict = v; }
+            if let Some(v) = m.cluster_summary { cfg.ai.models.cluster_summary = v; }
+            if let Some(v) = m.cluster_review_order { cfg.ai.models.cluster_review_order = v; }
+        }
+        if let Some(p) = a.custom_prompts {
+            if let Some(v) = p.summary { cfg.ai.custom_prompts.summary = v; }
+            if let Some(v) = p.code_review { cfg.ai.custom_prompts.code_review = v; }
+            if let Some(v) = p.edge_cases { cfg.ai.custom_prompts.edge_cases = v; }
+            if let Some(v) = p.related_files { cfg.ai.custom_prompts.related_files = v; }
+            if let Some(v) = p.follow_up { cfg.ai.custom_prompts.follow_up = v; }
+            if let Some(v) = p.chat { cfg.ai.custom_prompts.chat = v; }
+            if let Some(v) = p.ac_validation { cfg.ai.custom_prompts.ac_validation = v; }
+            if let Some(v) = p.adversarial_tests { cfg.ai.custom_prompts.adversarial_tests = v; }
+            if let Some(v) = p.contracts { cfg.ai.custom_prompts.contracts = v; }
+            if let Some(v) = p.behavioral_delta { cfg.ai.custom_prompts.behavioral_delta = v; }
+            if let Some(v) = p.fix { cfg.ai.custom_prompts.fix = v; }
+            if let Some(v) = p.inquiry { cfg.ai.custom_prompts.inquiry = v; }
         }
     }
 
@@ -761,6 +1036,10 @@ pub fn apply_update(current: &BottoConfig, update: ConfigUpdate) -> (BottoConfig
         if let Some(v) = c.max_cached_reviews { cfg.cache.max_cached_reviews = v; }
     }
 
+    if let Some(r) = update.review {
+        if let Some(v) = r.auto_review_on_push { cfg.review.auto_review_on_push = v; }
+    }
+
     if let Some(h) = update.harness {
         if let Some(v) = h.enabled { cfg.harness.enabled = v; }
         if let Some(v) = h.max_rounds { cfg.harness.max_rounds = v; }
@@ -770,6 +1049,19 @@ pub fn apply_update(current: &BottoConfig, update: ConfigUpdate) -> (BottoConfig
         if let Some(v) = h.gitlab_seed_orgs { cfg.harness.gitlab_seed_orgs = v; }
         if let Some(v) = h.memory_dir { cfg.harness.memory_dir = PathBuf::from(v); }
         if let Some(v) = h.judge_model { cfg.harness.judge_model = v; }
+    }
+
+    if let Some(c) = update.cluster {
+        if let Some(v) = c.enabled { cfg.cluster.enabled = v; }
+        if let Some(v) = c.max_cluster_size { cfg.cluster.max_cluster_size = v; }
+        if let Some(v) = c.file_overlap_threshold { cfg.cluster.file_overlap_threshold = v; }
+        if let Some(v) = c.summary_ttl_days { cfg.cluster.summary_ttl_days = v; }
+    }
+
+    if let Some(c) = update.conflict {
+        if let Some(v) = c.enabled { cfg.conflict.enabled = v; }
+        if let Some(v) = c.semantic_analysis { cfg.conflict.semantic_analysis = v; }
+        if let Some(v) = c.semantic_cache_ttl_days { cfg.conflict.semantic_cache_ttl_days = v; }
     }
 
     (cfg, restart_needed)
@@ -787,7 +1079,10 @@ pub fn to_toml_string(cfg: &BottoConfig) -> Result<String> {
         ai: AiOut<'a>,
         sandbox: SandboxOut<'a>,
         cache: &'a CacheConfig,
+        review: &'a ReviewConfig,
         harness: HarnessOut<'a>,
+        cluster: &'a ClusterConfig,
+        conflict: &'a ConflictConfig,
     }
 
     #[derive(Serialize)]
@@ -803,6 +1098,8 @@ pub fn to_toml_string(cfg: &BottoConfig) -> Result<String> {
         base_url: &'a str,
         api_key: &'a str,
         models: &'a AiModelConfig,
+        #[serde(skip_serializing_if = "AiCustomPrompts::is_all_empty")]
+        custom_prompts: &'a AiCustomPrompts,
     }
 
     #[derive(Serialize)]
@@ -848,6 +1145,7 @@ pub fn to_toml_string(cfg: &BottoConfig) -> Result<String> {
             base_url: &cfg.ai.base_url,
             api_key: &cfg.ai.api_key,
             models: &cfg.ai.models,
+            custom_prompts: &cfg.ai.custom_prompts,
         },
         sandbox: SandboxOut {
             enabled: cfg.sandbox.enabled,
@@ -870,6 +1168,7 @@ pub fn to_toml_string(cfg: &BottoConfig) -> Result<String> {
             knowledge_cache_ttl_secs: cfg.sandbox.knowledge_cache_ttl_secs,
         },
         cache: &cfg.cache,
+        review: &cfg.review,
         harness: HarnessOut {
             enabled: cfg.harness.enabled,
             max_rounds: cfg.harness.max_rounds,
@@ -880,6 +1179,8 @@ pub fn to_toml_string(cfg: &BottoConfig) -> Result<String> {
             memory_dir: cfg.harness.memory_dir.display().to_string(),
             judge_model: &cfg.harness.judge_model,
         },
+        cluster: &cfg.cluster,
+        conflict: &cfg.conflict,
     };
 
     toml::to_string_pretty(&out).map_err(|e| anyhow::anyhow!("TOML serialize error: {}", e))
@@ -925,6 +1226,7 @@ mod tests {
                 base_url: "https://api.example.com".into(),
                 api_key: "sk-ai-key-5678".into(),
                 models: AiModelConfig::default(),
+                custom_prompts: AiCustomPrompts::default(),
             },
             sandbox: SandboxConfig {
                 enabled: true,
@@ -948,6 +1250,9 @@ mod tests {
                 review_ttl_days: 7,
                 max_cached_reviews: 500,
             },
+            review: ReviewConfig {
+                auto_review_on_push: false,
+            },
             harness: HarnessConfig {
                 enabled: false,
                 max_rounds: 10,
@@ -958,6 +1263,8 @@ mod tests {
                 memory_dir: PathBuf::from("harness"),
                 judge_model: "claude-opus-4-6".into(),
             },
+            cluster: ClusterConfig::default(),
+            conflict: ConflictConfig::default(),
             data_dir: PathBuf::from("/tmp/botto-test"),
         }
     }
@@ -1033,11 +1340,16 @@ mod tests {
                     follow_up: None, chat: None, ac_validation: None,
                     adversarial_tests: None, contracts: None, behavioral_delta: None,
                     fix: None, inquiry: None,
+                    semantic_conflict: None, cluster_summary: None, cluster_review_order: None,
                 }),
+                custom_prompts: None,
             }),
             sandbox: None,
             cache: None,
+            review: None,
             harness: None,
+            cluster: None,
+            conflict: None,
         };
 
         let (new_cfg, restart_fields) = apply_update(&cfg, update);
@@ -1066,10 +1378,14 @@ mod tests {
                 base_url: None,
                 api_key: Some("••••5678".into()), // redacted
                 models: None,
+                custom_prompts: None,
             }),
             sandbox: None,
             cache: None,
+            review: None,
             harness: None,
+            cluster: None,
+            conflict: None,
         };
 
         let (new_cfg, _) = apply_update(&cfg, update);
@@ -1096,7 +1412,10 @@ mod tests {
             ai: None,
             sandbox: None,
             cache: None,
+            review: None,
             harness: None,
+            cluster: None,
+            conflict: None,
         };
 
         let (new_cfg, _) = apply_update(&cfg, update);
@@ -1119,7 +1438,10 @@ mod tests {
             ai: None,
             sandbox: None,
             cache: None,
+            review: None,
             harness: None,
+            cluster: None,
+            conflict: None,
         };
 
         let (new_cfg, restart_fields) = apply_update(&cfg, update);
@@ -1145,7 +1467,10 @@ mod tests {
             ai: None,
             sandbox: None,
             cache: None,
+            review: None,
             harness: None,
+            cluster: None,
+            conflict: None,
         };
 
         let (_, restart_fields) = apply_update(&cfg, update);
@@ -1175,7 +1500,10 @@ mod tests {
                 knowledge_cache_ttl_secs: None,
             }),
             cache: None,
+            review: None,
             harness: None,
+            cluster: None,
+            conflict: None,
         };
 
         let (new_cfg, _) = apply_update(&cfg, update);
@@ -1192,11 +1520,32 @@ mod tests {
                 bot_token: None,
                 webhook_secret: Some("".into()), // empty = clear
             }),
-            ai: None, sandbox: None, cache: None, harness: None,
+            ai: None, sandbox: None, cache: None, review: None, harness: None, cluster: None, conflict: None,
         };
 
         let (new_cfg, _) = apply_update(&cfg, update);
         assert_eq!(new_cfg.gitlab.webhook_secret, None);
+    }
+
+    #[test]
+    fn apply_update_review_auto_review_on_push() {
+        let cfg = test_config();
+        assert!(!cfg.review.auto_review_on_push); // default is false
+
+        let update = ConfigUpdate {
+            server: None, auth: None, gitlab: None, ai: None,
+            sandbox: None, cache: None,
+            review: Some(ReviewConfigUpdate {
+                auto_review_on_push: Some(true),
+            }),
+            harness: None,
+            cluster: None,
+            conflict: None,
+        };
+
+        let (new_cfg, restart_fields) = apply_update(&cfg, update);
+        assert!(new_cfg.review.auto_review_on_push);
+        assert!(restart_fields.is_empty()); // no restart needed for review settings
     }
 
     // -- to_toml_string --
@@ -1213,6 +1562,7 @@ mod tests {
         assert!(toml_str.contains("[ai]"));
         assert!(toml_str.contains("[sandbox]"));
         assert!(toml_str.contains("[cache]"));
+        assert!(toml_str.contains("[review]"));
         assert!(toml_str.contains("[harness]"));
 
         // Should contain actual values

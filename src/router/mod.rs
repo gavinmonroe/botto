@@ -64,6 +64,10 @@ pub async fn handle_request(state: &AppState, payload: &Value) -> Value {
         "GET_TEAM_DIGEST" => handlers::get_team_digest(state, effective_payload).await,
         "GET_REPO_CONFIG" => handlers::get_repo_config(state, effective_payload).await,
         "INVALIDATE_REPO_CONFIG" => handlers::invalidate_repo_config(state, effective_payload).await,
+        "GET_CONFLICTS" => handlers::get_conflicts(state, effective_payload).await,
+        "GET_CLUSTER" => handlers::get_cluster(state, effective_payload).await,
+        "GET_SERVER_CONFIG" => handlers::get_server_config(state).await,
+        "UPDATE_SERVER_CONFIG" => handlers::update_server_config(state, effective_payload).await,
         _ => {
             warn!("unknown request type: {}", msg_type);
             serde_json::json!({
@@ -178,9 +182,8 @@ pub async fn handle_viewing_mr(
     if let Ok(actions) =
         db::queries::get_comment_actions(state.pool(), &mr.project_path, mr.mr_iid as i64).await
     {
-        let rows: Vec<(String, String, String, Option<String>, i64)> = actions;
-        if !rows.is_empty() {
-            let actions_json: Vec<Value> = rows
+        if !actions.is_empty() {
+            let actions_json: Vec<Value> = actions
                 .into_iter()
                 .map(|row| {
                     serde_json::json!({
@@ -189,6 +192,8 @@ pub async fn handle_viewing_mr(
                         "action": row.2,
                         "edited_body": row.3,
                         "created_at": row.4,
+                        "category": row.5,
+                        "severity": row.6,
                     })
                 })
                 .collect();
@@ -224,6 +229,102 @@ pub async fn handle_viewing_mr(
         let _ = tx.send(serde_json::to_string(&msg).unwrap());
     }
 
+    // Proactively push conflict radar and cluster data on MR join.
+    // Spawned as a background task so the join response isn't blocked by the
+    // GitLab API call to resolve project_id. Data arrives shortly after join,
+    // same pattern as CACHED_REVIEW. If the file index is empty (no webhooks
+    // received yet), the client-side GET_CONFLICTS/GET_CLUSTER handles it.
+    {
+        let state = state.clone();
+        let mr = mr.clone();
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let cfg = state.config();
+            if !cfg.conflict.enabled && !cfg.cluster.enabled {
+                return;
+            }
+
+            let gl_cfg = crate::services::gitlab::client::GitLabConfig {
+                base_url: cfg.gitlab.url.clone(),
+                token: cfg.gitlab.bot_token.clone(),
+            };
+
+            // Resolve project_id from project_path — needed for DB queries.
+            // Uses the cached resolver to avoid redundant API calls.
+            let project_id = match state.resolve_project_id(&mr.project_path).await {
+                Some(id) => id,
+                None => return, // Can't resolve — client will use GET_CONFLICTS/GET_CLUSTER
+            };
+
+            // Push conflict report
+            if cfg.conflict.enabled {
+                if let Ok(report) = crate::services::conflict::detector::detect_conflicts(
+                    state.pool(),
+                    &gl_cfg,
+                    project_id,
+                    mr.mr_iid,
+                )
+                .await
+                {
+                    if !report.conflicts.is_empty() {
+                        let msg = crate::api::ws::WsOutbound::ConflictUpdated {
+                            project_id,
+                            mr_iid: mr.mr_iid,
+                            conflicts: serde_json::to_value(&report).unwrap_or_default(),
+                        };
+                        let _ = tx.send(serde_json::to_string(&msg).unwrap_or_default());
+                    }
+                }
+            }
+
+            // Push cluster data
+            if cfg.cluster.enabled {
+                if let Ok(rows) = db::queries::get_clusters_for_mr(
+                    state.pool(),
+                    project_id,
+                    mr.mr_iid as i64,
+                )
+                .await
+                {
+                    for (id, proj_id, ticket_key, member_mrs_json, signals_json, relevance, summary_blob, _summary_hash, order_blob, _updated) in rows {
+                        let member_mrs: Vec<crate::types::cluster::ClusterMember> =
+                            serde_json::from_str(&member_mrs_json).unwrap_or_default();
+                        let signals: Vec<crate::types::cluster::ClusterSignal> =
+                            serde_json::from_str(&signals_json).unwrap_or_default();
+
+                        let summary: Option<crate::types::cluster::ClusterSummaryData> =
+                            summary_blob.and_then(|blob| {
+                                let json_str = decompress_or_raw(&blob);
+                                serde_json::from_slice(&json_str).ok()
+                            });
+                        let review_order: Option<crate::types::cluster::ClusterReviewOrder> =
+                            order_blob.and_then(|blob| {
+                                let json_str = decompress_or_raw(&blob);
+                                serde_json::from_slice(&json_str).ok()
+                            });
+
+                        let cluster = crate::types::cluster::MrCluster {
+                            id,
+                            project_id: proj_id,
+                            ticket_key,
+                            member_mrs,
+                            relevance_score: relevance,
+                            signals,
+                            summary,
+                            review_order,
+                        };
+
+                        let msg = crate::api::ws::WsOutbound::ClusterUpdated {
+                            project_id,
+                            cluster: serde_json::to_value(&cluster).unwrap_or_default(),
+                        };
+                        let _ = tx.send(serde_json::to_string(&msg).unwrap_or_default());
+                    }
+                }
+            }
+        });
+    }
+
     Ok(())
 }
 
@@ -240,6 +341,8 @@ pub async fn handle_comment_action(
     comment_id: &str,
     action: &str,
     edited_body: Option<&str>,
+    category: Option<&str>,
+    severity: Option<&str>,
 ) {
     // Persist
     let _ = db::queries::upsert_comment_action(
@@ -250,6 +353,8 @@ pub async fn handle_comment_action(
         user_id,
         action,
         edited_body,
+        category,
+        severity,
     )
     .await;
 

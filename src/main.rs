@@ -119,18 +119,8 @@ async fn run_server(cfg: config::BottoConfig, data_dir: &PathBuf) -> anyhow::Res
 
     // Start background review queue manager
     let queue_shutdown = tokio_util::sync::CancellationToken::new();
-    let state_for_queue = state.clone();
-    let queue_broadcaster: Arc<dyn Fn(&types::state::MrRef, &str) + Send + Sync> = {
-        let s = state_for_queue;
-        Arc::new(move |mr, msg| s.broadcast_to_mr(mr, msg))
-    };
-    let queue_mgr = services::queue::manager::QueueManager::new(
-        cfg.clone(),
-        pool.clone(),
-        state.event_bus().clone(),
-        queue_broadcaster,
-        state.ai_semaphore().clone(),
-    );
+    let queue_mgr = services::queue::manager::QueueManager::new(state.clone());
+    state.set_queue_manager(queue_mgr.clone());
     let queue_handle = {
         let shutdown = queue_shutdown.clone();
         tokio::spawn(async move {

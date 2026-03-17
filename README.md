@@ -24,6 +24,7 @@ Works with gitlab.com, self-hosted GitLab instances, and any OpenAI-compatible A
 - **Admin settings page** — embedded web UI at `/admin` for live config changes (hot-swap, no restart needed for most settings)
 - **Self-evolving prompts** — built-in harness that autonomously improves sandbox fix prompts through evolution loops
 - **Priority queue** — reviews scored and executed in priority order, with pause/resume/cancel
+- **Auto-review on push** — optionally enqueue reviews when commits land on open MRs, so the AI review is cached before a human even opens the page
 - **Works with any model** — OpenAI, Anthropic, Mistral, Ollama, or any OpenAI-compatible endpoint
 
 ## Features
@@ -216,7 +217,7 @@ Multiplexed WebSocket protocol between Otto extensions and Botto:
 Botto receives GitLab webhook events for real-time coordination:
 
 - **MR events** — triggers cache invalidation, queue updates
-- **Push events** — detects new commits on reviewed MRs
+- **Push events** — detects new commits on reviewed MRs; optionally auto-enqueues reviews (see `review.auto_review_on_push`)
 - **Note events** — tracks discussion activity
 
 Configure a webhook in GitLab pointing to `https://your-botto-host:7700/api/webhooks/gitlab` with a matching secret token.
@@ -275,6 +276,15 @@ All config is optional — Botto auto-detects what it can. Priority: CLI flags >
 | Env Var | Config Key | Description |
 |---------|-----------|-------------|
 | `BOTTO_WEBHOOK_SECRET` | `gitlab.webhook_secret` | GitLab webhook validation token |
+
+### Review Configuration
+
+```toml
+[review]
+auto_review_on_push = false  # default: off
+```
+
+When enabled, Botto automatically enqueues a review whenever new commits are pushed to a branch with an open MR. Draft MRs are skipped. By the time a human reviewer opens the MR, the full AI review is already cached and waiting. Connected Otto extensions are notified immediately so the UI can show review-in-progress status.
 
 ### Per-Task Model Configuration
 

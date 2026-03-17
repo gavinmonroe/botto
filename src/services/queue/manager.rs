@@ -16,16 +16,14 @@
 //   6. Advances to next item
 // ---------------------------------------------------------------------------
 
-use crate::config::BottoConfig;
-use crate::services::events::{Event, EventBus, EventType};
+use crate::services::events::{Event, EventType};
 use crate::services::gitlab::client as gitlab;
 use crate::services::review::orchestrator;
 use crate::types::review::{DiffFileData, MrContext};
-use crate::types::state::MrRef;
+use crate::types::state::{AppState, InFlightReview, MrRef};
 use serde_json::json;
-use sqlx::SqlitePool;
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex, Notify, Semaphore};
+use tokio::sync::{mpsc, Mutex, Notify};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
@@ -47,38 +45,25 @@ enum ItemStatus {
 
 /// The queue manager. Owned by AppState, runs as a background task.
 pub struct QueueManager {
-    cfg: BottoConfig,
-    pool: SqlitePool,
-    event_bus: EventBus,
+    /// Shared application state — gives access to config (hot-swap safe),
+    /// in-flight review map (dedup with interactive reviews), DB pool,
+    /// event bus, broadcaster, and AI semaphore.
+    state: AppState,
     /// In-memory queue sorted by priority (highest first).
     items: Mutex<Vec<QueueItem>>,
     /// Currently running review's cancellation token.
     active_cancel: Mutex<Option<CancellationToken>>,
     /// Notify when a new item is enqueued (wakes the run loop).
     notify: Notify,
-    /// Broadcast function for sending chunks to connected Ottos.
-    broadcaster: Arc<dyn Fn(&MrRef, &str) + Send + Sync>,
-    /// Shared AI call semaphore (same instance as stream_review uses).
-    ai_semaphore: Arc<Semaphore>,
 }
 
 impl QueueManager {
-    pub fn new(
-        cfg: BottoConfig,
-        pool: SqlitePool,
-        event_bus: EventBus,
-        broadcaster: Arc<dyn Fn(&MrRef, &str) + Send + Sync>,
-        ai_semaphore: Arc<Semaphore>,
-    ) -> Arc<Self> {
+    pub fn new(state: AppState) -> Arc<Self> {
         Arc::new(Self {
-            cfg,
-            pool,
-            event_bus,
+            state,
             items: Mutex::new(Vec::new()),
             active_cancel: Mutex::new(None),
             notify: Notify::new(),
-            broadcaster,
-            ai_semaphore,
         })
     }
 
@@ -99,6 +84,12 @@ impl QueueManager {
             return Err("already queued".into());
         }
 
+        // Also skip if an interactive review is already in-flight for this MR
+        let mr_key = format!("{}:{}", project_path, mr_iid);
+        if self.state.in_flight().contains_key(&mr_key) {
+            return Err("review already in-flight".into());
+        }
+
         items.push(QueueItem {
             project_path: project_path.to_string(),
             mr_iid,
@@ -115,6 +106,7 @@ impl QueueManager {
             .unwrap()
             .as_secs() as i64;
         let mr_context_json = serde_json::to_vec(&json!({})).unwrap();
+        let pool = self.state.pool();
         let _ = sqlx::query(
             "INSERT INTO review_queue (project_path, mr_iid, priority_score, status, mr_context, enqueued_at)
              VALUES (?, ?, ?, 'queued', ?, ?)
@@ -128,7 +120,7 @@ impl QueueManager {
         .bind(priority_score)
         .bind(&mr_context_json)
         .bind(now)
-        .execute(&self.pool)
+        .execute(pool)
         .await;
 
         drop(items);
@@ -138,7 +130,7 @@ impl QueueManager {
         // Wake the run loop
         self.notify.notify_one();
 
-        self.event_bus.publish(Event {
+        self.state.event_bus().publish(Event {
             event_type: EventType::ReviewStarted,
             project_path: project_path.to_string(),
             mr_iid: Some(mr_iid),
@@ -229,41 +221,65 @@ impl QueueManager {
 
                 info!("queue: starting review for {}:!{}", project_path, mr_iid);
 
+                let mr_key = format!("{}:{}", project_path, mr_iid);
+
+                // Check if an interactive review is already in-flight (race
+                // between enqueue check and now). If so, skip — the interactive
+                // review will cache the result.
+                if self.state.in_flight().contains_key(&mr_key) {
+                    info!("queue: skipping {}:!{} — interactive review already in-flight", project_path, mr_iid);
+                    let mut items = self.items.lock().await;
+                    items.retain(|i| !(i.project_path == project_path && i.mr_iid == mr_iid));
+                    continue;
+                }
+
+                // Register in-flight so interactive stream_review requests
+                // late-join instead of starting a duplicate review.
+                let in_flight = InFlightReview::new();
+                self.state.in_flight().insert(mr_key.clone(), in_flight.clone());
+
+                // Read config fresh (hot-swap safe)
+                let cfg = self.state.config();
+
                 // Build MrContext from GitLab API
-                let mr_context = self.build_mr_context(&project_path, mr_iid).await;
+                let mr_context = self.build_mr_context(&cfg, &project_path, mr_iid).await;
 
                 match mr_context {
                     Some(ctx) => {
                         let cancel = CancellationToken::new();
                         *self.active_cancel.lock().await = Some(cancel.clone());
 
-                        // Create chunk channel — we drain it to avoid blocking the
-                        // orchestrator, but don't broadcast individual chunks.
-                        // Queue reviews run server-side with no active stream listener.
-                        // Results are cached by the orchestrator; we broadcast a
-                        // CACHED_REVIEW notification when complete.
+                        // Create chunk channel. Forward chunks through the
+                        // InFlightReview so late-joiners (humans opening the MR
+                        // while the queued review runs) get replay + live stream.
                         let (chunk_tx, mut chunk_rx) = mpsc::channel::<serde_json::Value>(128);
 
-                        // Drain chunks (orchestrator blocks if channel is full)
-                        let drainer = tokio::spawn(async move {
-                            while chunk_rx.recv().await.is_some() {}
+                        let in_flight_for_fwd = in_flight.clone();
+                        let forwarder = tokio::spawn(async move {
+                            while let Some(chunk) = chunk_rx.recv().await {
+                                in_flight_for_fwd.emit(chunk);
+                            }
                         });
 
                         // Run the review
                         let tasks = orchestrator::all_tasks();
                         let result = orchestrator::execute_review(
-                            &self.cfg,
-                            &self.pool,
+                            &cfg,
+                            self.state.pool(),
                             &ctx,
                             &tasks,
                             chunk_tx,
                             cancel,
                             false, // queue reviews always use cache
-                            Some(self.ai_semaphore.clone()),
+                            Some(self.state.ai_semaphore().clone()),
                         )
                         .await;
 
-                        let _ = drainer.await;
+                        let _ = forwarder.await;
+
+                        // Mark in-flight as complete so late-joiners know
+                        // the review is done and can read from cache.
+                        in_flight.finish();
 
                         // Notify all viewers that a cached review is available
                         if result.is_some() {
@@ -278,10 +294,10 @@ impl QueueManager {
                                 "mr_iid": mr_iid,
                                 "payload": { "source": "queue" }
                             });
-                            (self.broadcaster)(&mr_ref, &notification.to_string());
+                            self.state.broadcast_to_mr(&mr_ref, &notification.to_string());
                         }
 
-                        self.event_bus.publish(Event {
+                        self.state.event_bus().publish(Event {
                             event_type: EventType::ReviewComplete,
                             project_path: project_path.clone(),
                             mr_iid: Some(mr_iid),
@@ -297,7 +313,8 @@ impl QueueManager {
                     }
                 }
 
-                // Remove completed item
+                // Clean up: remove in-flight entry and queue item
+                self.state.in_flight().remove(&mr_key);
                 {
                     let mut items = self.items.lock().await;
                     items.retain(|i| {
@@ -310,10 +327,10 @@ impl QueueManager {
     }
 
     /// Build an MrContext by fetching data from GitLab.
-    async fn build_mr_context(&self, project_path: &str, mr_iid: u64) -> Option<MrContext> {
+    async fn build_mr_context(&self, cfg: &crate::config::BottoConfig, project_path: &str, mr_iid: u64) -> Option<MrContext> {
         let gl_cfg = gitlab::GitLabConfig {
-            base_url: self.cfg.gitlab.url.clone(),
-            token: self.cfg.gitlab.bot_token.clone(),
+            base_url: cfg.gitlab.url.clone(),
+            token: cfg.gitlab.bot_token.clone(),
         };
 
         // Fetch project to get numeric ID
@@ -349,7 +366,7 @@ impl QueueManager {
             project_path: project_path.to_string(),
             project_id: Some(project.id),
             mr_iid,
-            host_url: self.cfg.gitlab.url.clone(),
+            host_url: cfg.gitlab.url.clone(),
             title: changes.title,
             description: changes.description,
             source_branch: changes.source_branch,

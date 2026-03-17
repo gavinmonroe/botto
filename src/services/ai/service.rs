@@ -50,6 +50,9 @@ impl TaskConfig {
             Contracts => &cfg.ai.models.contracts,
             BehavioralDelta => &cfg.ai.models.behavioral_delta,
             Inquiry => &cfg.ai.models.inquiry,
+            SemanticConflict => &cfg.ai.models.semantic_conflict,
+            ClusterSummary => &cfg.ai.models.cluster_summary,
+            ClusterReviewOrder => &cfg.ai.models.cluster_review_order,
         };
         Self {
             model: model.clone(),
@@ -161,7 +164,7 @@ pub async fn generate_summary(
 ) -> Result<MrSummary, AiError> {
     let client_cfg = ai_config(cfg);
     let task_cfg = TaskConfig::from_botto_config(cfg, crate::types::settings::AiTaskType::Summary);
-    let messages = prompts::summary::build(mr, ticket_context, None, repo_config);
+    let messages = prompts::summary::build(mr, ticket_context, cfg.ai.custom_prompts.get("summary"), repo_config);
 
     if delta_tx.is_some() {
         call_streaming_and_parse(&client_cfg, &task_cfg, messages, delta_tx, cancel).await
@@ -183,7 +186,7 @@ pub async fn review_file(
     let client_cfg = ai_config(cfg);
     let task_cfg =
         TaskConfig::from_botto_config(cfg, crate::types::settings::AiTaskType::CodeReview);
-    let messages = prompts::code_review::build(mr, file, file_content, context, None);
+    let messages = prompts::code_review::build(mr, file, file_content, context, cfg.ai.custom_prompts.get("code_review"));
 
     if delta_tx.is_some() {
         call_streaming_and_parse(&client_cfg, &task_cfg, messages, delta_tx, cancel).await
@@ -204,7 +207,7 @@ pub async fn analyze_edge_cases(
     let client_cfg = ai_config(cfg);
     let task_cfg =
         TaskConfig::from_botto_config(cfg, crate::types::settings::AiTaskType::EdgeCases);
-    let messages = prompts::edge_cases::build(mr, summary, None, repo_config);
+    let messages = prompts::edge_cases::build(mr, summary, cfg.ai.custom_prompts.get("edge_cases"), repo_config);
 
     if delta_tx.is_some() {
         call_streaming_and_parse(&client_cfg, &task_cfg, messages, delta_tx, cancel).await
@@ -304,7 +307,7 @@ pub async fn discover_related_files(
     let client_cfg = ai_config(cfg);
     let task_cfg =
         TaskConfig::from_botto_config(cfg, crate::types::settings::AiTaskType::RelatedFiles);
-    let messages = prompts::related_files::build(mr, None, repo_config);
+    let messages = prompts::related_files::build(mr, cfg.ai.custom_prompts.get("related_files"), repo_config);
 
     call_streaming_and_parse(&client_cfg, &task_cfg, messages, None, cancel).await
 }
@@ -324,7 +327,7 @@ pub async fn generate_adversarial_tests(
     let client_cfg = ai_config(cfg);
     let task_cfg =
         TaskConfig::from_botto_config(cfg, crate::types::settings::AiTaskType::AdversarialTests);
-    let messages = prompts::adversarial_tests::build(mr, edge_cases, None, repo_config);
+    let messages = prompts::adversarial_tests::build(mr, edge_cases, cfg.ai.custom_prompts.get("adversarial_tests"), repo_config);
 
     call_streaming_and_parse(&client_cfg, &task_cfg, messages, None, cancel).await
 }
@@ -339,7 +342,7 @@ pub async fn generate_contracts(
     let client_cfg = ai_config(cfg);
     let task_cfg =
         TaskConfig::from_botto_config(cfg, crate::types::settings::AiTaskType::Contracts);
-    let messages = prompts::contracts::build(mr, None, repo_config);
+    let messages = prompts::contracts::build(mr, cfg.ai.custom_prompts.get("contracts"), repo_config);
 
     call_streaming_and_parse(&client_cfg, &task_cfg, messages, None, cancel).await
 }
@@ -355,7 +358,7 @@ pub async fn analyze_behavioral_delta(
     let client_cfg = ai_config(cfg);
     let task_cfg =
         TaskConfig::from_botto_config(cfg, crate::types::settings::AiTaskType::BehavioralDelta);
-    let messages = prompts::behavioral_delta::build(mr, summary, None, repo_config);
+    let messages = prompts::behavioral_delta::build(mr, summary, cfg.ai.custom_prompts.get("behavioral_delta"), repo_config);
 
     call_streaming_and_parse(&client_cfg, &task_cfg, messages, None, cancel).await
 }

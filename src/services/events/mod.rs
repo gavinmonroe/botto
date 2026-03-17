@@ -33,6 +33,10 @@ pub enum EventType {
     MrUpdated,
     UserJoinedMr,
     UserLeftMr,
+    /// A conflict was detected or resolved between in-flight MRs.
+    ConflictUpdated,
+    /// A cluster was created, updated, or dissolved.
+    ClusterUpdated,
 }
 
 #[derive(Clone)]

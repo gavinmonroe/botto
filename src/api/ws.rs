@@ -494,6 +494,8 @@ async fn handle_message(
             comment_id,
             action,
             edited_body,
+            category,
+            severity,
         } => {
             let state = state.clone();
             let conn_id = conn_id.to_string();
@@ -508,6 +510,8 @@ async fn handle_message(
                     &comment_id,
                     &action,
                     edited_body.as_deref(),
+                    category.as_deref(),
+                    severity.as_deref(),
                 )
                 .await;
             });
@@ -639,6 +643,8 @@ pub enum WsInbound {
         comment_id: String,
         action: String,
         edited_body: Option<String>,
+        category: Option<String>,
+        severity: Option<String>,
     },
 
     /// Request a sandbox fix.
@@ -790,6 +796,21 @@ pub enum WsOutbound {
     #[serde(rename = "PRESENCE_SNAPSHOT")]
     PresenceSnapshot {
         viewers: Vec<serde_json::Value>,
+    },
+
+    /// Conflict radar update: pushed when conflicts are detected or change.
+    #[serde(rename = "CONFLICT_UPDATED")]
+    ConflictUpdated {
+        project_id: i64,
+        mr_iid: u64,
+        conflicts: serde_json::Value,
+    },
+
+    /// Cluster update: pushed when a cluster is created, updated, or removed.
+    #[serde(rename = "CLUSTER_UPDATED")]
+    ClusterUpdated {
+        project_id: i64,
+        cluster: serde_json::Value,
     },
 }
 

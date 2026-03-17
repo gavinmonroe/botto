@@ -1,4 +1,6 @@
 pub mod ai;
+pub mod cluster;
+pub mod conflict;
 pub mod digest;
 pub mod events;
 pub mod gitlab;

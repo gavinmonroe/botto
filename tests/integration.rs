@@ -34,6 +34,7 @@ fn test_config(port: u16) -> BottoConfig {
             base_url: "".into(),
             api_key: "".into(),
             models: AiModelConfig::default(),
+            custom_prompts: AiCustomPrompts::default(),
         },
         sandbox: SandboxConfig {
             enabled: false,
@@ -57,6 +58,11 @@ fn test_config(port: u16) -> BottoConfig {
             review_ttl_days: 7,
             max_cached_reviews: 100,
         },
+        review: ReviewConfig {
+            auto_review_on_push: false,
+        },
+        cluster: ClusterConfig::default(),
+        conflict: ConflictConfig::default(),
         harness: HarnessConfig {
             enabled: false,
             max_rounds: 1,
@@ -998,4 +1004,84 @@ async fn test_project_knowledge_survives_recipe_deletion() {
     let (facts_json, _, _) =
         db::queries::get_project_knowledge(&pool, "group/project", "node:20").await.unwrap().unwrap();
     assert_eq!(facts_json, facts);
+}
+
+// ---------------------------------------------------------------------------
+// Reviewer preferences — category/severity persistence + aggregation
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_comment_action_with_category_severity() {
+    let pool = db::init(std::path::Path::new(":memory:")).await.unwrap();
+
+    // Insert actions with category/severity
+    db::queries::upsert_comment_action(
+        &pool, "team/repo", 1, "c1", "alice", "accepted", None,
+        Some("bug"), Some("critical"),
+    ).await.unwrap();
+
+    db::queries::upsert_comment_action(
+        &pool, "team/repo", 1, "c2", "alice", "dismissed", None,
+        Some("style"), Some("suggestion"),
+    ).await.unwrap();
+
+    // Verify they're persisted
+    let actions = db::queries::get_comment_actions(&pool, "team/repo", 1).await.unwrap();
+    assert_eq!(actions.len(), 2);
+}
+
+#[tokio::test]
+async fn test_comment_action_without_category_severity() {
+    let pool = db::init(std::path::Path::new(":memory:")).await.unwrap();
+
+    // Old-style action without category/severity (backward compat)
+    db::queries::upsert_comment_action(
+        &pool, "team/repo", 1, "c1", "alice", "accepted", None,
+        None, None,
+    ).await.unwrap();
+
+    let actions = db::queries::get_comment_actions(&pool, "team/repo", 1).await.unwrap();
+    assert_eq!(actions.len(), 1);
+}
+
+#[tokio::test]
+async fn test_comment_action_upsert_preserves_category() {
+    let pool = db::init(std::path::Path::new(":memory:")).await.unwrap();
+
+    // First action has category/severity
+    db::queries::upsert_comment_action(
+        &pool, "team/repo", 1, "c1", "alice", "accepted", None,
+        Some("bug"), Some("critical"),
+    ).await.unwrap();
+
+    // Same user changes action but sends NULL category (e.g. older client).
+    // COALESCE in the upsert should preserve the original category/severity.
+    db::queries::upsert_comment_action(
+        &pool, "team/repo", 1, "c1", "alice", "dismissed", None,
+        None, None,
+    ).await.unwrap();
+
+    let actions = db::queries::get_comment_actions(&pool, "team/repo", 1).await.unwrap();
+    assert_eq!(actions.len(), 1);
+    assert_eq!(actions[0].2, "dismissed"); // action updated
+}
+
+#[tokio::test]
+async fn test_reviewer_prefs_upsert_and_get() {
+    let pool = db::init(std::path::Path::new(":memory:")).await.unwrap();
+
+    db::queries::upsert_reviewer_prefs(&pool, "team/repo", "## Team prefs\n- style dismissed 80%").await.unwrap();
+
+    let result = db::queries::get_reviewer_prefs(&pool, "team/repo").await.unwrap();
+    assert!(result.is_some());
+    let (text, _ts) = result.unwrap();
+    assert!(text.contains("style dismissed 80%"));
+}
+
+#[tokio::test]
+async fn test_reviewer_prefs_empty_for_unknown_project() {
+    let pool = db::init(std::path::Path::new(":memory:")).await.unwrap();
+
+    let result = db::queries::get_reviewer_prefs(&pool, "unknown/project").await.unwrap();
+    assert!(result.is_none());
 }

@@ -337,6 +337,45 @@ pub async fn fetch_recent_merged_mrs(
     .await
 }
 
+/// Fetch open merge requests whose source branch matches the given branch name.
+/// Used by auto-review-on-push to find which MRs are affected by a push event.
+/// Returns at most one page (20 results) — a branch rarely has more than one open MR.
+pub async fn fetch_open_mrs_for_branch(
+    cfg: &GitLabConfig,
+    project_id: i64,
+    source_branch: &str,
+) -> Result<Vec<MergeRequest>, GitLabError> {
+    get_json(
+        cfg,
+        &format!("/projects/{}/merge_requests", project_id),
+        &[
+            ("state", "opened"),
+            ("source_branch", source_branch),
+            ("per_page", "20"),
+        ],
+    )
+    .await
+}
+
+/// Fetch all open merge requests for a project. Used by cluster detection
+/// to find MRs sharing ticket keys. Paginated, capped at 5 pages (500 MRs).
+pub async fn fetch_open_mrs(
+    cfg: &GitLabConfig,
+    project_id: i64,
+) -> Result<Vec<MergeRequest>, GitLabError> {
+    get_all_pages(
+        cfg,
+        &format!("/projects/{}/merge_requests", project_id),
+        &[
+            ("state", "opened"),
+            ("order_by", "updated_at"),
+            ("sort", "desc"),
+        ],
+        5,
+    )
+    .await
+}
+
 /// Fetch changed file paths for a specific MR (lightweight — no diff content).
 pub async fn fetch_mr_changed_paths(
     cfg: &GitLabConfig,
@@ -658,6 +697,13 @@ pub struct MergeRequest {
     pub web_url: String,
     pub author: Option<MrAuthor>,
     pub merged_at: Option<String>,
+    /// Whether the MR is a draft/WIP. Defaults to false if not present
+    /// (e.g. older GitLab versions or list endpoints that omit it).
+    #[serde(default)]
+    pub draft: bool,
+    /// Labels applied to the MR. Used for priority scoring (risk/security labels).
+    #[serde(default)]
+    pub labels: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -57,6 +57,12 @@ api_key = ""
 # review_ttl_days = 7
 # max_cached_reviews = 500  # per project
 
+[review]
+# Automatically enqueue a review when new commits land on an open MR.
+# Draft MRs are skipped. By the time a human opens the MR, the AI review
+# is already cached and waiting.
+# auto_review_on_push = false
+
 [harness]
 # Self-evolving prompt engineering harness. Disabled by default.
 # enabled = false

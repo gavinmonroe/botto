@@ -8,6 +8,7 @@
 #![allow(unused_variables, unused_imports)]
 
 use crate::api::ws::WsOutbound;
+use crate::config;
 use crate::db;
 use crate::types::state::AppState;
 use serde_json::{json, Value};
@@ -358,13 +359,15 @@ pub async fn get_comment_actions(state: &AppState, payload: &Value) -> Value {
         Ok(rows) => {
             let actions_json: Vec<Value> = rows
                 .into_iter()
-                .map(|row: (String, String, String, Option<String>, i64)| {
+                .map(|row: (String, String, String, Option<String>, i64, Option<String>, Option<String>)| {
                     json!({
                         "comment_id": row.0,
                         "user_id": row.1,
                         "action": row.2,
                         "edited_body": row.3,
                         "created_at": row.4,
+                        "category": row.5,
+                        "severity": row.6,
                     })
                 })
                 .collect();
@@ -858,7 +861,7 @@ pub async fn stream_chat(
 
     // Build message history
     let mut messages = vec![
-        crate::services::ai::prompts::chat::build_system(&review_context, None, repo_config_text.as_deref()),
+        crate::services::ai::prompts::chat::build_system(&review_context, state.config().ai.custom_prompts.get("chat"), repo_config_text.as_deref()),
     ];
 
     // Add conversation history if provided
@@ -970,7 +973,7 @@ pub async fn stream_inquiry(
 
     // Build message history: system + context + previous slides + current question
     let mut messages = vec![
-        crate::services::ai::prompts::inquiry::build_system(None),
+        crate::services::ai::prompts::inquiry::build_system(state.config().ai.custom_prompts.get("inquiry")),
         ChatMessage {
             role: "user".into(),
             content: Some(context_text),
@@ -1150,4 +1153,184 @@ pub async fn invalidate_repo_config(state: &AppState, payload: &Value) -> Value 
 
     crate::services::repo_config::invalidate(state.pool(), project_path).await;
     ok(json!({ "invalidated": true }))
+}
+
+// ---------------------------------------------------------------------------
+// Conflict Radar
+// ---------------------------------------------------------------------------
+
+pub async fn get_conflicts(state: &AppState, payload: &Value) -> Value {
+    let mr_iid = match extract_u64(payload, "mr_iid") {
+        Some(iid) => iid,
+        None => return err("missing mr_iid"),
+    };
+
+    let cfg = state.config();
+    if !cfg.conflict.enabled {
+        return ok(json!({ "mrIid": mr_iid, "conflicts": [] }));
+    }
+
+    let gl_cfg = crate::services::gitlab::client::GitLabConfig {
+        base_url: cfg.gitlab.url.clone(),
+        token: cfg.gitlab.bot_token.clone(),
+    };
+
+    // Accept either project_id (numeric) or project_path (string).
+    // Uses the cached project_id resolver to avoid redundant API calls.
+    let project_id = match extract_i64(payload, "project_id") {
+        Some(id) => id,
+        None => {
+            let project_path = match extract_str(payload, "project_path") {
+                Some(p) => p,
+                None => return err("missing project_id or project_path"),
+            };
+            match state.resolve_project_id(project_path).await {
+                Some(id) => id,
+                None => return err("failed to resolve project"),
+            }
+        }
+    };
+
+    match crate::services::conflict::detector::detect_conflicts(
+        state.pool(),
+        &gl_cfg,
+        project_id,
+        mr_iid,
+    )
+    .await
+    {
+        Ok(report) => ok(serde_json::to_value(&report).unwrap_or_default()),
+        Err(e) => err(&format!("conflict detection failed: {}", e)),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cross-MR Clusters
+// ---------------------------------------------------------------------------
+
+pub async fn get_cluster(state: &AppState, payload: &Value) -> Value {
+    let mr_iid = match extract_u64(payload, "mr_iid") {
+        Some(iid) => iid,
+        None => return err("missing mr_iid"),
+    };
+
+    let cfg = state.config();
+    if !cfg.cluster.enabled {
+        return ok(json!({ "clusters": [] }));
+    }
+
+    // Accept either project_id or project_path — same pattern as get_conflicts.
+    // Uses the cached project_id resolver to avoid redundant API calls.
+    let project_id = match extract_i64(payload, "project_id") {
+        Some(id) => id,
+        None => {
+            let project_path = match extract_str(payload, "project_path") {
+                Some(p) => p,
+                None => return err("missing project_id or project_path"),
+            };
+            match state.resolve_project_id(project_path).await {
+                Some(id) => id,
+                None => return err("failed to resolve project"),
+            }
+        }
+    };
+
+    match db::queries::get_clusters_for_mr(state.pool(), project_id, mr_iid as i64).await {
+        Ok(rows) => {
+            let clusters: Vec<Value> = rows
+                .into_iter()
+                .filter_map(|(id, proj_id, ticket_key, member_mrs_json, signals_json, relevance, summary_blob, summary_hash, order_blob, _updated)| {
+                    let member_mrs: Vec<crate::types::cluster::ClusterMember> =
+                        serde_json::from_str(&member_mrs_json).ok()?;
+                    let signals: Vec<crate::types::cluster::ClusterSignal> =
+                        serde_json::from_str(&signals_json).ok()?;
+
+                    // Decompress summary if present
+                    let summary: Option<crate::types::cluster::ClusterSummaryData> =
+                        summary_blob.and_then(|blob| {
+                            let json_str = decompress_string(&blob)?;
+                            serde_json::from_str(&json_str).ok()
+                        });
+
+                    // Decompress review order if present
+                    let review_order: Option<crate::types::cluster::ClusterReviewOrder> =
+                        order_blob.and_then(|blob| {
+                            let json_str = decompress_string(&blob)?;
+                            serde_json::from_str(&json_str).ok()
+                        });
+
+                    let cluster = crate::types::cluster::MrCluster {
+                        id,
+                        project_id: proj_id,
+                        ticket_key,
+                        member_mrs,
+                        relevance_score: relevance,
+                        signals,
+                        summary,
+                        review_order,
+                    };
+
+                    serde_json::to_value(&cluster).ok()
+                })
+                .collect();
+
+            ok(json!({ "clusters": clusters }))
+        }
+        Err(e) => err(&format!("cluster lookup failed: {}", e)),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Server config (read/write via WebSocket — mirrors the HTTP admin API)
+// ---------------------------------------------------------------------------
+
+/// Return the current server config with secrets redacted.
+pub async fn get_server_config(state: &AppState) -> Value {
+    let cfg = state.config();
+    let response = config::ConfigResponse::from_config(&cfg);
+    ok(serde_json::to_value(&response).unwrap_or_default())
+}
+
+/// Apply a partial config update, persist to disk, and hot-swap in memory.
+pub async fn update_server_config(state: &AppState, payload: &Value) -> Value {
+    let update: config::ConfigUpdate = match serde_json::from_value(payload.clone()) {
+        Ok(u) => u,
+        Err(e) => return err(&format!("invalid config update: {}", e)),
+    };
+
+    let current = state.config();
+    let (new_config, restart_fields) = config::apply_update(&current, update);
+
+    // Persist to disk first — if this fails, don't swap in memory
+    if let Err(e) = config::save_to_file(&new_config).await {
+        return err(&format!("failed to save config: {}", e));
+    }
+
+    // Hot-swap in memory
+    state.swap_config(new_config.clone());
+
+    let restart_required = !restart_fields.is_empty();
+    let response = config::ConfigResponse::from_config(&new_config);
+
+    info!(
+        "config updated via WebSocket (restart_required={}, fields={:?})",
+        restart_required, restart_fields
+    );
+
+    ok(json!({
+        "saved": true,
+        "restart_required": restart_required,
+        "restart_fields": restart_fields,
+        "config": serde_json::to_value(&response).unwrap_or_default(),
+    }))
+}
+
+/// Decompress gzip data to a string. Returns None on failure.
+fn decompress_string(data: &[u8]) -> Option<String> {
+    use flate2::read::GzDecoder;
+    use std::io::Read;
+    let mut decoder = GzDecoder::new(data);
+    let mut result = String::new();
+    decoder.read_to_string(&mut result).ok()?;
+    Some(result)
 }

@@ -47,8 +47,9 @@ a{color:var(--primary);text-decoration:none}
 .field .hint{font-size:11px;color:var(--text2);font-style:italic}
 .badge-restart{font-size:10px;color:var(--danger);border:1px solid var(--danger);border-radius:3px;padding:0 4px;margin-left:6px;font-weight:500}
 
-input,select{font-family:var(--font);font-size:13px;padding:6px 8px;background:var(--input-bg);color:var(--text);border:1px solid var(--border);border-radius:4px;outline:none;width:100%}
-input:focus,select:focus{border-color:var(--primary)}
+input,select,textarea{font-family:var(--font);font-size:13px;padding:6px 8px;background:var(--input-bg);color:var(--text);border:1px solid var(--border);border-radius:4px;outline:none;width:100%}
+input:focus,select:focus,textarea:focus{border-color:var(--primary)}
+textarea{resize:vertical;min-height:60px;font-family:monospace;font-size:12px;line-height:1.4}
 input[type="checkbox"]{width:auto;margin-right:4px}
 
 .check-row{display:flex;align-items:center;gap:4px;padding-top:4px}
@@ -177,6 +178,28 @@ input[type="checkbox"]{width:auto;margin-right:4px}
       </div>
     </div>
 
+    <!-- Custom Prompts -->
+    <div class="section collapsed" id="sec-prompts">
+      <div class="section-head" onclick="toggle('sec-prompts')">
+        <h2>Custom Prompts</h2><span class="arrow">▼</span>
+      </div>
+      <div class="section-body single">
+        <span class="hint" style="margin-bottom:8px">Override the system prompt for each AI task. Leave empty to use the built-in default. Changes apply to all team reviews.</span>
+        <div class="field full"><label>Summary</label><textarea id="ai.custom_prompts.summary" rows="3"></textarea></div>
+        <div class="field full"><label>Code review</label><textarea id="ai.custom_prompts.code_review" rows="3"></textarea></div>
+        <div class="field full"><label>Edge cases</label><textarea id="ai.custom_prompts.edge_cases" rows="3"></textarea></div>
+        <div class="field full"><label>Related files</label><textarea id="ai.custom_prompts.related_files" rows="3"></textarea></div>
+        <div class="field full"><label>Follow-up</label><textarea id="ai.custom_prompts.follow_up" rows="3"></textarea></div>
+        <div class="field full"><label>Chat</label><textarea id="ai.custom_prompts.chat" rows="3"></textarea></div>
+        <div class="field full"><label>AC validation</label><textarea id="ai.custom_prompts.ac_validation" rows="3"></textarea></div>
+        <div class="field full"><label>Adversarial tests</label><textarea id="ai.custom_prompts.adversarial_tests" rows="3"></textarea></div>
+        <div class="field full"><label>Contracts</label><textarea id="ai.custom_prompts.contracts" rows="3"></textarea></div>
+        <div class="field full"><label>Behavioral delta</label><textarea id="ai.custom_prompts.behavioral_delta" rows="3"></textarea></div>
+        <div class="field full"><label>Fix (sandbox)</label><textarea id="ai.custom_prompts.fix" rows="3"></textarea></div>
+        <div class="field full"><label>Inquiry</label><textarea id="ai.custom_prompts.inquiry" rows="3"></textarea></div>
+      </div>
+    </div>
+
     <!-- Sandbox -->
     <div class="section" id="sec-sandbox">
       <div class="section-head" onclick="toggle('sec-sandbox')">
@@ -232,6 +255,22 @@ input[type="checkbox"]{width:auto;margin-right:4px}
       </div>
     </div>
 
+    <!-- Review -->
+    <div class="section" id="sec-review">
+      <div class="section-head" onclick="toggle('sec-review')">
+        <h2>Review</h2><span class="arrow">▼</span>
+      </div>
+      <div class="section-body single">
+        <div class="field full">
+          <div class="check-row">
+            <input type="checkbox" name="review.auto_review_on_push" id="review.auto_review_on_push">
+            <label for="review.auto_review_on_push">Auto-review on push</label>
+          </div>
+          <span class="hint">Automatically enqueue a review when new commits are pushed to an open MR. Draft MRs are skipped.</span>
+        </div>
+      </div>
+    </div>
+
     <!-- Harness -->
     <div class="section" id="sec-harness">
       <div class="section-head" onclick="toggle('sec-harness')">
@@ -251,6 +290,46 @@ input[type="checkbox"]{width:auto;margin-right:4px}
         <div class="field full"><label>Seed orgs (comma-separated)</label><input name="harness.gitlab_seed_orgs" id="harness.gitlab_seed_orgs"></div>
         <div class="field"><label>Memory directory</label><input name="harness.memory_dir" id="harness.memory_dir"></div>
         <div class="field"><label>Judge model</label><input name="harness.judge_model" id="harness.judge_model"></div>
+      </div>
+    </div>
+
+    <!-- Cluster -->
+    <div class="section" id="sec-cluster">
+      <div class="section-head" onclick="toggle('sec-cluster')">
+        <h2>Cross-MR Clusters</h2><span class="arrow">▼</span>
+      </div>
+      <div class="section-body">
+        <div class="field">
+          <label class="toggle-row">
+            <input type="checkbox" name="cluster.enabled" id="cluster.enabled">
+            <label for="cluster.enabled">Enabled</label>
+          </label>
+        </div>
+        <div class="field"><label>Max cluster size</label><input name="cluster.max_cluster_size" id="cluster.max_cluster_size" type="number"></div>
+        <div class="field"><label>File overlap threshold (0.0–1.0)</label><input name="cluster.file_overlap_threshold" id="cluster.file_overlap_threshold" type="number" step="0.01" min="0" max="1"></div>
+        <div class="field"><label>Summary TTL (days)</label><input name="cluster.summary_ttl_days" id="cluster.summary_ttl_days" type="number"></div>
+      </div>
+    </div>
+
+    <!-- Conflict -->
+    <div class="section" id="sec-conflict">
+      <div class="section-head" onclick="toggle('sec-conflict')">
+        <h2>Conflict Radar</h2><span class="arrow">▼</span>
+      </div>
+      <div class="section-body">
+        <div class="field">
+          <label class="toggle-row">
+            <input type="checkbox" name="conflict.enabled" id="conflict.enabled">
+            <label for="conflict.enabled">Enabled</label>
+          </label>
+        </div>
+        <div class="field">
+          <label class="toggle-row">
+            <input type="checkbox" name="conflict.semantic_analysis" id="conflict.semantic_analysis">
+            <label for="conflict.semantic_analysis">Semantic analysis (AI, higher cost)</label>
+          </label>
+        </div>
+        <div class="field"><label>Semantic cache TTL (days)</label><input name="conflict.semantic_cache_ttl_days" id="conflict.semantic_cache_ttl_days" type="number"></div>
       </div>
     </div>
 
@@ -336,6 +415,21 @@ async function loadConfig() {
     setVal('ai.models.behavioral_delta', c.ai.models.behavioral_delta);
     setVal('ai.models.fix', c.ai.models.fix);
 
+    // Custom prompts
+    const cp = c.ai.custom_prompts || {};
+    setVal('ai.custom_prompts.summary', cp.summary);
+    setVal('ai.custom_prompts.code_review', cp.code_review);
+    setVal('ai.custom_prompts.edge_cases', cp.edge_cases);
+    setVal('ai.custom_prompts.related_files', cp.related_files);
+    setVal('ai.custom_prompts.follow_up', cp.follow_up);
+    setVal('ai.custom_prompts.chat', cp.chat);
+    setVal('ai.custom_prompts.ac_validation', cp.ac_validation);
+    setVal('ai.custom_prompts.adversarial_tests', cp.adversarial_tests);
+    setVal('ai.custom_prompts.contracts', cp.contracts);
+    setVal('ai.custom_prompts.behavioral_delta', cp.behavioral_delta);
+    setVal('ai.custom_prompts.fix', cp.fix);
+    setVal('ai.custom_prompts.inquiry', cp.inquiry);
+
     setVal('sandbox.enabled', c.sandbox.enabled);
     setVal('sandbox.max_concurrent', c.sandbox.max_concurrent);
     setVal('sandbox.timeout_seconds', c.sandbox.timeout_seconds);
@@ -346,6 +440,8 @@ async function loadConfig() {
     setVal('cache.review_ttl_days', c.cache.review_ttl_days);
     setVal('cache.max_cached_reviews', c.cache.max_cached_reviews);
 
+    setVal('review.auto_review_on_push', c.review.auto_review_on_push);
+
     setVal('harness.enabled', c.harness.enabled);
     setVal('harness.max_rounds', c.harness.max_rounds);
     setVal('harness.variants_per_round', c.harness.variants_per_round);
@@ -354,6 +450,18 @@ async function loadConfig() {
     setVal('harness.gitlab_seed_orgs', (c.harness.gitlab_seed_orgs || []).join(', '));
     setVal('harness.memory_dir', c.harness.memory_dir);
     setVal('harness.judge_model', c.harness.judge_model);
+
+    // Cluster & Conflict
+    const cl = c.cluster || {};
+    setVal('cluster.enabled', cl.enabled ?? true);
+    setVal('cluster.max_cluster_size', cl.max_cluster_size ?? 8);
+    setVal('cluster.file_overlap_threshold', cl.file_overlap_threshold ?? 0.15);
+    setVal('cluster.summary_ttl_days', cl.summary_ttl_days ?? 7);
+
+    const co = c.conflict || {};
+    setVal('conflict.enabled', co.enabled ?? true);
+    setVal('conflict.semantic_analysis', co.semantic_analysis ?? false);
+    setVal('conflict.semantic_cache_ttl_days', co.semantic_cache_ttl_days ?? 3);
   } catch(e) {
     toast('Failed to load config', false);
   }
@@ -406,6 +514,20 @@ async function saveConfig(e) {
         behavioral_delta: getVal('ai.models.behavioral_delta'),
         fix: getVal('ai.models.fix'),
       },
+      custom_prompts: {
+        summary: getVal('ai.custom_prompts.summary'),
+        code_review: getVal('ai.custom_prompts.code_review'),
+        edge_cases: getVal('ai.custom_prompts.edge_cases'),
+        related_files: getVal('ai.custom_prompts.related_files'),
+        follow_up: getVal('ai.custom_prompts.follow_up'),
+        chat: getVal('ai.custom_prompts.chat'),
+        ac_validation: getVal('ai.custom_prompts.ac_validation'),
+        adversarial_tests: getVal('ai.custom_prompts.adversarial_tests'),
+        contracts: getVal('ai.custom_prompts.contracts'),
+        behavioral_delta: getVal('ai.custom_prompts.behavioral_delta'),
+        fix: getVal('ai.custom_prompts.fix'),
+        inquiry: getVal('ai.custom_prompts.inquiry'),
+      },
     },
     sandbox: {
       enabled: getVal('sandbox.enabled'),
@@ -419,6 +541,9 @@ async function saveConfig(e) {
       review_ttl_days: getVal('cache.review_ttl_days'),
       max_cached_reviews: getVal('cache.max_cached_reviews'),
     },
+    review: {
+      auto_review_on_push: getVal('review.auto_review_on_push'),
+    },
     harness: {
       enabled: getVal('harness.enabled'),
       max_rounds: getVal('harness.max_rounds'),
@@ -428,6 +553,17 @@ async function saveConfig(e) {
       gitlab_seed_orgs: typeof orgs === 'string' ? orgs.split(',').map(s => s.trim()).filter(Boolean) : undefined,
       memory_dir: getVal('harness.memory_dir'),
       judge_model: getVal('harness.judge_model'),
+    },
+    cluster: {
+      enabled: getVal('cluster.enabled'),
+      max_cluster_size: getVal('cluster.max_cluster_size'),
+      file_overlap_threshold: getVal('cluster.file_overlap_threshold'),
+      summary_ttl_days: getVal('cluster.summary_ttl_days'),
+    },
+    conflict: {
+      enabled: getVal('conflict.enabled'),
+      semantic_analysis: getVal('conflict.semantic_analysis'),
+      semantic_cache_ttl_days: getVal('conflict.semantic_cache_ttl_days'),
     },
   };
 

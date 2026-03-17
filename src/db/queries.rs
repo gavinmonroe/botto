@@ -179,14 +179,18 @@ pub async fn upsert_comment_action(
     user_id: &str,
     action: &str,
     edited_body: Option<&str>,
+    category: Option<&str>,
+    severity: Option<&str>,
 ) -> Result<()> {
     let now = epoch_secs();
     sqlx::query(
-        "INSERT INTO comment_actions (project_path, mr_iid, comment_id, user_id, action, edited_body, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)
+        "INSERT INTO comment_actions (project_path, mr_iid, comment_id, user_id, action, edited_body, category, severity, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(project_path, mr_iid, comment_id, user_id) DO UPDATE SET
            action = excluded.action,
            edited_body = excluded.edited_body,
+           category = COALESCE(excluded.category, comment_actions.category),
+           severity = COALESCE(excluded.severity, comment_actions.severity),
            created_at = excluded.created_at",
     )
     .bind(project_path)
@@ -195,6 +199,8 @@ pub async fn upsert_comment_action(
     .bind(user_id)
     .bind(action)
     .bind(edited_body)
+    .bind(category)
+    .bind(severity)
     .bind(now)
     .execute(pool)
     .await?;
@@ -205,9 +211,9 @@ pub async fn get_comment_actions(
     pool: &SqlitePool,
     project_path: &str,
     mr_iid: i64,
-) -> Result<Vec<(String, String, String, Option<String>, i64)>> {
-    let rows: Vec<(String, String, String, Option<String>, i64)> = sqlx::query_as(
-        "SELECT comment_id, user_id, action, edited_body, created_at
+) -> Result<Vec<(String, String, String, Option<String>, i64, Option<String>, Option<String>)>> {
+    let rows: Vec<(String, String, String, Option<String>, i64, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT comment_id, user_id, action, edited_body, created_at, category, severity
          FROM comment_actions
          WHERE project_path = ? AND mr_iid = ?
          ORDER BY created_at DESC",
@@ -746,12 +752,361 @@ pub async fn delete_project_knowledge(
 }
 
 // ---------------------------------------------------------------------------
+// Reviewer preferences (team-wide learned patterns)
+// ---------------------------------------------------------------------------
+
+/// Get cached reviewer prefs for a project. Returns (prefs_text, updated_at).
+pub async fn get_reviewer_prefs(
+    pool: &SqlitePool,
+    project_path: &str,
+) -> Result<Option<(String, i64)>> {
+    let row: Option<(Vec<u8>, i64)> = sqlx::query_as(
+        "SELECT prefs, updated_at FROM reviewer_prefs WHERE project_path = ? AND host_url = ''",
+    )
+    .bind(project_path)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(blob, ts)| (String::from_utf8_lossy(&blob).into_owned(), ts)))
+}
+
+/// Upsert cached reviewer prefs for a project.
+pub async fn upsert_reviewer_prefs(
+    pool: &SqlitePool,
+    project_path: &str,
+    prefs_text: &str,
+) -> Result<()> {
+    let now = epoch_secs();
+    sqlx::query(
+        "INSERT INTO reviewer_prefs (project_path, host_url, prefs, updated_at)
+         VALUES (?, '', ?, ?)
+         ON CONFLICT(project_path, host_url) DO UPDATE SET
+           prefs = excluded.prefs,
+           updated_at = excluded.updated_at",
+    )
+    .bind(project_path)
+    .bind(prefs_text.as_bytes())
+    .bind(now)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// MR changed files (shared index for Conflict Radar + Cross-MR Clusters)
+// ---------------------------------------------------------------------------
+
+/// Upsert a single changed file entry for an MR.
+/// Called from webhook handlers and review pipeline side-effects.
+pub async fn upsert_mr_changed_file(
+    pool: &SqlitePool,
+    project_id: i64,
+    mr_iid: i64,
+    file_path: &str,
+    old_path: Option<&str>,
+    change_type: &str,
+    diff_hash: &str,
+    hunks_json: &str,
+) -> Result<()> {
+    let now = epoch_secs();
+    sqlx::query(
+        "INSERT INTO mr_changed_files (project_id, mr_iid, file_path, old_path, change_type, diff_hash, hunks, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(project_id, mr_iid, file_path) DO UPDATE SET
+           old_path = excluded.old_path,
+           change_type = excluded.change_type,
+           diff_hash = excluded.diff_hash,
+           hunks = excluded.hunks,
+           updated_at = excluded.updated_at",
+    )
+    .bind(project_id)
+    .bind(mr_iid)
+    .bind(file_path)
+    .bind(old_path)
+    .bind(change_type)
+    .bind(diff_hash)
+    .bind(hunks_json)
+    .bind(now)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Delete all changed file entries for an MR (on merge or close).
+pub async fn delete_mr_changed_files(
+    pool: &SqlitePool,
+    project_id: i64,
+    mr_iid: i64,
+) -> Result<u64> {
+    let result = sqlx::query(
+        "DELETE FROM mr_changed_files WHERE project_id = ? AND mr_iid = ?",
+    )
+    .bind(project_id)
+    .bind(mr_iid)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+/// Get all changed files for a specific MR.
+/// Returns (file_path, old_path, change_type, diff_hash, hunks_json, updated_at).
+pub async fn get_mr_changed_files(
+    pool: &SqlitePool,
+    project_id: i64,
+    mr_iid: i64,
+) -> Result<Vec<(String, Option<String>, String, String, String, i64)>> {
+    let rows: Vec<(String, Option<String>, String, String, String, i64)> = sqlx::query_as(
+        "SELECT file_path, old_path, change_type, diff_hash, hunks, updated_at
+         FROM mr_changed_files
+         WHERE project_id = ? AND mr_iid = ?",
+    )
+    .bind(project_id)
+    .bind(mr_iid)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+/// Find all other MRs in the same project that touch any of the same files.
+/// Returns (mr_iid, file_path, old_path, change_type, diff_hash, hunks_json)
+/// for every overlapping file in other MRs. The caller computes hunk-level
+/// overlap in memory.
+///
+/// Uses a subquery to first find the file paths for the given MR, then joins
+/// back to find other MRs touching those paths. This is efficient because
+/// the idx_mcf_project_file index covers the join.
+pub async fn get_conflicting_mr_files(
+    pool: &SqlitePool,
+    project_id: i64,
+    mr_iid: i64,
+) -> Result<Vec<(i64, String, Option<String>, String, String, String)>> {
+    let rows: Vec<(i64, String, Option<String>, String, String, String)> = sqlx::query_as(
+        "SELECT other.mr_iid, other.file_path, other.old_path, other.change_type, other.diff_hash, other.hunks
+         FROM mr_changed_files other
+         WHERE other.project_id = ?
+           AND other.mr_iid != ?
+           AND other.file_path IN (
+               SELECT file_path FROM mr_changed_files
+               WHERE project_id = ? AND mr_iid = ?
+           )",
+    )
+    .bind(project_id)
+    .bind(mr_iid)
+    .bind(project_id)
+    .bind(mr_iid)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+/// Get all changed file paths for all MRs in a project.
+/// Used by ClusterDetector's FileOverlapStrategy to compute Jaccard similarity.
+/// Returns (mr_iid, file_path) pairs — lightweight, no hunks needed.
+pub async fn get_project_mr_file_paths(
+    pool: &SqlitePool,
+    project_id: i64,
+) -> Result<Vec<(i64, String)>> {
+    let rows: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT mr_iid, file_path FROM mr_changed_files WHERE project_id = ?",
+    )
+    .bind(project_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+/// Get all distinct MR IIDs in the file index for a project.
+/// Used to know which MRs are currently tracked (for cleanup, etc.).
+pub async fn get_indexed_mr_iids(
+    pool: &SqlitePool,
+    project_id: i64,
+) -> Result<Vec<i64>> {
+    let rows: Vec<(i64,)> = sqlx::query_as(
+        "SELECT DISTINCT mr_iid FROM mr_changed_files WHERE project_id = ?",
+    )
+    .bind(project_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|(iid,)| iid).collect())
+}
+
+// ---------------------------------------------------------------------------
+// MR clusters
+// ---------------------------------------------------------------------------
+
+/// Upsert a cluster. member_mrs and signals are JSON strings.
+/// summary_json and review_order_json are optional gzip-compressed blobs.
+pub async fn upsert_cluster(
+    pool: &SqlitePool,
+    id: &str,
+    project_id: i64,
+    ticket_key: Option<&str>,
+    member_mrs_json: &str,
+    signals_json: &str,
+    relevance_score: f64,
+    ttl_days: u32,
+) -> Result<()> {
+    let now = epoch_secs();
+    let expires_at = now + (ttl_days as i64 * 86400);
+    sqlx::query(
+        "INSERT INTO mr_clusters (id, project_id, ticket_key, member_mrs, signals, relevance_score, created_at, updated_at, expires_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET
+           ticket_key = excluded.ticket_key,
+           member_mrs = excluded.member_mrs,
+           signals = excluded.signals,
+           relevance_score = excluded.relevance_score,
+           updated_at = excluded.updated_at,
+           expires_at = excluded.expires_at",
+    )
+    .bind(id)
+    .bind(project_id)
+    .bind(ticket_key)
+    .bind(member_mrs_json)
+    .bind(signals_json)
+    .bind(relevance_score)
+    .bind(now)
+    .bind(now)
+    .bind(expires_at)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Get all clusters containing a specific MR.
+/// Uses a JSON search on the member_mrs column — SQLite's json_each is
+/// available in modern SQLite but we use a LIKE match for broader compat.
+/// Returns (id, project_id, ticket_key, member_mrs, signals, relevance_score,
+///          summary_json, summary_diff_hash, review_order_json, updated_at).
+pub async fn get_clusters_for_mr(
+    pool: &SqlitePool,
+    project_id: i64,
+    mr_iid: i64,
+) -> Result<Vec<(String, i64, Option<String>, String, String, f64, Option<Vec<u8>>, Option<String>, Option<Vec<u8>>, i64)>> {
+    let now = epoch_secs();
+    // Match MR IID in the JSON array. The member_mrs column contains compact
+    // serde_json like [{"mrIid":42,"mrTitle":"..."},...]. After the number, the
+    // next char is always ',' (next field) or '}' (end of object). We match both
+    // to avoid false positives (e.g. mrIid 42 matching 421).
+    let pattern_comma = format!("%\"mrIid\":{},%", mr_iid);
+    let pattern_brace = format!("%\"mrIid\":{}}}%", mr_iid);
+    let rows = sqlx::query_as(
+        "SELECT id, project_id, ticket_key, member_mrs, signals, relevance_score,
+                summary_json, summary_diff_hash, review_order_json, updated_at
+         FROM mr_clusters
+         WHERE project_id = ?
+           AND (member_mrs LIKE ? OR member_mrs LIKE ?)
+           AND expires_at > ?",
+    )
+    .bind(project_id)
+    .bind(&pattern_comma)
+    .bind(&pattern_brace)
+    .bind(now)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+/// Get a cluster by its ID.
+/// Returns (id, project_id, ticket_key, member_mrs, signals, relevance_score,
+///          summary_json, summary_diff_hash, review_order_json, updated_at).
+pub async fn get_cluster_by_id(
+    pool: &SqlitePool,
+    id: &str,
+) -> Result<Option<(String, i64, Option<String>, String, String, f64, Option<Vec<u8>>, Option<String>, Option<Vec<u8>>, i64)>> {
+    let now = epoch_secs();
+    let row = sqlx::query_as(
+        "SELECT id, project_id, ticket_key, member_mrs, signals, relevance_score,
+                summary_json, summary_diff_hash, review_order_json, updated_at
+         FROM mr_clusters
+         WHERE id = ? AND expires_at > ?",
+    )
+    .bind(id)
+    .bind(now)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row)
+}
+
+/// Delete a cluster by ID.
+pub async fn delete_cluster(pool: &SqlitePool, id: &str) -> Result<u64> {
+    let result = sqlx::query("DELETE FROM mr_clusters WHERE id = ?")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
+}
+
+/// Delete all clusters for a project (cleanup).
+pub async fn delete_project_clusters(pool: &SqlitePool, project_id: i64) -> Result<u64> {
+    let result = sqlx::query("DELETE FROM mr_clusters WHERE project_id = ?")
+        .bind(project_id)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
+}
+
+/// Update the cached summary for a cluster.
+pub async fn update_cluster_summary(
+    pool: &SqlitePool,
+    id: &str,
+    summary_json: &[u8],
+    summary_diff_hash: &str,
+) -> Result<()> {
+    let now = epoch_secs();
+    sqlx::query(
+        "UPDATE mr_clusters SET summary_json = ?, summary_diff_hash = ?, updated_at = ?
+         WHERE id = ?",
+    )
+    .bind(summary_json)
+    .bind(summary_diff_hash)
+    .bind(now)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Update the cached review order for a cluster.
+pub async fn update_cluster_review_order(
+    pool: &SqlitePool,
+    id: &str,
+    review_order_json: &[u8],
+) -> Result<()> {
+    let now = epoch_secs();
+    sqlx::query(
+        "UPDATE mr_clusters SET review_order_json = ?, updated_at = ?
+         WHERE id = ?",
+    )
+    .bind(review_order_json)
+    .bind(now)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Purge expired clusters across all projects.
+pub async fn purge_expired_clusters(pool: &SqlitePool) -> Result<u64> {
+    let now = epoch_secs();
+    let result = sqlx::query("DELETE FROM mr_clusters WHERE expires_at <= ?")
+        .bind(now)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
 fn epoch_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_secs() as i64
+}
+
+/// Public accessor for modules that need timestamps (e.g. prefs staleness check).
+pub fn epoch_secs_pub() -> i64 {
+    epoch_secs()
 }
