@@ -72,6 +72,7 @@ pub struct AiModelConfig {
     pub behavioral_delta: String,
     /// Model for sandbox fix iterations — needs strong reasoning for autonomous fixing.
     pub fix: String,
+    pub inquiry: String,
 }
 
 impl Default for AiModelConfig {
@@ -88,6 +89,7 @@ impl Default for AiModelConfig {
             contracts: "claude-sonnet-4-5".into(),
             behavioral_delta: "claude-sonnet-4-5".into(),
             fix: "claude-opus-4-6".into(),
+            inquiry: "claude-sonnet-4-5".into(),
         }
     }
 }
@@ -204,6 +206,7 @@ struct TomlAiModels {
     contracts: Option<String>,
     behavioral_delta: Option<String>,
     fix: Option<String>,
+    inquiry: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -365,6 +368,7 @@ pub async fn load(config_path: &Option<PathBuf>, data_dir: &Path) -> Result<Bott
                 contracts: toml_models.contracts.unwrap_or(default_models.contracts),
                 behavioral_delta: toml_models.behavioral_delta.unwrap_or(default_models.behavioral_delta),
                 fix: toml_models.fix.unwrap_or(default_models.fix),
+                inquiry: toml_models.inquiry.unwrap_or(default_models.inquiry),
             },
         },
         sandbox: SandboxConfig {
@@ -587,6 +591,7 @@ pub struct AiModelConfigUpdate {
     pub contracts: Option<String>,
     pub behavioral_delta: Option<String>,
     pub fix: Option<String>,
+    pub inquiry: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -702,6 +707,7 @@ pub fn apply_update(current: &BottoConfig, update: ConfigUpdate) -> (BottoConfig
             if let Some(v) = m.contracts { cfg.ai.models.contracts = v; }
             if let Some(v) = m.behavioral_delta { cfg.ai.models.behavioral_delta = v; }
             if let Some(v) = m.fix { cfg.ai.models.fix = v; }
+            if let Some(v) = m.inquiry { cfg.ai.models.inquiry = v; }
         }
     }
 

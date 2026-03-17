@@ -20,6 +20,7 @@ pub enum AiTaskType {
     AdversarialTests,
     Contracts,
     BehavioralDelta,
+    Inquiry,
 }
 
 /// Per-task AI configuration (model, temperature, max_tokens).
@@ -43,5 +44,6 @@ pub fn default_temperature(task: AiTaskType) -> f32 {
         AiTaskType::AdversarialTests => 0.3,
         AiTaskType::Contracts => 0.2,
         AiTaskType::BehavioralDelta => 0.3,
+        AiTaskType::Inquiry => 0.3,
     }
 }

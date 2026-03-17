@@ -6,6 +6,7 @@ pub mod code_review;
 pub mod contracts;
 pub mod edge_cases;
 pub mod followup;
+pub mod inquiry;
 pub mod related_files;
 pub mod shared;
 pub mod summary;

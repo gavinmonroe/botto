@@ -123,6 +123,13 @@ pub async fn handle_stream(
             );
             handlers::stream_chat(state, stream_id, payload, tx, cancel_rx).await;
         }
+        "STREAM_INQUIRY" => {
+            info!(
+                "stream inquiry started: conn={} stream={}",
+                conn_id, stream_id
+            );
+            handlers::stream_inquiry(state, stream_id, payload, tx, cancel_rx).await;
+        }
         _ => {
             warn!("unknown stream type: {}", stream_type);
             send_chunk(serde_json::json!({

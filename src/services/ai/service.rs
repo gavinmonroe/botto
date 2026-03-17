@@ -49,6 +49,7 @@ impl TaskConfig {
             AdversarialTests => &cfg.ai.models.adversarial_tests,
             Contracts => &cfg.ai.models.contracts,
             BehavioralDelta => &cfg.ai.models.behavioral_delta,
+            Inquiry => &cfg.ai.models.inquiry,
         };
         Self {
             model: model.clone(),
@@ -221,6 +222,45 @@ pub async fn generate_chat_response(
 ) -> Result<String, AiError> {
     let client_cfg = ai_config(cfg);
     let task_cfg = TaskConfig::from_botto_config(cfg, crate::types::settings::AiTaskType::Chat);
+
+    let request = ChatCompletionRequest {
+        model: task_cfg.model,
+        messages,
+        temperature: Some(task_cfg.temperature),
+        max_tokens: None,
+        stream: None,
+        tools: None,
+        tool_choice: None,
+    };
+
+    let mut rx = chat_completion_stream(&client_cfg, request, cancel).await?;
+    let mut full_content = String::new();
+
+    while let Some(event) = rx.recv().await {
+        match event {
+            StreamEvent::Delta(text) => {
+                full_content.push_str(&text);
+                let _ = delta_tx.send(text).await;
+            }
+            StreamEvent::Done => break,
+            StreamEvent::Error(e) => return Err(AiError::Network(e)),
+            StreamEvent::ToolCallDelta(_) => {}
+        }
+    }
+
+    Ok(full_content)
+}
+
+/// Generate an inquiry response for a line-range question.
+/// Same streaming pattern as chat — returns plain markdown, not JSON.
+pub async fn generate_inquiry_response(
+    cfg: &crate::config::BottoConfig,
+    messages: Vec<ChatMessage>,
+    delta_tx: &mpsc::Sender<String>,
+    cancel: CancellationToken,
+) -> Result<String, AiError> {
+    let client_cfg = ai_config(cfg);
+    let task_cfg = TaskConfig::from_botto_config(cfg, crate::types::settings::AiTaskType::Inquiry);
 
     let request = ChatCompletionRequest {
         model: task_cfg.model,

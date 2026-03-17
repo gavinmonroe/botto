@@ -934,6 +934,142 @@ pub async fn stream_chat(
     let _ = tx.send(serde_json::to_string(&WsOutbound::StreamEnd { stream_id: stream_id.to_string() }).unwrap());
 }
 
+pub async fn stream_inquiry(
+    state: &AppState,
+    stream_id: &str,
+    payload: &Value,
+    tx: &broadcast::Sender<String>,
+    cancel_rx: watch::Receiver<bool>,
+) {
+    use crate::services::ai::client::ChatMessage;
+    use crate::services::ai::service;
+
+    let send_chunk = |chunk: Value| {
+        let msg = WsOutbound::StreamChunk {
+            stream_id: stream_id.to_string(),
+            chunk,
+        };
+        let _ = tx.send(serde_json::to_string(&msg).unwrap());
+    };
+
+    // Check AI is configured
+    if state.config().ai.base_url.is_empty() {
+        send_chunk(json!({
+            "type": "STREAM_INQUIRY_ERROR",
+            "payload": { "error": "AI provider not configured on this Botto server" },
+        }));
+        let _ = tx.send(serde_json::to_string(&WsOutbound::StreamEnd { stream_id: stream_id.to_string() }).unwrap());
+        return;
+    }
+
+    // Parse inquiry payload
+    let question = payload.get("question").and_then(|v| v.as_str()).unwrap_or("");
+
+    // Build context from the inquiryContext object
+    let context_text = crate::services::ai::prompts::inquiry::build_context_from_payload(payload);
+
+    // Build message history: system + context + previous slides + current question
+    let mut messages = vec![
+        crate::services::ai::prompts::inquiry::build_system(None),
+        ChatMessage {
+            role: "user".into(),
+            content: Some(context_text),
+            tool_calls: None,
+            tool_call_id: None,
+        },
+        ChatMessage {
+            role: "assistant".into(),
+            content: Some("I see the selected code. What would you like to know?".into()),
+            tool_calls: None,
+            tool_call_id: None,
+        },
+    ];
+
+    // Add previous slides as conversation history (for follow-ups)
+    if let Some(prev_slides) = payload
+        .get("inquiryContext")
+        .and_then(|c| c.get("previousSlides"))
+        .and_then(|v| v.as_array())
+    {
+        for slide in prev_slides {
+            let q = slide.get("question").and_then(|v| v.as_str()).unwrap_or("");
+            let a = slide.get("answer").and_then(|v| v.as_str()).unwrap_or("");
+            messages.push(ChatMessage {
+                role: "user".into(),
+                content: Some(q.to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+            });
+            if !a.is_empty() {
+                messages.push(ChatMessage {
+                    role: "assistant".into(),
+                    content: Some(a.to_string()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                });
+            }
+        }
+    }
+
+    // Add the current question
+    messages.push(ChatMessage {
+        role: "user".into(),
+        content: Some(question.to_string()),
+        tool_calls: None,
+        tool_call_id: None,
+    });
+
+    // Bridge cancellation
+    let cancel_token = tokio_util::sync::CancellationToken::new();
+    let cancel_token_clone = cancel_token.clone();
+    let mut cancel_rx = cancel_rx;
+    tokio::spawn(async move {
+        while cancel_rx.changed().await.is_ok() {
+            if *cancel_rx.borrow() {
+                cancel_token_clone.cancel();
+                break;
+            }
+        }
+    });
+
+    // Stream the response
+    let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel::<String>(64);
+    let tx_clone = tx.clone();
+    let stream_id_owned = stream_id.to_string();
+
+    // Forward deltas to WebSocket
+    let forwarder = tokio::spawn(async move {
+        while let Some(delta) = delta_rx.recv().await {
+            let msg = WsOutbound::StreamChunk {
+                stream_id: stream_id_owned.clone(),
+                chunk: json!({ "type": "STREAM_INQUIRY_DELTA", "payload": { "content": delta } }),
+            };
+            let _ = tx_clone.send(serde_json::to_string(&msg).unwrap());
+        }
+    });
+
+    match service::generate_inquiry_response(&state.config(), messages, &delta_tx, cancel_token).await {
+        Ok(full_response) => {
+            drop(delta_tx);
+            let _ = forwarder.await;
+            send_chunk(json!({
+                "type": "STREAM_INQUIRY_COMPLETE",
+                "payload": { "content": full_response },
+            }));
+        }
+        Err(e) => {
+            drop(delta_tx);
+            let _ = forwarder.await;
+            send_chunk(json!({
+                "type": "STREAM_INQUIRY_ERROR",
+                "payload": { "error": e.to_string() },
+            }));
+        }
+    }
+
+    let _ = tx.send(serde_json::to_string(&WsOutbound::StreamEnd { stream_id: stream_id.to_string() }).unwrap());
+}
+
 // ---------------------------------------------------------------------------
 // Team digest
 // ---------------------------------------------------------------------------
