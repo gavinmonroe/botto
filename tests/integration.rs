@@ -50,6 +50,8 @@ fn test_config(port: u16) -> BottoConfig {
             output_redaction: true,
             recipe_cache: true,
             recipe_cache_ttl_secs: 86400,
+            knowledge_cache: true,
+            knowledge_cache_ttl_secs: 604800,
         },
         cache: CacheConfig {
             review_ttl_days: 7,
@@ -896,4 +898,104 @@ async fn test_setup_recipe_different_projects_are_separate() {
 
     assert_eq!(parsed_a[0], "npm ci");
     assert_eq!(parsed_b[0], "yarn install");
+}
+
+// ---------------------------------------------------------------------------
+// Project knowledge — direct DB query tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_project_knowledge_upsert_and_get() {
+    let pool = db::init(std::path::Path::new(":memory:")).await.unwrap();
+
+    // Initially no knowledge exists
+    let result = db::queries::get_project_knowledge(&pool, "group/project", "node:20").await.unwrap();
+    assert!(result.is_none());
+
+    // Upsert facts
+    let facts = r#"{"package_manager":"npm","test_command":"npm test"}"#;
+    db::queries::upsert_project_knowledge(&pool, "group/project", "node:20", facts, None, None).await.unwrap();
+
+    // Get it back
+    let (facts_json, notes, created_at) =
+        db::queries::get_project_knowledge(&pool, "group/project", "node:20").await.unwrap().unwrap();
+    assert_eq!(facts_json, facts);
+    assert!(notes.is_none());
+    assert!(created_at > 0);
+}
+
+#[tokio::test]
+async fn test_project_knowledge_upsert_preserves_notes() {
+    let pool = db::init(std::path::Path::new(":memory:")).await.unwrap();
+
+    // Write facts + notes
+    let facts_v1 = r#"{"package_manager":"bundler"}"#;
+    db::queries::upsert_project_knowledge(
+        &pool, "group/project", "ruby:3.2", facts_v1,
+        Some("rugged needs libgit2"), Some("summary"),
+    ).await.unwrap();
+
+    // Re-upsert with new facts but no notes — notes should be preserved
+    let facts_v2 = r#"{"package_manager":"bundler","test_command":"bundle exec rspec"}"#;
+    db::queries::upsert_project_knowledge(
+        &pool, "group/project", "ruby:3.2", facts_v2, None, None,
+    ).await.unwrap();
+
+    let (facts_json, notes, _) =
+        db::queries::get_project_knowledge(&pool, "group/project", "ruby:3.2").await.unwrap().unwrap();
+    assert_eq!(facts_json, facts_v2);
+    assert_eq!(notes.as_deref(), Some("rugged needs libgit2")); // preserved!
+}
+
+#[tokio::test]
+async fn test_project_knowledge_update_notes() {
+    let pool = db::init(std::path::Path::new(":memory:")).await.unwrap();
+
+    // Write facts first (Option C)
+    let facts = r#"{"package_manager":"pip"}"#;
+    db::queries::upsert_project_knowledge(&pool, "group/project", "python:3.11", facts, None, None).await.unwrap();
+
+    // Then update notes (Option B, async)
+    db::queries::update_project_notes(
+        &pool, "group/project", "python:3.11",
+        "- Needs PYTHONPATH set to /workspace/src", "summary",
+    ).await.unwrap();
+
+    let (_, notes, _) =
+        db::queries::get_project_knowledge(&pool, "group/project", "python:3.11").await.unwrap().unwrap();
+    assert_eq!(notes.as_deref(), Some("- Needs PYTHONPATH set to /workspace/src"));
+}
+
+#[tokio::test]
+async fn test_project_knowledge_delete() {
+    let pool = db::init(std::path::Path::new(":memory:")).await.unwrap();
+
+    let facts = r#"{"package_manager":"cargo"}"#;
+    db::queries::upsert_project_knowledge(&pool, "group/project", "rust:1.75", facts, None, None).await.unwrap();
+
+    assert!(db::queries::get_project_knowledge(&pool, "group/project", "rust:1.75").await.unwrap().is_some());
+
+    db::queries::delete_project_knowledge(&pool, "group/project", "rust:1.75").await.unwrap();
+
+    assert!(db::queries::get_project_knowledge(&pool, "group/project", "rust:1.75").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn test_project_knowledge_survives_recipe_deletion() {
+    let pool = db::init(std::path::Path::new(":memory:")).await.unwrap();
+
+    // Store both a recipe and knowledge for the same project
+    let cmds = vec!["npm ci".to_string()];
+    db::queries::upsert_setup_recipe(&pool, "group/project", "node:20", &cmds, 3).await.unwrap();
+
+    let facts = r#"{"package_manager":"npm","native_deps":["python3"]}"#;
+    db::queries::upsert_project_knowledge(&pool, "group/project", "node:20", facts, None, None).await.unwrap();
+
+    // Delete the recipe (simulating replay failure)
+    db::queries::delete_setup_recipe(&pool, "group/project", "node:20").await.unwrap();
+
+    // Knowledge should still be there
+    let (facts_json, _, _) =
+        db::queries::get_project_knowledge(&pool, "group/project", "node:20").await.unwrap().unwrap();
+    assert_eq!(facts_json, facts);
 }

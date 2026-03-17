@@ -648,6 +648,104 @@ pub async fn delete_setup_recipe(
 }
 
 // ---------------------------------------------------------------------------
+// Project knowledge (structured facts + AI-distilled notes)
+// ---------------------------------------------------------------------------
+
+/// Save structured project facts after a successful setup.
+/// Preserves existing notes on conflict — re-extracting facts from a new
+/// recipe shouldn't wipe out AI-distilled notes from a previous run.
+pub async fn upsert_project_knowledge(
+    pool: &SqlitePool,
+    project_path: &str,
+    base_image: &str,
+    facts_json: &str,
+    notes: Option<&str>,
+    notes_model: Option<&str>,
+) -> Result<()> {
+    let now = epoch_secs();
+    sqlx::query(
+        "INSERT INTO project_knowledge (project_path, base_image, facts, notes, notes_model, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(project_path, base_image) DO UPDATE SET
+           facts = excluded.facts,
+           notes = COALESCE(excluded.notes, project_knowledge.notes),
+           notes_model = COALESCE(excluded.notes_model, project_knowledge.notes_model),
+           updated_at = excluded.updated_at",
+    )
+    .bind(project_path)
+    .bind(base_image)
+    .bind(facts_json)
+    .bind(notes)
+    .bind(notes_model)
+    .bind(now)
+    .bind(now)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Fetch project knowledge for prompt injection.
+/// Returns (facts_json, notes, created_at) if found.
+/// Does NOT check TTL — the caller decides freshness.
+pub async fn get_project_knowledge(
+    pool: &SqlitePool,
+    project_path: &str,
+    base_image: &str,
+) -> Result<Option<(String, Option<String>, i64)>> {
+    let row: Option<(String, Option<String>, i64)> = sqlx::query_as(
+        "SELECT facts, notes, created_at
+         FROM project_knowledge
+         WHERE project_path = ? AND base_image = ?",
+    )
+    .bind(project_path)
+    .bind(base_image)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row)
+}
+
+/// Update just the AI-distilled notes (Option B).
+/// Called asynchronously after the distillation AI call completes.
+/// The facts row must already exist (written by Option C first).
+pub async fn update_project_notes(
+    pool: &SqlitePool,
+    project_path: &str,
+    base_image: &str,
+    notes: &str,
+    notes_model: &str,
+) -> Result<()> {
+    let now = epoch_secs();
+    sqlx::query(
+        "UPDATE project_knowledge SET notes = ?, notes_model = ?, updated_at = ?
+         WHERE project_path = ? AND base_image = ?",
+    )
+    .bind(notes)
+    .bind(notes_model)
+    .bind(now)
+    .bind(project_path)
+    .bind(base_image)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Delete project knowledge (manual invalidation).
+pub async fn delete_project_knowledge(
+    pool: &SqlitePool,
+    project_path: &str,
+    base_image: &str,
+) -> Result<()> {
+    sqlx::query(
+        "DELETE FROM project_knowledge WHERE project_path = ? AND base_image = ?",
+    )
+    .bind(project_path)
+    .bind(base_image)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 

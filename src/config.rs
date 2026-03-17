@@ -119,6 +119,11 @@ pub struct SandboxConfig {
     pub recipe_cache: bool,
     /// How long (seconds) before a cached setup recipe is considered stale.
     pub recipe_cache_ttl_secs: u64,
+    /// Store structured facts and AI-distilled notes per project+image.
+    /// Survives recipe invalidation — knowledge helps even without a cached recipe.
+    pub knowledge_cache: bool,
+    /// How long (seconds) before cached project knowledge expires.
+    pub knowledge_cache_ttl_secs: u64,
 }
 
 /// Controls where sandbox fix commits are pushed.
@@ -230,6 +235,8 @@ struct TomlSandbox {
     output_redaction: Option<bool>,
     recipe_cache: Option<bool>,
     recipe_cache_ttl_secs: Option<u64>,
+    knowledge_cache: Option<bool>,
+    knowledge_cache_ttl_secs: Option<u64>,
 }
 
 #[derive(Deserialize, Default)]
@@ -396,6 +403,8 @@ pub async fn load(config_path: &Option<PathBuf>, data_dir: &Path) -> Result<Bott
             output_redaction: toml_sandbox.output_redaction.unwrap_or(true),
             recipe_cache: toml_sandbox.recipe_cache.unwrap_or(true),
             recipe_cache_ttl_secs: toml_sandbox.recipe_cache_ttl_secs.unwrap_or(86400),
+            knowledge_cache: toml_sandbox.knowledge_cache.unwrap_or(true),
+            knowledge_cache_ttl_secs: toml_sandbox.knowledge_cache_ttl_secs.unwrap_or(604800),
         },
         cache: CacheConfig {
             review_ttl_days: toml_cache.review_ttl_days.unwrap_or(7),
@@ -618,6 +627,8 @@ pub struct SandboxConfigUpdate {
     pub output_redaction: Option<bool>,
     pub recipe_cache: Option<bool>,
     pub recipe_cache_ttl_secs: Option<u64>,
+    pub knowledge_cache: Option<bool>,
+    pub knowledge_cache_ttl_secs: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -741,6 +752,8 @@ pub fn apply_update(current: &BottoConfig, update: ConfigUpdate) -> (BottoConfig
         if let Some(v) = s.output_redaction { cfg.sandbox.output_redaction = v; }
         if let Some(v) = s.recipe_cache { cfg.sandbox.recipe_cache = v; }
         if let Some(v) = s.recipe_cache_ttl_secs { cfg.sandbox.recipe_cache_ttl_secs = v; }
+        if let Some(v) = s.knowledge_cache { cfg.sandbox.knowledge_cache = v; }
+        if let Some(v) = s.knowledge_cache_ttl_secs { cfg.sandbox.knowledge_cache_ttl_secs = v; }
     }
 
     if let Some(c) = update.cache {
@@ -807,6 +820,8 @@ pub fn to_toml_string(cfg: &BottoConfig) -> Result<String> {
         output_redaction: bool,
         recipe_cache: bool,
         recipe_cache_ttl_secs: u64,
+        knowledge_cache: bool,
+        knowledge_cache_ttl_secs: u64,
     }
 
     #[derive(Serialize)]
@@ -851,6 +866,8 @@ pub fn to_toml_string(cfg: &BottoConfig) -> Result<String> {
             output_redaction: cfg.sandbox.output_redaction,
             recipe_cache: cfg.sandbox.recipe_cache,
             recipe_cache_ttl_secs: cfg.sandbox.recipe_cache_ttl_secs,
+            knowledge_cache: cfg.sandbox.knowledge_cache,
+            knowledge_cache_ttl_secs: cfg.sandbox.knowledge_cache_ttl_secs,
         },
         cache: &cfg.cache,
         harness: HarnessOut {
@@ -924,6 +941,8 @@ mod tests {
                 output_redaction: true,
                 recipe_cache: true,
                 recipe_cache_ttl_secs: 86400,
+                knowledge_cache: true,
+                knowledge_cache_ttl_secs: 604800,
             },
             cache: CacheConfig {
                 review_ttl_days: 7,
@@ -1152,6 +1171,8 @@ mod tests {
                 output_redaction: None,
                 recipe_cache: None,
                 recipe_cache_ttl_secs: None,
+                knowledge_cache: None,
+                knowledge_cache_ttl_secs: None,
             }),
             cache: None,
             harness: None,

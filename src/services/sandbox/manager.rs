@@ -713,6 +713,36 @@ impl SandboxManager {
             mr_ref: mr_ref.clone(),
         };
 
+        // Fetch cached project knowledge for prompt injection.
+        // This runs for both warm and cold paths — the fix prompt (step 4)
+        // benefits from knowledge regardless of how setup was handled.
+        let knowledge_block = if self.cfg.sandbox.knowledge_cache {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64;
+
+            match crate::db::queries::get_project_knowledge(&self.pool, &req.project_path, base_image).await {
+                Ok(Some((facts_json, notes, created_at))) => {
+                    let age = now - created_at;
+                    if age < self.cfg.sandbox.knowledge_cache_ttl_secs as i64 {
+                        let block = format_knowledge_block(&facts_json, notes.as_deref());
+                        if !block.is_empty() {
+                            debug!("sandbox fix: injecting project knowledge for {} (age {}s)", req.project_path, age);
+                        }
+                        block
+                    } else {
+                        debug!("sandbox fix: project knowledge for {} expired (age {}s > ttl {}s)",
+                            req.project_path, age, self.cfg.sandbox.knowledge_cache_ttl_secs);
+                        String::new()
+                    }
+                }
+                _ => String::new(),
+            }
+        } else {
+            String::new()
+        };
+
         // Steps 0-2 are the cold path: prereqs, clone, native deps, AI setup.
         // Warm containers already have all of this — skip straight to pre-validate.
         if !is_warm {
@@ -908,7 +938,8 @@ impl SandboxManager {
                         .replace("{project}", &req.project_path)
                         .replace("{file_path}", &req.file_path)
                         .replace("{test_cmd}", &test_cmd_preview)
-                        .replace("{repo_context}", &format_repo_context_block(repo_context)),
+                        .replace("{repo_context}", &format_repo_context_block(repo_context))
+                        .replace("{project_knowledge}", &knowledge_block),
                 ),
                 tool_calls: None,
                 tool_call_id: None,
@@ -1055,6 +1086,107 @@ impl SandboxManager {
                 let _ = crate::db::queries::upsert_setup_recipe(
                     &self.pool, &req.project_path, &base_image, &recipe_commands, setup_step,
                 ).await;
+            }
+
+            // Extract and store project knowledge (Option C: structured facts).
+            // Always runs on successful setup — the facts are derived from the
+            // recipe commands with zero AI cost.
+            if setup_done && !recipe_commands.is_empty() && self.cfg.sandbox.knowledge_cache {
+                let facts = extract_project_facts(&recipe_commands);
+                let facts_json = serde_json::to_string(&facts).unwrap_or_else(|_| "{}".into());
+
+                info!(
+                    "sandbox fix: storing project knowledge for {} (pkg={:?}, test={:?}, deps={})",
+                    req.project_path,
+                    facts.package_manager,
+                    facts.test_command.as_deref().map(|s| truncate_output(s, 60)),
+                    facts.native_deps.len(),
+                );
+
+                let _ = crate::db::queries::upsert_project_knowledge(
+                    &self.pool, &req.project_path, base_image, &facts_json, None, None,
+                ).await;
+
+                // Option B: AI-distilled notes for complex projects.
+                // Only fires on first-ever setup (no existing knowledge) with 8+ steps.
+                // Uses the cheap summary model, fire-and-forget via tokio::spawn.
+                if setup_step >= 8 {
+                    let existing = crate::db::queries::get_project_knowledge(
+                        &self.pool, &req.project_path, base_image,
+                    ).await;
+                    let has_notes = matches!(&existing, Ok(Some((_, Some(_), _))));
+
+                    if !has_notes {
+                        let transcript = format_setup_transcript(&setup_messages);
+                        if !transcript.is_empty() {
+                            let pool = self.pool.clone();
+                            let project_path = req.project_path.clone();
+                            let base_image_owned = base_image.to_string();
+                            let ai_cfg = self.ai_config();
+                            let model = self.cfg.ai.models.summary.clone();
+
+                            tokio::spawn(async move {
+                                let distill_request = crate::services::ai::client::ChatCompletionRequest {
+                                    model,
+                                    messages: vec![
+                                        crate::services::ai::client::ChatMessage {
+                                            role: "system".into(),
+                                            content: Some(
+                                                "You are a technical documentation assistant. Given a setup \
+                                                 conversation for a software project, extract the non-obvious \
+                                                 things a developer should know about building and testing \
+                                                 this project. Focus on gotchas, workarounds, and environment \
+                                                 quirks — not standard steps like 'run npm install'.".into(),
+                                            ),
+                                            tool_calls: None,
+                                            tool_call_id: None,
+                                        },
+                                        crate::services::ai::client::ChatMessage {
+                                            role: "user".into(),
+                                            content: Some(format!(
+                                                "Here is the setup conversation for project {}:\n\n{}\n\n\
+                                                 Summarize in 3-5 concise bullet points. Only include non-obvious insights.",
+                                                project_path, transcript,
+                                            )),
+                                            tool_calls: None,
+                                            tool_call_id: None,
+                                        },
+                                    ],
+                                    temperature: Some(0.3),
+                                    max_tokens: Some(300),
+                                    stream: None,
+                                    tools: None,
+                                    tool_choice: None,
+                                };
+
+                                match crate::services::ai::client::chat_completion(&ai_cfg, distill_request).await {
+                                    Ok(resp) => {
+                                        if let Some(notes) = resp.choices.first()
+                                            .and_then(|c| c.message.content.as_ref())
+                                        {
+                                            let notes = notes.trim();
+                                            if !notes.is_empty() {
+                                                let model_name = resp.choices.first()
+                                                    .map(|_| "summary")
+                                                    .unwrap_or("unknown");
+                                                let _ = crate::db::queries::update_project_notes(
+                                                    &pool, &project_path, &base_image_owned, notes, model_name,
+                                                ).await;
+                                                info!(
+                                                    "sandbox fix: stored AI-distilled notes for {} ({} chars)",
+                                                    project_path, notes.len(),
+                                                );
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        debug!("sandbox fix: knowledge distillation failed for {} (non-fatal): {}", project_path, e);
+                                    }
+                                }
+                            });
+                        }
+                    }
+                }
             }
         }
         } // end if !recipe_hit
@@ -1242,7 +1374,8 @@ else:
                         .replace("{original}", &req.original_code)
                         .replace("{suggestion}", &current_suggestion)
                         .replace("{test_cmd}", &test_cmd)
-                        .replace("{repo_context}", &format_repo_context_block(repo_context)),
+                        .replace("{repo_context}", &format_repo_context_block(repo_context))
+                        .replace("{project_knowledge}", &knowledge_block),
                 ),
                 tool_calls: None,
                 tool_call_id: None,
@@ -2226,6 +2359,294 @@ fn truncate_output(s: &str, max_bytes: usize) -> &str {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Project knowledge extraction (Option C)
+// ---------------------------------------------------------------------------
+
+/// Structured facts extracted from successful setup commands.
+/// All fields are optional — we extract what we can, skip what we can't.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct ProjectFacts {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub package_manager: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub test_command: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub working_directory: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
+    pub native_deps: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
+    pub env_vars: Vec<(String, String)>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_version: Option<String>,
+}
+
+/// Extract structured project facts from the recipe commands.
+/// Pure function — no I/O, no side effects. Parses command strings
+/// to identify package managers, test commands, native deps, etc.
+fn extract_project_facts(commands: &[String]) -> ProjectFacts {
+    let mut facts = ProjectFacts::default();
+
+    for cmd in commands {
+        let trimmed = cmd.trim();
+
+        // --- Package manager detection ---
+        // Check the full command string, not just the first word,
+        // because commands are often chained: "cd /workspace && npm ci"
+        if facts.package_manager.is_none() {
+            if trimmed.contains("npm ci") || trimmed.contains("npm install") {
+                facts.package_manager = Some("npm".into());
+            } else if trimmed.contains("yarn install") || trimmed.contains("yarn --frozen-lockfile") {
+                facts.package_manager = Some("yarn".into());
+            } else if trimmed.contains("pnpm install") || trimmed.contains("pnpm i") {
+                facts.package_manager = Some("pnpm".into());
+            } else if trimmed.contains("bundle install") {
+                facts.package_manager = Some("bundler".into());
+            } else if trimmed.contains("pip install") || trimmed.contains("pip3 install") {
+                facts.package_manager = Some("pip".into());
+            } else if trimmed.contains("poetry install") {
+                facts.package_manager = Some("poetry".into());
+            } else if trimmed.contains("cargo build") || trimmed.contains("cargo check") {
+                facts.package_manager = Some("cargo".into());
+            } else if trimmed.contains("go mod download") || trimmed.contains("go mod tidy") {
+                facts.package_manager = Some("go".into());
+            } else if trimmed.contains("composer install") {
+                facts.package_manager = Some("composer".into());
+            } else if trimmed.contains("dotnet restore") {
+                facts.package_manager = Some("dotnet".into());
+            } else if trimmed.contains("mvn ") || trimmed.contains("./mvnw ") {
+                facts.package_manager = Some("maven".into());
+            } else if trimmed.contains("gradle ") || trimmed.contains("./gradlew ") {
+                facts.package_manager = Some("gradle".into());
+            }
+        }
+
+        // --- Working directory detection ---
+        // Look for "cd /workspace/subdir &&" patterns (monorepo subdirectories).
+        // Only capture subdirectories, not bare "cd /workspace".
+        if facts.working_directory.is_none() {
+            if let Some(rest) = trimmed.strip_prefix("cd ") {
+                let dir = rest.split(&['&', ';', ' '][..]).next().unwrap_or("").trim();
+                if dir.starts_with("/workspace/") && dir.len() > "/workspace/".len() {
+                    facts.working_directory = Some(dir.to_string());
+                }
+            }
+        }
+
+        // --- Native deps detection ---
+        // Parse apt-get install, apk add, yum/dnf install commands.
+        extract_native_deps(trimmed, &mut facts.native_deps);
+
+        // --- Environment variables ---
+        // Parse "export KEY=VALUE" patterns.
+        extract_env_vars(trimmed, &mut facts.env_vars);
+
+        // --- Runtime version detection ---
+        if facts.runtime_version.is_none() {
+            facts.runtime_version = extract_runtime_version(trimmed);
+        }
+
+        // --- Test command detection ---
+        // Keep overwriting — the last test-like command in the recipe is
+        // most likely the real test command (earlier ones might be smoke tests).
+        if let Some(test_cmd) = extract_test_command(trimmed) {
+            facts.test_command = Some(test_cmd);
+        }
+    }
+
+    facts
+}
+
+/// Parse native dependency packages from install commands.
+fn extract_native_deps(cmd: &str, deps: &mut Vec<String>) {
+    // Match patterns like:
+    //   apt-get install -y cmake libgit2-dev
+    //   apk add --no-cache git python3
+    //   yum install -y gcc
+    //   dnf install -y make
+    let install_patterns = [
+        "apt-get install",
+        "apt install",
+        "apk add",
+        "yum install",
+        "dnf install",
+    ];
+
+    for pattern in &install_patterns {
+        if let Some(pos) = cmd.find(pattern) {
+            let after = &cmd[pos + pattern.len()..];
+            // Split on && or ; to avoid capturing subsequent commands
+            let segment = after.split(&['&', ';'][..]).next().unwrap_or("");
+            for token in segment.split_whitespace() {
+                // Skip flags (-y, --no-cache, --fix-broken, etc.)
+                if token.starts_with('-') {
+                    continue;
+                }
+                // Skip if it looks like a path or redirect
+                if token.contains('/') || token.contains('>') {
+                    continue;
+                }
+                let pkg = token.trim();
+                if !pkg.is_empty() && !deps.contains(&pkg.to_string()) {
+                    deps.push(pkg.to_string());
+                }
+            }
+        }
+    }
+}
+
+/// Parse "export KEY=VALUE" patterns from a command.
+fn extract_env_vars(cmd: &str, env_vars: &mut Vec<(String, String)>) {
+    // Handle both standalone "export FOO=bar" and chained "export FOO=bar && ..."
+    for segment in cmd.split(&['&', ';'][..]) {
+        let trimmed = segment.trim();
+        if let Some(rest) = trimmed.strip_prefix("export ") {
+            if let Some(eq_pos) = rest.find('=') {
+                let key = rest[..eq_pos].trim().to_string();
+                let value = rest[eq_pos + 1..].trim()
+                    .trim_matches('"')
+                    .trim_matches('\'')
+                    .to_string();
+                if !key.is_empty() && !env_vars.iter().any(|(k, _)| k == &key) {
+                    env_vars.push((key, value));
+                }
+            }
+        }
+    }
+}
+
+/// Detect runtime version install commands.
+fn extract_runtime_version(cmd: &str) -> Option<String> {
+    let patterns: &[(&str, &str)] = &[
+        ("nvm install ", "node"),
+        ("nvm use ", "node"),
+        ("rbenv install ", "ruby"),
+        ("rvm install ", "ruby"),
+        ("pyenv install ", "python"),
+        ("rustup default ", "rust"),
+        ("rustup toolchain install ", "rust"),
+        ("sdk install java ", "java"),
+    ];
+
+    for (pattern, runtime) in patterns {
+        if let Some(pos) = cmd.find(pattern) {
+            let after = &cmd[pos + pattern.len()..];
+            let version = after.split_whitespace().next().unwrap_or("").trim();
+            if !version.is_empty() {
+                return Some(format!("{} {}", runtime, version));
+            }
+        }
+    }
+    None
+}
+
+/// Detect test commands in a recipe command string.
+fn extract_test_command(cmd: &str) -> Option<String> {
+    let test_patterns = [
+        "npm test", "npm run test", "npx jest", "npx vitest", "npx mocha",
+        "yarn test", "pnpm test",
+        "bundle exec rspec", "bundle exec rake test", "rails test",
+        "pytest", "python -m pytest", "python3 -m pytest",
+        "cargo test",
+        "go test",
+        "make test",
+        "dotnet test",
+        "mvn test", "./mvnw test",
+        "gradle test", "./gradlew test",
+        "phpunit",
+    ];
+
+    for pattern in &test_patterns {
+        if cmd.contains(pattern) {
+            // Return the full command, not just the pattern — it may include
+            // flags, paths, or redirects that are important.
+            return Some(cmd.trim().to_string());
+        }
+    }
+    None
+}
+
+/// Format project knowledge (facts + notes) into a text block for prompt injection.
+/// Returns empty string if no knowledge exists, so the placeholder collapses cleanly.
+fn format_knowledge_block(facts_json: &str, notes: Option<&str>) -> String {
+    let facts: ProjectFacts = match serde_json::from_str(facts_json) {
+        Ok(f) => f,
+        Err(_) => return String::new(),
+    };
+
+    let mut lines = Vec::new();
+
+    // Only emit the section if we have at least one fact
+    let has_facts = facts.package_manager.is_some()
+        || facts.test_command.is_some()
+        || facts.working_directory.is_some()
+        || !facts.native_deps.is_empty()
+        || !facts.env_vars.is_empty()
+        || facts.runtime_version.is_some();
+
+    if has_facts {
+        lines.push("## Known project facts (from previous setup)".to_string());
+        if let Some(ref pm) = facts.package_manager {
+            lines.push(format!("- Package manager: {}", pm));
+        }
+        if let Some(ref tc) = facts.test_command {
+            lines.push(format!("- Test command: `{}`", tc));
+        }
+        if let Some(ref wd) = facts.working_directory {
+            lines.push(format!("- Working directory: {}", wd));
+        }
+        if let Some(ref rv) = facts.runtime_version {
+            lines.push(format!("- Runtime version: {}", rv));
+        }
+        if !facts.native_deps.is_empty() {
+            lines.push(format!("- Native deps: {}", facts.native_deps.join(", ")));
+        }
+        if !facts.env_vars.is_empty() {
+            let env_str: Vec<String> = facts.env_vars.iter()
+                .map(|(k, v)| format!("{}={}", k, v))
+                .collect();
+            lines.push(format!("- Required env: {}", env_str.join(", ")));
+        }
+    }
+
+    if let Some(notes_text) = notes {
+        let trimmed = notes_text.trim();
+        if !trimmed.is_empty() {
+            if !lines.is_empty() {
+                lines.push(String::new()); // blank line separator
+            }
+            lines.push("## Project notes (from previous AI analysis)".to_string());
+            lines.push(trimmed.to_string());
+        }
+    }
+
+    if lines.is_empty() {
+        String::new()
+    } else {
+        format!("\n{}\n", lines.join("\n"))
+    }
+}
+
+/// Condense setup conversation messages into a readable transcript for AI distillation.
+/// Includes only the command/output pairs, not the system prompt.
+fn format_setup_transcript(messages: &[crate::services::ai::client::ChatMessage]) -> String {
+    let mut transcript = String::new();
+    for msg in messages {
+        if msg.role == "system" {
+            continue; // Skip system prompt — it's boilerplate, not project-specific
+        }
+        let content = msg.content.as_deref().unwrap_or("");
+        if msg.role == "assistant" {
+            transcript.push_str(&format!("$ {}\n", content));
+        } else if msg.role == "user" && content.starts_with("Exit code:") {
+            transcript.push_str(&format!("{}\n\n", content));
+        }
+    }
+    transcript
+}
+
 /// Check if a command is purely exploratory (read-only) and not worth caching
 /// in a setup recipe. The AI often starts with `ls`, `cat`, `head`, `which`,
 /// `node --version` etc. to understand the project. These succeed but don't
@@ -2824,5 +3245,191 @@ mod tests {
         assert!(!is_exploratory_command("export NODE_ENV=test"));
         assert!(!is_exploratory_command("nvm install 20"));
         assert!(!is_exploratory_command("curl -fsSL https://example.com/setup.sh"));
+    }
+
+    // --- extract_project_facts tests ---
+
+    #[test]
+    fn facts_detects_npm_package_manager() {
+        let cmds = vec![
+            "cd /workspace && npm ci".into(),
+            "cd /workspace && npm test".into(),
+        ];
+        let facts = extract_project_facts(&cmds);
+        assert_eq!(facts.package_manager.as_deref(), Some("npm"));
+    }
+
+    #[test]
+    fn facts_detects_bundler_package_manager() {
+        let cmds = vec![
+            "apt-get install -y cmake libgit2-dev".into(),
+            "cd /workspace && bundle install".into(),
+            "cd /workspace && bundle exec rspec spec/".into(),
+        ];
+        let facts = extract_project_facts(&cmds);
+        assert_eq!(facts.package_manager.as_deref(), Some("bundler"));
+    }
+
+    #[test]
+    fn facts_detects_native_deps() {
+        let cmds = vec![
+            "apt-get update && apt-get install -y cmake libgit2-dev pkg-config".into(),
+            "cd /workspace && bundle install".into(),
+        ];
+        let facts = extract_project_facts(&cmds);
+        assert!(facts.native_deps.contains(&"cmake".to_string()));
+        assert!(facts.native_deps.contains(&"libgit2-dev".to_string()));
+        assert!(facts.native_deps.contains(&"pkg-config".to_string()));
+    }
+
+    #[test]
+    fn facts_detects_apk_native_deps() {
+        let cmds = vec![
+            "apk add --no-cache git python3 ca-certificates".into(),
+        ];
+        let facts = extract_project_facts(&cmds);
+        assert!(facts.native_deps.contains(&"git".to_string()));
+        assert!(facts.native_deps.contains(&"python3".to_string()));
+        assert!(facts.native_deps.contains(&"ca-certificates".to_string()));
+    }
+
+    #[test]
+    fn facts_detects_env_vars() {
+        let cmds = vec![
+            "export RAILS_ENV=test".into(),
+            "export DATABASE_URL=\"sqlite3::memory:\"".into(),
+            "cd /workspace && bundle install".into(),
+        ];
+        let facts = extract_project_facts(&cmds);
+        assert!(facts.env_vars.contains(&("RAILS_ENV".into(), "test".into())));
+        assert!(facts.env_vars.contains(&("DATABASE_URL".into(), "sqlite3::memory:".into())));
+    }
+
+    #[test]
+    fn facts_detects_working_directory() {
+        let cmds = vec![
+            "cd /workspace/packages/core && npm ci".into(),
+        ];
+        let facts = extract_project_facts(&cmds);
+        assert_eq!(facts.working_directory.as_deref(), Some("/workspace/packages/core"));
+    }
+
+    #[test]
+    fn facts_ignores_bare_workspace_dir() {
+        let cmds = vec![
+            "cd /workspace && npm ci".into(),
+        ];
+        let facts = extract_project_facts(&cmds);
+        assert!(facts.working_directory.is_none());
+    }
+
+    #[test]
+    fn facts_detects_runtime_version() {
+        let cmds = vec![
+            "nvm install 20".into(),
+            "cd /workspace && npm ci".into(),
+        ];
+        let facts = extract_project_facts(&cmds);
+        assert_eq!(facts.runtime_version.as_deref(), Some("node 20"));
+    }
+
+    #[test]
+    fn facts_detects_test_command() {
+        let cmds = vec![
+            "cd /workspace && npm ci".into(),
+            "cd /workspace && npm test".into(),
+        ];
+        let facts = extract_project_facts(&cmds);
+        assert_eq!(facts.test_command.as_deref(), Some("cd /workspace && npm test"));
+    }
+
+    #[test]
+    fn facts_last_test_command_wins() {
+        let cmds = vec![
+            "cd /workspace && npm ci".into(),
+            "cd /workspace && npx jest --passWithNoTests".into(),
+            "cd /workspace && npm test".into(),
+        ];
+        let facts = extract_project_facts(&cmds);
+        // Last test command should win
+        assert_eq!(facts.test_command.as_deref(), Some("cd /workspace && npm test"));
+    }
+
+    #[test]
+    fn facts_empty_commands_returns_defaults() {
+        let facts = extract_project_facts(&[]);
+        assert!(facts.package_manager.is_none());
+        assert!(facts.test_command.is_none());
+        assert!(facts.working_directory.is_none());
+        assert!(facts.native_deps.is_empty());
+        assert!(facts.env_vars.is_empty());
+        assert!(facts.runtime_version.is_none());
+    }
+
+    #[test]
+    fn facts_full_rails_setup() {
+        let cmds = vec![
+            "apt-get update && apt-get install -y cmake libgit2-dev pkg-config".into(),
+            "export RAILS_ENV=test".into(),
+            "cd /workspace && bundle install".into(),
+            "cd /workspace && bundle exec rails db:create db:migrate".into(),
+            "cd /workspace && bundle exec rspec spec/".into(),
+        ];
+        let facts = extract_project_facts(&cmds);
+        assert_eq!(facts.package_manager.as_deref(), Some("bundler"));
+        assert_eq!(facts.test_command.as_deref(), Some("cd /workspace && bundle exec rspec spec/"));
+        assert!(facts.native_deps.contains(&"cmake".to_string()));
+        assert!(facts.native_deps.contains(&"libgit2-dev".to_string()));
+        assert!(facts.env_vars.contains(&("RAILS_ENV".into(), "test".into())));
+    }
+
+    // --- format_knowledge_block tests ---
+
+    #[test]
+    fn knowledge_block_with_facts_only() {
+        let facts = ProjectFacts {
+            package_manager: Some("npm".into()),
+            test_command: Some("npm test".into()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&facts).unwrap();
+        let block = format_knowledge_block(&json, None);
+        assert!(block.contains("Package manager: npm"));
+        assert!(block.contains("Test command: `npm test`"));
+        assert!(!block.contains("Project notes"));
+    }
+
+    #[test]
+    fn knowledge_block_with_facts_and_notes() {
+        let facts = ProjectFacts {
+            package_manager: Some("bundler".into()),
+            native_deps: vec!["cmake".into(), "libgit2-dev".into()],
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&facts).unwrap();
+        let notes = "- The rugged gem needs libgit2 headers at compile time.";
+        let block = format_knowledge_block(&json, Some(notes));
+        assert!(block.contains("Package manager: bundler"));
+        assert!(block.contains("Native deps: cmake, libgit2-dev"));
+        assert!(block.contains("Project notes"));
+        assert!(block.contains("rugged gem"));
+    }
+
+    #[test]
+    fn knowledge_block_empty_facts_no_output() {
+        let facts = ProjectFacts::default();
+        let json = serde_json::to_string(&facts).unwrap();
+        let block = format_knowledge_block(&json, None);
+        assert!(block.is_empty());
+    }
+
+    #[test]
+    fn knowledge_block_notes_only_no_facts() {
+        let facts = ProjectFacts::default();
+        let json = serde_json::to_string(&facts).unwrap();
+        let block = format_knowledge_block(&json, Some("- Important gotcha about this project"));
+        assert!(!block.is_empty());
+        assert!(block.contains("Project notes"));
+        assert!(!block.contains("Known project facts"));
     }
 }

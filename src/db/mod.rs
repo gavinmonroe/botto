@@ -63,6 +63,11 @@ async fn migrate(pool: &SqlitePool) -> Result<()> {
         .await
         .context("migration 004 failed")?;
 
+    sqlx::query(MIGRATION_005)
+        .execute(pool)
+        .await
+        .context("migration 005 failed")?;
+
     info!("migrations complete");
     Ok(())
 }
@@ -225,6 +230,24 @@ CREATE TABLE IF NOT EXISTS setup_recipes (
     created_at   INTEGER NOT NULL,
     last_used_at INTEGER NOT NULL,
     use_count    INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (project_path, base_image)
+);
+"#;
+
+const MIGRATION_005: &str = r#"
+-- Per-project knowledge store: structured facts extracted from successful
+-- setups (Option C) and optional AI-distilled notes for complex projects
+-- (Option B). Separate from setup_recipes because knowledge should survive
+-- recipe invalidation — if a recipe replay fails, the knowledge ("rugged
+-- needs libgit2-dev") is still valid for the next AI setup.
+CREATE TABLE IF NOT EXISTS project_knowledge (
+    project_path    TEXT NOT NULL,
+    base_image      TEXT NOT NULL,
+    facts           TEXT NOT NULL,
+    notes           TEXT,
+    notes_model     TEXT,
+    created_at      INTEGER NOT NULL,
+    updated_at      INTEGER NOT NULL,
     PRIMARY KEY (project_path, base_image)
 );
 "#;
