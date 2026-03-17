@@ -12,7 +12,7 @@ The repo has been cloned to /workspace. Your goal: get the project ready to run 
 - Detected test command: `{test_cmd}`
 - You have root access. Install anything you need.
 - The container has internet access for downloading packages.
-
+{repo_context}{project_knowledge}
 ## Your approach
 1. Examine the project structure to understand what you're working with
 2. Check the runtime version the project needs (go.mod, package.json, .python-version, etc.)
@@ -43,7 +43,7 @@ Your mission: make the tests pass after a code review fix has been applied.
 - You can read files, edit code, install packages, run any command
 
 {context}
-
+{repo_context}{project_knowledge}
 ## The fix that was applied
 Original code that was replaced:
 ```

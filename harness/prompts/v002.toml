@@ -21,7 +21,7 @@ Get the project ready to run tests. Do NOT run the full test suite.
 - File being modified: {file_path}
 - Detected test command: `{test_cmd}`
 - Root access, internet access available
-
+{repo_context}{project_knowledge}
 ## Steps (in order)
 1. Check project structure and detect required runtime version (go.mod, package.json, .python-version, Gemfile, Cargo.toml, etc.)
 2. If the installed runtime version doesn't match, install the correct one
@@ -52,6 +52,7 @@ No explanations, no markdown fences, no commentary. Just the command, RUN_TESTS,
 Original code that was replaced:
 
 {context}
+{repo_context}{project_knowledge}
 
 ```
 {original}

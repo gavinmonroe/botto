@@ -716,7 +716,7 @@ impl SandboxManager {
         // Fetch cached project knowledge for prompt injection.
         // This runs for both warm and cold paths — the fix prompt (step 4)
         // benefits from knowledge regardless of how setup was handled.
-        let knowledge_block = if self.cfg.sandbox.knowledge_cache {
+        let knowledge_block = if self.cfg.sandbox.knowledge_cache && !self.harness_mode {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -820,7 +820,7 @@ impl SandboxManager {
         // On any failure, the recipe is deleted and we fall through to the
         // full AI setup.
         let mut recipe_hit = false;
-        if self.cfg.sandbox.recipe_cache {
+        if self.cfg.sandbox.recipe_cache && !self.harness_mode {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -1078,7 +1078,7 @@ impl SandboxManager {
             // Don't cache on timeout, UNFIXABLE, or empty response — those
             // indicate the setup didn't fully succeed and replaying partial
             // commands could leave the environment in a broken state.
-            if setup_done && !recipe_commands.is_empty() && self.cfg.sandbox.recipe_cache {
+            if setup_done && !recipe_commands.is_empty() && self.cfg.sandbox.recipe_cache && !self.harness_mode {
                 info!(
                     "sandbox fix: caching setup recipe for {} ({} commands from {} steps)",
                     req.project_path, recipe_commands.len(), setup_step,
@@ -1091,7 +1091,7 @@ impl SandboxManager {
             // Extract and store project knowledge (Option C: structured facts).
             // Always runs on successful setup — the facts are derived from the
             // recipe commands with zero AI cost.
-            if setup_done && !recipe_commands.is_empty() && self.cfg.sandbox.knowledge_cache {
+            if setup_done && !recipe_commands.is_empty() && self.cfg.sandbox.knowledge_cache && !self.harness_mode {
                 let facts = extract_project_facts(&recipe_commands);
                 let facts_json = serde_json::to_string(&facts).unwrap_or_else(|_| "{}".into());
 
