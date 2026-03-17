@@ -486,9 +486,20 @@ impl SandboxManager {
                 self.send_progress(&req.job_id, &req.comment_id, &mr_ref, "cloning", "warm container found, syncing branch...");
                 info!("sandbox fix: warm hit for {} (container {})", mr_key, &warm_id[..12]);
 
-                // Reset to clean state and pull latest commits
+                // Reset to clean state, switch to source_branch, and sync to remote HEAD.
+                //
+                // Why checkout + fetch + reset instead of just pull:
+                // 1. A previous fix in new_branch mode leaves the container on a
+                //    different branch (git checkout -b botto-fix-...). Without an
+                //    explicit checkout, `git pull` merges into the wrong branch and
+                //    the pre-validate file check fails ("file not found in cloned repo").
+                // 2. The source branch may have been force-pushed (rebased) since the
+                //    last fix. `git pull` on a shallow clone can hit merge conflicts,
+                //    but `git fetch + reset --hard` always lands on the remote tip.
                 let reset_cmd = format!(
-                    "cd /workspace && git reset --hard && git clean -fd && git pull origin {}",
+                    "cd /workspace && git reset --hard && git clean -fd && git fetch origin {} && git checkout {} && git reset --hard origin/{}",
+                    shell_escape(&req.source_branch),
+                    shell_escape(&req.source_branch),
                     shell_escape(&req.source_branch),
                 );
                 let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
