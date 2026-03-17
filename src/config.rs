@@ -114,6 +114,11 @@ pub struct SandboxConfig {
     pub live_output: bool,
     /// Redact secrets (tokens, passwords) from live output before streaming.
     pub output_redaction: bool,
+    /// Cache the AI-discovered setup commands per project+image and replay them
+    /// on cold containers to skip the AI setup loop.
+    pub recipe_cache: bool,
+    /// How long (seconds) before a cached setup recipe is considered stale.
+    pub recipe_cache_ttl_secs: u64,
 }
 
 /// Controls where sandbox fix commits are pushed.
@@ -223,6 +228,8 @@ struct TomlSandbox {
     warm_max_lifetime_secs: Option<u64>,
     live_output: Option<bool>,
     output_redaction: Option<bool>,
+    recipe_cache: Option<bool>,
+    recipe_cache_ttl_secs: Option<u64>,
 }
 
 #[derive(Deserialize, Default)]
@@ -387,6 +394,8 @@ pub async fn load(config_path: &Option<PathBuf>, data_dir: &Path) -> Result<Bott
             warm_max_lifetime_secs: toml_sandbox.warm_max_lifetime_secs.unwrap_or(3600),
             live_output: toml_sandbox.live_output.unwrap_or(true),
             output_redaction: toml_sandbox.output_redaction.unwrap_or(true),
+            recipe_cache: toml_sandbox.recipe_cache.unwrap_or(true),
+            recipe_cache_ttl_secs: toml_sandbox.recipe_cache_ttl_secs.unwrap_or(86400),
         },
         cache: CacheConfig {
             review_ttl_days: toml_cache.review_ttl_days.unwrap_or(7),
@@ -607,6 +616,8 @@ pub struct SandboxConfigUpdate {
     pub warm_max_lifetime_secs: Option<u64>,
     pub live_output: Option<bool>,
     pub output_redaction: Option<bool>,
+    pub recipe_cache: Option<bool>,
+    pub recipe_cache_ttl_secs: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -728,6 +739,8 @@ pub fn apply_update(current: &BottoConfig, update: ConfigUpdate) -> (BottoConfig
         if let Some(v) = s.warm_max_lifetime_secs { cfg.sandbox.warm_max_lifetime_secs = v; }
         if let Some(v) = s.live_output { cfg.sandbox.live_output = v; }
         if let Some(v) = s.output_redaction { cfg.sandbox.output_redaction = v; }
+        if let Some(v) = s.recipe_cache { cfg.sandbox.recipe_cache = v; }
+        if let Some(v) = s.recipe_cache_ttl_secs { cfg.sandbox.recipe_cache_ttl_secs = v; }
     }
 
     if let Some(c) = update.cache {
@@ -792,6 +805,8 @@ pub fn to_toml_string(cfg: &BottoConfig) -> Result<String> {
         warm_max_lifetime_secs: u64,
         live_output: bool,
         output_redaction: bool,
+        recipe_cache: bool,
+        recipe_cache_ttl_secs: u64,
     }
 
     #[derive(Serialize)]
@@ -834,6 +849,8 @@ pub fn to_toml_string(cfg: &BottoConfig) -> Result<String> {
             warm_max_lifetime_secs: cfg.sandbox.warm_max_lifetime_secs,
             live_output: cfg.sandbox.live_output,
             output_redaction: cfg.sandbox.output_redaction,
+            recipe_cache: cfg.sandbox.recipe_cache,
+            recipe_cache_ttl_secs: cfg.sandbox.recipe_cache_ttl_secs,
         },
         cache: &cfg.cache,
         harness: HarnessOut {
@@ -905,6 +922,8 @@ mod tests {
                 warm_max_lifetime_secs: 3600,
                 live_output: true,
                 output_redaction: true,
+                recipe_cache: true,
+                recipe_cache_ttl_secs: 86400,
             },
             cache: CacheConfig {
                 review_ttl_days: 7,
@@ -994,7 +1013,7 @@ mod tests {
                     code_review: None, edge_cases: None, related_files: None,
                     follow_up: None, chat: None, ac_validation: None,
                     adversarial_tests: None, contracts: None, behavioral_delta: None,
-                    fix: None,
+                    fix: None, inquiry: None,
                 }),
             }),
             sandbox: None,
@@ -1131,6 +1150,8 @@ mod tests {
                 warm_max_lifetime_secs: None,
                 live_output: None,
                 output_redaction: None,
+                recipe_cache: None,
+                recipe_cache_ttl_secs: None,
             }),
             cache: None,
             harness: None,

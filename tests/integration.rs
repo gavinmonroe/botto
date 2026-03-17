@@ -48,6 +48,8 @@ fn test_config(port: u16) -> BottoConfig {
             warm_max_lifetime_secs: 3600,
             live_output: false,
             output_redaction: true,
+            recipe_cache: true,
+            recipe_cache_ttl_secs: 86400,
         },
         cache: CacheConfig {
             review_ttl_days: 7,
@@ -752,4 +754,146 @@ async fn test_flat_snake_case_still_works() {
 
     ws.close(None).await.ok();
     server_handle.abort();
+}
+
+// ---------------------------------------------------------------------------
+// Setup recipe cache — direct DB query tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_setup_recipe_upsert_and_get() {
+    let pool = db::init(std::path::Path::new(":memory:")).await.unwrap();
+
+    // Initially no recipe exists
+    let result = db::queries::get_setup_recipe(&pool, "group/project", "node:20-slim").await.unwrap();
+    assert!(result.is_none());
+
+    // Upsert a recipe
+    let commands = vec![
+        "cd /workspace && npm ci".to_string(),
+        "cd /workspace && npx tsc --noEmit".to_string(),
+    ];
+    db::queries::upsert_setup_recipe(&pool, "group/project", "node:20-slim", &commands, 5).await.unwrap();
+
+    // Get it back
+    let (commands_json, steps, created_at, use_count) =
+        db::queries::get_setup_recipe(&pool, "group/project", "node:20-slim").await.unwrap().unwrap();
+
+    let parsed: Vec<String> = serde_json::from_str(&commands_json).unwrap();
+    assert_eq!(parsed.len(), 2);
+    assert_eq!(parsed[0], "cd /workspace && npm ci");
+    assert_eq!(parsed[1], "cd /workspace && npx tsc --noEmit");
+    assert_eq!(steps, 5);
+    assert_eq!(use_count, 1);
+    assert!(created_at > 0);
+}
+
+#[tokio::test]
+async fn test_setup_recipe_touch_bumps_use_count() {
+    let pool = db::init(std::path::Path::new(":memory:")).await.unwrap();
+
+    let commands = vec!["npm ci".to_string()];
+    db::queries::upsert_setup_recipe(&pool, "group/project", "node:20-slim", &commands, 3).await.unwrap();
+
+    // Touch it twice
+    db::queries::touch_setup_recipe(&pool, "group/project", "node:20-slim").await.unwrap();
+    db::queries::touch_setup_recipe(&pool, "group/project", "node:20-slim").await.unwrap();
+
+    let (_, _, _, use_count) =
+        db::queries::get_setup_recipe(&pool, "group/project", "node:20-slim").await.unwrap().unwrap();
+    assert_eq!(use_count, 3); // 1 initial + 2 touches
+}
+
+#[tokio::test]
+async fn test_setup_recipe_delete() {
+    let pool = db::init(std::path::Path::new(":memory:")).await.unwrap();
+
+    let commands = vec!["bundle install".to_string()];
+    db::queries::upsert_setup_recipe(&pool, "group/project", "ruby:3.2", &commands, 2).await.unwrap();
+
+    // Verify it exists
+    assert!(db::queries::get_setup_recipe(&pool, "group/project", "ruby:3.2").await.unwrap().is_some());
+
+    // Delete it
+    db::queries::delete_setup_recipe(&pool, "group/project", "ruby:3.2").await.unwrap();
+
+    // Gone
+    assert!(db::queries::get_setup_recipe(&pool, "group/project", "ruby:3.2").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn test_setup_recipe_upsert_replaces_existing() {
+    let pool = db::init(std::path::Path::new(":memory:")).await.unwrap();
+
+    // First recipe
+    let commands_v1 = vec!["npm install".to_string()];
+    db::queries::upsert_setup_recipe(&pool, "group/project", "node:18", &commands_v1, 3).await.unwrap();
+
+    // Touch it so use_count = 2
+    db::queries::touch_setup_recipe(&pool, "group/project", "node:18").await.unwrap();
+
+    // Upsert with new commands — should replace and reset use_count
+    let commands_v2 = vec!["npm ci".to_string(), "npm run build".to_string()];
+    db::queries::upsert_setup_recipe(&pool, "group/project", "node:18", &commands_v2, 4).await.unwrap();
+
+    let (commands_json, steps, _, use_count) =
+        db::queries::get_setup_recipe(&pool, "group/project", "node:18").await.unwrap().unwrap();
+
+    let parsed: Vec<String> = serde_json::from_str(&commands_json).unwrap();
+    assert_eq!(parsed.len(), 2);
+    assert_eq!(parsed[0], "npm ci");
+    assert_eq!(steps, 4);
+    assert_eq!(use_count, 1); // Reset on upsert
+}
+
+#[tokio::test]
+async fn test_setup_recipe_different_images_are_separate() {
+    let pool = db::init(std::path::Path::new(":memory:")).await.unwrap();
+
+    let node_cmds = vec!["npm ci".to_string()];
+    let ruby_cmds = vec!["bundle install".to_string()];
+
+    db::queries::upsert_setup_recipe(&pool, "group/project", "node:20", &node_cmds, 2).await.unwrap();
+    db::queries::upsert_setup_recipe(&pool, "group/project", "ruby:3.2", &ruby_cmds, 3).await.unwrap();
+
+    // Each image has its own recipe
+    let (node_json, node_steps, _, _) =
+        db::queries::get_setup_recipe(&pool, "group/project", "node:20").await.unwrap().unwrap();
+    let (ruby_json, ruby_steps, _, _) =
+        db::queries::get_setup_recipe(&pool, "group/project", "ruby:3.2").await.unwrap().unwrap();
+
+    let node_parsed: Vec<String> = serde_json::from_str(&node_json).unwrap();
+    let ruby_parsed: Vec<String> = serde_json::from_str(&ruby_json).unwrap();
+
+    assert_eq!(node_parsed[0], "npm ci");
+    assert_eq!(ruby_parsed[0], "bundle install");
+    assert_eq!(node_steps, 2);
+    assert_eq!(ruby_steps, 3);
+
+    // Deleting one doesn't affect the other
+    db::queries::delete_setup_recipe(&pool, "group/project", "node:20").await.unwrap();
+    assert!(db::queries::get_setup_recipe(&pool, "group/project", "node:20").await.unwrap().is_none());
+    assert!(db::queries::get_setup_recipe(&pool, "group/project", "ruby:3.2").await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn test_setup_recipe_different_projects_are_separate() {
+    let pool = db::init(std::path::Path::new(":memory:")).await.unwrap();
+
+    let cmds_a = vec!["npm ci".to_string()];
+    let cmds_b = vec!["yarn install".to_string()];
+
+    db::queries::upsert_setup_recipe(&pool, "team/frontend", "node:20", &cmds_a, 2).await.unwrap();
+    db::queries::upsert_setup_recipe(&pool, "team/backend", "node:20", &cmds_b, 3).await.unwrap();
+
+    let (json_a, _, _, _) =
+        db::queries::get_setup_recipe(&pool, "team/frontend", "node:20").await.unwrap().unwrap();
+    let (json_b, _, _, _) =
+        db::queries::get_setup_recipe(&pool, "team/backend", "node:20").await.unwrap().unwrap();
+
+    let parsed_a: Vec<String> = serde_json::from_str(&json_a).unwrap();
+    let parsed_b: Vec<String> = serde_json::from_str(&json_b).unwrap();
+
+    assert_eq!(parsed_a[0], "npm ci");
+    assert_eq!(parsed_b[0], "yarn install");
 }

@@ -599,7 +599,7 @@ impl SandboxManager {
         // Warm hits skip the setup phase (prereqs, clone, deps, AI setup).
         let repo_context_text = repo_cfg.as_ref().map(crate::services::repo_config::format_for_prompt);
         let result = self
-            .execute_fix_pipeline(&container_id, &req, &clone_url_authed, &strategy, &mr_ref, &detection.lang, is_warm, repo_context_text.as_deref())
+            .execute_fix_pipeline(&container_id, &req, &clone_url_authed, &strategy, &mr_ref, &detection.lang, is_warm, repo_context_text.as_deref(), &base_image)
             .await;
 
         // --- Post-fix: warm pool management ---
@@ -623,7 +623,7 @@ impl SandboxManager {
                     mr_key.clone(),
                     container_id.clone(),
                     req.source_branch.clone(),
-                    base_image,
+                    base_image.clone(),
                 );
                 info!("sandbox fix: stored warm container for {}", mr_key);
             } else {
@@ -693,6 +693,7 @@ impl SandboxManager {
         lang: &crate::services::sandbox::detector::ProjectLang,
         is_warm: bool,
         repo_context: Option<&str>,
+        base_image: &str,
     ) -> FixResult {
         // Harness runs get 25 minutes — real projects (Rust, Java) need time
         // for cargo check, mvn compile, etc. Production uses the configured timeout.
@@ -782,10 +783,107 @@ impl SandboxManager {
             }
         }
 
+        // Step 1.75: Try cached setup recipe.
+        // If a previous successful setup for this project+image was cached,
+        // replay those commands instead of running the AI setup loop. This
+        // saves 5-15 AI round-trips and 30-120 seconds per cold container.
+        // On any failure, the recipe is deleted and we fall through to the
+        // full AI setup.
+        let mut recipe_hit = false;
+        if self.cfg.sandbox.recipe_cache {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64;
+
+            if let Ok(Some((commands_json, _steps, created_at, use_count))) =
+                crate::db::queries::get_setup_recipe(&self.pool, &req.project_path, &base_image).await
+            {
+                let age_secs = now - created_at;
+                if age_secs < self.cfg.sandbox.recipe_cache_ttl_secs as i64 {
+                    if let Ok(commands) = serde_json::from_str::<Vec<String>>(&commands_json) {
+                        if !commands.is_empty() {
+                            info!(
+                                "sandbox fix: replaying cached recipe for {} ({} commands, used {} times, age {}s)",
+                                req.project_path, commands.len(), use_count, age_secs
+                            );
+                            self.send_progress(
+                                &req.job_id, &req.comment_id, mr_ref, "setting_up",
+                                "replaying cached setup recipe...",
+                            );
+                            self.update_job_status(&req.job_id, "setting_up").await;
+
+                            // Give replay a shorter deadline — if the cached recipe
+                            // takes longer than 5 minutes, something changed and we
+                            // should fall back to the AI.
+                            let replay_deadline = tokio::time::Instant::now()
+                                + std::time::Duration::from_secs(300);
+                            let mut replay_ok = true;
+
+                            for (i, cmd) in commands.iter().enumerate() {
+                                if tokio::time::Instant::now() >= replay_deadline {
+                                    warn!("sandbox fix: recipe replay timed out at step {}/{}", i + 1, commands.len());
+                                    replay_ok = false;
+                                    break;
+                                }
+
+                                let detail = format!(
+                                    "recipe step {}/{}: {}",
+                                    i + 1, commands.len(), truncate_output(cmd, 100),
+                                );
+                                self.send_progress(
+                                    &req.job_id, &req.comment_id, mr_ref, "setting_up", &detail,
+                                );
+
+                                match self.exec_in_container(container_id, cmd, replay_deadline).await {
+                                    Ok(output) if output.exit_code == 0 => {
+                                        debug!("recipe step {}/{} succeeded", i + 1, commands.len());
+                                    }
+                                    Ok(output) => {
+                                        warn!(
+                                            "sandbox fix: recipe step {}/{} failed (exit {}): {}",
+                                            i + 1, commands.len(), output.exit_code,
+                                            truncate_output(&output.stdout, 200),
+                                        );
+                                        replay_ok = false;
+                                        break;
+                                    }
+                                    Err(e) => {
+                                        warn!("sandbox fix: recipe step {}/{} exec error: {}", i + 1, commands.len(), e);
+                                        replay_ok = false;
+                                        break;
+                                    }
+                                }
+                            }
+
+                            if replay_ok {
+                                info!("sandbox fix: recipe replay succeeded for {}", req.project_path);
+                                recipe_hit = true;
+                                // Bump usage stats
+                                let _ = crate::db::queries::touch_setup_recipe(
+                                    &self.pool, &req.project_path, &base_image,
+                                ).await;
+                            } else {
+                                info!("sandbox fix: recipe replay failed, deleting stale recipe and falling through to AI setup");
+                                let _ = crate::db::queries::delete_setup_recipe(
+                                    &self.pool, &req.project_path, &base_image,
+                                ).await;
+                            }
+                        }
+                    }
+                } else {
+                    debug!("sandbox fix: recipe for {} expired (age {}s > ttl {}s), skipping",
+                        req.project_path, age_secs, self.cfg.sandbox.recipe_cache_ttl_secs);
+                }
+            }
+        }
+
         // Step 2: AI-driven project setup.
         // The AI reads the project, understands it, installs deps, and gets
         // the environment ready to run tests. No hardcoded commands — the AI
         // figures out what the project needs.
+        // Skipped entirely if a cached recipe was replayed successfully above.
+        if !recipe_hit {
         self.send_progress(&req.job_id, &req.comment_id, mr_ref, "setting_up", "AI analyzing project...");
         self.update_job_status(&req.job_id, "setting_up").await;
 
@@ -819,6 +917,11 @@ impl SandboxManager {
             ];
 
             let mut setup_step = 0u32;
+            let mut setup_done = false;
+            // Collect commands that succeeded — these form the recipe if setup completes.
+            // Only commands with exit_code == 0 are included; failed commands are the AI
+            // exploring dead ends and shouldn't be replayed.
+            let mut recipe_commands: Vec<String> = Vec::new();
 
             loop {
                 if tokio::time::Instant::now() >= deadline {
@@ -878,6 +981,7 @@ impl SandboxManager {
 
                 if cmd == "SETUP_DONE" {
                     info!("AI completed project setup after {} steps", setup_step);
+                    setup_done = true;
                     break;
                 }
 
@@ -900,6 +1004,13 @@ impl SandboxManager {
                     Err(e) => (-1, format!("exec error: {}", e)),
                 };
 
+                // Capture successful commands for the recipe cache.
+                // Only exit_code == 0 commands are worth replaying — failed ones
+                // are the AI probing or hitting errors it then recovers from.
+                if cmd_exit == 0 {
+                    recipe_commands.push(cmd.clone());
+                }
+
                 setup_messages.push(ChatMessage {
                     role: "user".into(),
                     content: Some(format!(
@@ -918,7 +1029,22 @@ impl SandboxManager {
                     setup_messages = std::iter::once(system).chain(recent).collect();
                 }
             }
+
+            // Cache the recipe if setup completed successfully (SETUP_DONE).
+            // Don't cache on timeout, UNFIXABLE, or empty response — those
+            // indicate the setup didn't fully succeed and replaying partial
+            // commands could leave the environment in a broken state.
+            if setup_done && !recipe_commands.is_empty() && self.cfg.sandbox.recipe_cache {
+                info!(
+                    "sandbox fix: caching setup recipe for {} ({} commands from {} steps)",
+                    req.project_path, recipe_commands.len(), setup_step,
+                );
+                let _ = crate::db::queries::upsert_setup_recipe(
+                    &self.pool, &req.project_path, &base_image, &recipe_commands, setup_step,
+                ).await;
+            }
         }
+        } // end if !recipe_hit
 
         } // end if !is_warm (cold path: steps 0-2)
 

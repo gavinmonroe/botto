@@ -556,6 +556,98 @@ pub async fn list_repo_configs(
 }
 
 // ---------------------------------------------------------------------------
+// Setup recipes (cached AI setup command sequences)
+// ---------------------------------------------------------------------------
+
+/// Save a setup recipe after a successful AI setup loop.
+/// Replaces any existing recipe for this project + image combination.
+pub async fn upsert_setup_recipe(
+    pool: &SqlitePool,
+    project_path: &str,
+    base_image: &str,
+    commands: &[String],
+    setup_steps: u32,
+) -> Result<()> {
+    let now = epoch_secs();
+    let commands_json = serde_json::to_string(commands)
+        .unwrap_or_else(|_| "[]".to_string());
+    sqlx::query(
+        "INSERT INTO setup_recipes (project_path, base_image, commands, setup_steps, created_at, last_used_at, use_count)
+         VALUES (?, ?, ?, ?, ?, ?, 1)
+         ON CONFLICT(project_path, base_image) DO UPDATE SET
+           commands = excluded.commands,
+           setup_steps = excluded.setup_steps,
+           created_at = excluded.created_at,
+           last_used_at = excluded.last_used_at,
+           use_count = 1",
+    )
+    .bind(project_path)
+    .bind(base_image)
+    .bind(&commands_json)
+    .bind(setup_steps as i64)
+    .bind(now)
+    .bind(now)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Fetch a cached setup recipe for a project + image.
+/// Returns (commands_json, setup_steps, created_at, use_count) if found.
+/// Does NOT check TTL — the caller decides whether the recipe is fresh enough.
+pub async fn get_setup_recipe(
+    pool: &SqlitePool,
+    project_path: &str,
+    base_image: &str,
+) -> Result<Option<(String, i64, i64, i64)>> {
+    let row: Option<(String, i64, i64, i64)> = sqlx::query_as(
+        "SELECT commands, setup_steps, created_at, use_count
+         FROM setup_recipes
+         WHERE project_path = ? AND base_image = ?",
+    )
+    .bind(project_path)
+    .bind(base_image)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row)
+}
+
+/// Bump last_used_at and use_count after a successful recipe replay.
+pub async fn touch_setup_recipe(
+    pool: &SqlitePool,
+    project_path: &str,
+    base_image: &str,
+) -> Result<()> {
+    let now = epoch_secs();
+    sqlx::query(
+        "UPDATE setup_recipes SET last_used_at = ?, use_count = use_count + 1
+         WHERE project_path = ? AND base_image = ?",
+    )
+    .bind(now)
+    .bind(project_path)
+    .bind(base_image)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Delete a stale recipe when replay fails.
+pub async fn delete_setup_recipe(
+    pool: &SqlitePool,
+    project_path: &str,
+    base_image: &str,
+) -> Result<()> {
+    sqlx::query(
+        "DELETE FROM setup_recipes WHERE project_path = ? AND base_image = ?",
+    )
+    .bind(project_path)
+    .bind(base_image)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 

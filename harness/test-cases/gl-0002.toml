@@ -1,0 +1,517 @@
+id = "gl-0002"
+project_path = "gitlab-org/auth/glgo"
+mr_iid = 187
+source_branch = "renovate/github.com-lestrrat-go-jwx-v2-3.x"
+target_branch = "main"
+file_path = "token/token.go"
+original_code = "\t// https://github.com/lestrrat-go/jwx/blob/develop/v2/docs/01-jwt.md#serialize-the-the-aud-field-as-a-single-string"
+expected_issue = "Outdated documentation link references v2"
+suggestion = "\t// https://github.com/lestrrat-go/jwx/blob/develop/v3/docs/01-jwt.md#serialize-the-the-aud-field-as-a-single-string"
+difficulty = "medium"
+mr_title = "fix(deps): update module github.com/lestrrat-go/jwx/v2 to v3"
+mr_description = '''
+This MR contains the following updates:
+
+| Package | Type | Update | Change |
+|---|---|---|---|
+| [github.com/lestrrat-go/jwx/v2](https://github.com/lestrrat-go/jwx) | require | major | `v2.1.3` -> `v3.0.13` |
+
+View the [Renovate pipeline for this MR](https://gitlab.com/gitlab-org/auth/glgo/-/jobs/13499089129)
+
+---
+
+### Release Notes
+
+<details>
+<summary>lestrrat-go/jwx (github.com/lestrrat-go/jwx/v2)</summary>
+
+### [`v3.0.13`](https://github.com/lestrrat-go/jwx/releases/tag/v3.0.13)
+
+[Compare Source](https://github.com/lestrrat-go/jwx/compare/v3.0.12...v3.0.13)
+
+#### What's Changed
+
+-   Pass value of WithContext to jws.Verify by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1483
+-   Bump golangci/golangci-lint-action from 8.0.0 to 9.0.0 by [@&#8203;dependabot](https://github.com/dependabot)\[bot] in https://github.com/lestrrat-go/jwx/pull/1490
+-   Bump actions/checkout from 5.0.0 to 5.0.1 by [@&#8203;dependabot](https://github.com/dependabot)\[bot] in https://github.com/lestrrat-go/jwx/pull/1494
+-   Bump actions/setup-go from 6.0.0 to 6.1.0 by [@&#8203;dependabot](https://github.com/dependabot)\[bot] in https://github.com/lestrrat-go/jwx/pull/1500
+-   Bump golang.org/x/crypto from 0.43.0 to 0.45.0 by [@&#8203;dependabot](https://github.com/dependabot)\[bot] in https://github.com/lestrrat-go/jwx/pull/1499
+-   Bump golang.org/x/crypto from 0.39.0 to 0.45.0 in /cmd/jwx by [@&#8203;dependabot](https://github.com/dependabot)\[bot] in https://github.com/lestrrat-go/jwx/pull/1495
+-   Bump actions/checkout from 5.0.1 to 6.0.0 by [@&#8203;dependabot](https://github.com/dependabot)\[bot] in https://github.com/lestrrat-go/jwx/pull/1504
+-   Bump golang.org/x/crypto from 0.43.0 to 0.45.0 in /tools/cmd/genoptions by [@&#8203;dependabot](https://github.com/dependabot)\[bot] in https://github.com/lestrrat-go/jwx/pull/1502
+-   Bump golangci/golangci-lint-action from 9.0.0 to 9.1.0 by [@&#8203;dependabot](https://github.com/dependabot)\[bot] in https://github.com/lestrrat-go/jwx/pull/1506
+-   Fix document for (jwk.Set).LookupKeyID by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1508
+-   Bump golang.org/x/crypto from 0.43.0 to 0.45.0 in /tools/cmd/genjwt by [@&#8203;dependabot](https://github.com/dependabot)\[bot] in https://github.com/lestrrat-go/jwx/pull/1509
+-   Bump actions/stale from 10.1.0 to 10.1.1 by [@&#8203;dependabot](https://github.com/dependabot)\[bot] in https://github.com/lestrrat-go/jwx/pull/1514
+-   Bump golangci/golangci-lint-action from 9.1.0 to 9.2.0 by [@&#8203;dependabot](https://github.com/dependabot)\[bot] in https://github.com/lestrrat-go/jwx/pull/1515
+-   Bump actions/checkout from 6.0.0 to 6.0.1 by [@&#8203;dependabot](https://github.com/dependabot)\[bot] in https://github.com/lestrrat-go/jwx/pull/1516
+-   Update httprc by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1518
+-   Bump actions/cache from 4.3.0 to 5.0.1 by [@&#8203;dependabot](https://github.com/dependabot)\[bot] in https://github.com/lestrrat-go/jwx/pull/1525
+-   Appease linter (v2.7.2) by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1526
+-   Bump golang.org/x/crypto from 0.45.0 to 0.46.0 by [@&#8203;dependabot](https://github.com/dependabot)\[bot] in https://github.com/lestrrat-go/jwx/pull/1520
+-   Add permissions by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1528
+-   Bump github.com/valyala/fastjson from 1.6.4 to 1.6.7 by [@&#8203;dependabot](https://github.com/dependabot)\[bot] in https://github.com/lestrrat-go/jwx/pull/1524
+-   Fix Clone() by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1530
+
+**Full Changelog**: https://github.com/lestrrat-go/jwx/compare/v3.0.12...v3.0.13
+
+### [`v3.0.12`](https://github.com/lestrrat-go/jwx/releases/tag/v3.0.12)
+
+[Compare Source](https://github.com/lestrrat-go/jwx/compare/v3.0.11...v3.0.12)
+
+#### What's Changed
+
+-   Change go.mod version requirements to go 1.24.0 and introduce toolchain directive by [@&#8203;henrymcconville](https://github.com/henrymcconville) in https://github.com/lestrrat-go/jwx/pull/1465
+-   Use go.mod for go version in Bazel module by [@&#8203;henrymcconville](https://github.com/henrymcconville) in https://github.com/lestrrat-go/jwx/pull/1466
+-   Enable legacy signers by default, and explicitly populate new signer instances by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1460
+-   autodoc updates by [@&#8203;github-actions](https://github.com/github-actions)\[bot] in https://github.com/lestrrat-go/jwx/pull/1475
+-   Fix `godoclint` issues by [@&#8203;babakks](https://github.com/babakks) in https://github.com/lestrrat-go/jwx/pull/1469
+-   Bump actions/cache from 4.2.4 to 4.3.0 by [@&#8203;dependabot](https://github.com/dependabot)\[bot] in https://github.com/lestrrat-go/jwx/pull/1463
+-   Bump actions/stale from 10.0.0 to 10.1.0 by [@&#8203;dependabot](https://github.com/dependabot)\[bot] in https://github.com/lestrrat-go/jwx/pull/1468
+-   Bump github.com/segmentio/asm from 1.2.0 to 1.2.1 by [@&#8203;dependabot](https://github.com/dependabot)\[bot] in https://github.com/lestrrat-go/jwx/pull/1462
+-   Bump github/codeql-action from 3 to 4 by [@&#8203;dependabot](https://github.com/dependabot)\[bot] in https://github.com/lestrrat-go/jwx/pull/1472
+-   Bump golang.org/x/crypto from 0.42.0 to 0.43.0 by [@&#8203;dependabot](https://github.com/dependabot)\[bot] in https://github.com/lestrrat-go/jwx/pull/1474
+-   revive godoclint by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1478
+-   \[jwe] Add option to explicitly clear per-recipient headers (`"header"`) for flattened JSON serialization by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1477
+-   autodoc updates by [@&#8203;github-actions](https://github.com/github-actions)\[bot] in https://github.com/lestrrat-go/jwx/pull/1480
+
+#### New Contributors
+
+-   [@&#8203;henrymcconville](https://github.com/henrymcconville) made their first contribution in https://github.com/lestrrat-go/jwx/pull/1465
+-   [@&#8203;babakks](https://github.com/babakks) made their first contribution in https://github.com/lestrrat-go/jwx/pull/1469
+
+**Full Changelog**: https://github.com/lestrrat-go/jwx/compare/v3.0.11...v3.0.12
+
+### [`v3.0.11`](https://github.com/lestrrat-go/jwx/releases/tag/v3.0.11)
+
+[Compare Source](https://github.com/lestrrat-go/jwx/compare/v3.0.10...v3.0.11)
+
+#### What's Changed
+
+-   Bump actions/cache from 4.2.3 to 4.2.4 by [@&#8203;dependabot](https://github.com/dependabot)\[bot] in https://github.com/lestrrat-go/jwx/pull/1438
+-   Bump golang.org/x/crypto from 0.40.0 to 0.41.0 by [@&#8203;dependabot](https://github.com/dependabot)\[bot] in https://github.com/lestrrat-go/jwx/pull/1436
+-   \[jwe] Work with non X25519 ECDH encryption by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1442
+-   Bump actions/checkout from 4.2.2 to 5.0.0 by [@&#8203;dependabot](https://github.com/dependabot)\[bot] in https://github.com/lestrrat-go/jwx/pull/1440
+-   Separate out signature generation / verification into its own framework by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1439
+-   Bump github.com/lestrrat-go/httprc/v3 from 3.0.0 to 3.0.1 by [@&#8203;dependabot](https://github.com/dependabot)\[bot] in https://github.com/lestrrat-go/jwx/pull/1443
+-   Bump actions/stale from 9.1.0 to 10.0.0 by [@&#8203;dependabot](https://github.com/dependabot)\[bot] in https://github.com/lestrrat-go/jwx/pull/1451
+-   Bump github.com/stretchr/testify from 1.10.0 to 1.11.1 by [@&#8203;dependabot](https://github.com/dependabot)\[bot] in https://github.com/lestrrat-go/jwx/pull/1447
+-   Bump golang.org/x/crypto from 0.41.0 to 0.42.0 by [@&#8203;dependabot](https://github.com/dependabot)\[bot] in https://github.com/lestrrat-go/jwx/pull/1456
+-   Bump actions/setup-go from 5.5.0 to 6.0.0 by [@&#8203;dependabot](https://github.com/dependabot)\[bot] in https://github.com/lestrrat-go/jwx/pull/1449
+-   Warh40k fix/connection leak by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1458
+-   Allow shutting down jwk cache by [@&#8203;adam-bates](https://github.com/adam-bates) in https://github.com/lestrrat-go/jwx/pull/1457
+
+#### New Contributors
+
+-   [@&#8203;adam-bates](https://github.com/adam-bates) made their first contribution in https://github.com/lestrrat-go/jwx/pull/1457
+
+**Full Changelog**: https://github.com/lestrrat-go/jwx/compare/v3.0.10...v3.0.11
+
+### [`v3.0.10`](https://github.com/lestrrat-go/jwx/releases/tag/v3.0.10)
+
+[Compare Source](https://github.com/lestrrat-go/jwx/compare/v3.0.9...v3.0.10)
+
+#### What's Changed
+
+-   Fix header not found error by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1435
+
+**Full Changelog**: https://github.com/lestrrat-go/jwx/compare/v3.0.9...v3.0.10
+
+### [`v3.0.9`](https://github.com/lestrrat-go/jwx/releases/tag/v3.0.9)
+
+[Compare Source](https://github.com/lestrrat-go/jwx/compare/v3.0.8...v3.0.9)
+
+#### What's Changed
+
+-   \[jwk] Implement X509 related code in jwkbb by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1423
+-   Tweak error message by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1424
+-   \[jwt] implement distinguishable jwt.Get errors by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1426
+-   Update bazel to v8 by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1429
+-   Bump golang.org/x/crypto from 0.39.0 to 0.40.0 by [@&#8203;dependabot](https://github.com/dependabot)\[bot] in https://github.com/lestrrat-go/jwx/pull/1428
+-   Allow HeaderGetXXX() functions to differentiate not found / invalid headers by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1432
+
+**Full Changelog**: https://github.com/lestrrat-go/jwx/compare/v3.0.8...v3.0.9
+
+### [`v3.0.8`](https://github.com/lestrrat-go/jwx/releases/tag/v3.0.8)
+
+[Compare Source](https://github.com/lestrrat-go/jwx/compare/v3.0.7...v3.0.8)
+
+#### What's Changed
+
+-   change from interface{} to any by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1417
+-   autodoc updates by [@&#8203;github-actions](https://github.com/github-actions) in https://github.com/lestrrat-go/jwx/pull/1418
+-   Introduce jwe lower level API (jwebb), and refactor a bunch of things. by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1419
+-   \[jws/jwsbb] Add io.Reader for source of randomness by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1420
+-   Add package level doc for jwe by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1421
+-   Add jwsbb.HeaderParse by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1422
+
+**Full Changelog**: https://github.com/lestrrat-go/jwx/compare/v3.0.7...v3.0.8
+
+### [`v3.0.7`](https://github.com/lestrrat-go/jwx/releases/tag/v3.0.7)
+
+[Compare Source](https://github.com/lestrrat-go/jwx/compare/v3.0.6...v3.0.7)
+
+#### What's Changed
+
+-   Update examples by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1412
+-   autodoc updates by [@&#8203;github-actions](https://github.com/github-actions) in https://github.com/lestrrat-go/jwx/pull/1413
+-   Add error when signature could not be verified by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1414
+-   Add Header type for quick and dirty access to JWS headers by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1415
+-   Refactor jwsbb code by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1416
+
+**Full Changelog**: https://github.com/lestrrat-go/jwx/compare/v3.0.6...v3.0.7
+
+### [`v3.0.6`](https://github.com/lestrrat-go/jwx/releases/tag/v3.0.6)
+
+[Compare Source](https://github.com/lestrrat-go/jwx/compare/v3.0.5...v3.0.6)
+
+#### What's Changed
+
+-   Use shared constants for better legibility/greppability by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1398
+-   Rework pool objects by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1399
+-   Bump github.com/cloudflare/circl from 1.6.0 to 1.6.1 in /examples by [@&#8203;dependabot](https://github.com/dependabot) in https://github.com/lestrrat-go/jwx/pull/1395
+-   Add AppendEncode to the interface by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1400
+-   Upgrade option and blackmagic by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1401
+-   Add comparison benchmark by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1407
+-   Implement low-level API for jws, and incorporate it to JWT to achieve massive performance gains by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1408
+-   autodoc updates by [@&#8203;github-actions](https://github.com/github-actions) in https://github.com/lestrrat-go/jwx/pull/1409
+-   Rename comparison by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1410
+
+**Full Changelog**: https://github.com/lestrrat-go/jwx/compare/v3.0.5...v3.0.6
+
+### [`v3.0.5`](https://github.com/lestrrat-go/jwx/releases/tag/v3.0.5)
+
+[Compare Source](https://github.com/lestrrat-go/jwx/compare/v3.0.4...v3.0.5)
+
+#### What's Changed
+
+-   Revert "Improve performance ([#&#8203;1391](https://github.com/lestrrat-go/jwx/issues/1391))" by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1397
+-   v3.0.4 has also been retracted on go.mod
+
+**Full Changelog**: https://github.com/lestrrat-go/jwx/compare/v3.0.4...v3.0.5
+
+### [`v3.0.4`](https://github.com/lestrrat-go/jwx/compare/v3.0.3...v3.0.4)
+
+[Compare Source](https://github.com/lestrrat-go/jwx/compare/v3.0.3...v3.0.4)
+
+### [`v3.0.3`](https://github.com/lestrrat-go/jwx/releases/tag/v3.0.3)
+
+[Compare Source](https://github.com/lestrrat-go/jwx/compare/v3.0.2...v3.0.3)
+
+#### What's Changed
+
+-   Add more context to the errors by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1387
+-   Update httprc version by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1388
+
+**Full Changelog**: https://github.com/lestrrat-go/jwx/compare/v3.0.2...v3.0.3
+
+### [`v3.0.2`](https://github.com/lestrrat-go/jwx/releases/tag/v3.0.2)
+
+[Compare Source](https://github.com/lestrrat-go/jwx/compare/v3.0.1...v3.0.2)
+
+#### What's Changed
+
+-   Bump golangci/golangci-lint-action from 7.0.0 to 8.0.0 by [@&#8203;dependabot](https://github.com/dependabot) in https://github.com/lestrrat-go/jwx/pull/1369
+-   Bump golang.org/x/crypto from 0.37.0 to 0.38.0 by [@&#8203;dependabot](https://github.com/dependabot) in https://github.com/lestrrat-go/jwx/pull/1372
+-   Bump actions/setup-go from 5.4.0 to 5.5.0 by [@&#8203;dependabot](https://github.com/dependabot) in https://github.com/lestrrat-go/jwx/pull/1373
+-   Add .deprecated field to algorithms in anticipation of future deprecations by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1374
+-   Add .deprecated field to algorithms in anticipation of future deprecations by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1376
+-   Add doc tweaks to [#&#8203;1380](https://github.com/lestrrat-go/jwx/issues/1380) by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1383
+-   autodoc updates by [@&#8203;github-actions](https://github.com/github-actions) in https://github.com/lestrrat-go/jwx/pull/1384
+-   Use jwk interfaces for each key type rather than concrete types by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1381
+-   Implement Filter objects for container types by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1377
+-   autodoc updates by [@&#8203;github-actions](https://github.com/github-actions) in https://github.com/lestrrat-go/jwx/pull/1386
+-   Implement generic AsMap by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1385
+
+**Full Changelog**: https://github.com/lestrrat-go/jwx/compare/v3.0.1...v3.0.2
+
+### [`v3.0.1`](https://github.com/lestrrat-go/jwx/releases/tag/v3.0.1)
+
+[Compare Source](https://github.com/lestrrat-go/jwx/compare/v3.0.0...v3.0.1)
+
+#### What's Changed
+
+Please read the Changes file and upgrade accordingly, especially if you are using the following combinations for JWE:
+
+-   DIRECT mode content encryption
+-   Using A256CBC_HS512
+-   With an erroneously created CEK of exactly 32-bytes.
+
+***
+
+-   Bump actions/cache from 4.2.1 to 4.2.3 by [@&#8203;dependabot](https://github.com/dependabot) in https://github.com/lestrrat-go/jwx/pull/1336
+-   Bump actions/checkout from 4.1.7 to 4.2.2 by [@&#8203;dependabot](https://github.com/dependabot) in https://github.com/lestrrat-go/jwx/pull/1337
+-   Bump actions/setup-go from 5.0.2 to 5.4.0 by [@&#8203;dependabot](https://github.com/dependabot) in https://github.com/lestrrat-go/jwx/pull/1338
+-   Update 02-jws.md by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1341
+-   Bump golang.org/x/crypto from 0.36.0 to 0.37.0 by [@&#8203;dependabot](https://github.com/dependabot) in https://github.com/lestrrat-go/jwx/pull/1342
+-   Add the claim name to error messages produced by ClaimValueIs() by [@&#8203;jmalloc](https://github.com/jmalloc) in https://github.com/lestrrat-go/jwx/pull/1347
+-   Tweak comments generated by genwa under jwa directory by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1348
+-   autodoc updates by [@&#8203;github-actions](https://github.com/github-actions) in https://github.com/lestrrat-go/jwx/pull/1349
+-   Disable funcorder by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1351
+-   Update .golangci.yml by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1353
+-   Update github.com/lestrrat-go/blackmagic by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1352
+-   disable dependabot for develop/v1 branch by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1358
+-   jws: improve performance for SplitCompact/SplitCompactString by [@&#8203;drakkan](https://github.com/drakkan) in https://github.com/lestrrat-go/jwx/pull/1360
+-   jwe: use strings.Cut in parseCompact by [@&#8203;drakkan](https://github.com/drakkan) in https://github.com/lestrrat-go/jwx/pull/1362
+-   Update httprc to v3.0.0-beta2 by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1364
+-   Create SECURITY.md by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1365
+-   \[v3] Explcitly check key sizes before passing to aes.NewCipher by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1367
+
+#### New Contributors
+
+-   [@&#8203;jmalloc](https://github.com/jmalloc) made their first contribution in https://github.com/lestrrat-go/jwx/pull/1347
+
+**Full Changelog**: https://github.com/lestrrat-go/jwx/compare/v3.0.0...v3.0.1
+
+### [`v3.0.0`](https://github.com/lestrrat-go/jwx/releases/tag/v3.0.0)
+
+[Compare Source](https://github.com/lestrrat-go/jwx/compare/v2.1.6...v3.0.0)
+
+#### What's Changed
+
+-   Add support for RSA-OAEP-384 and RSA-OAEP-512 by [@&#8203;Hannes-Kunnen](https://github.com/Hannes-Kunnen) in https://github.com/lestrrat-go/jwx/pull/1142
+-   fix: typos by [@&#8203;maro114510](https://github.com/maro114510) in https://github.com/lestrrat-go/jwx/pull/1145
+-   Update httprc to v1.0.6 by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1150
+-   Improve API for checking algorithm characteristics around symmetry by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1151
+-   Fix typos/mistakes/wording/links in documentation/comments by [@&#8203;Hannes-Kunnen](https://github.com/Hannes-Kunnen) in https://github.com/lestrrat-go/jwx/pull/1152
+-   Apply changes from [#&#8203;1156](https://github.com/lestrrat-go/jwx/issues/1156) to v2 by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1158
+-   Avoid problems on 32-bit systems by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1159
+-   Update minimum required go version to 1.20 by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1161
+-   Run CI with minimum go version 1.20 by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1162
+-   Bump golang.org/x/crypto from 0.24.0 to 0.25.0 by [@&#8203;dependabot](https://github.com/dependabot) in https://github.com/lestrrat-go/jwx/pull/1149
+-   Deprecate jws.WithHeaders by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1163
+-   Bump golang.org/x/crypto from 0.25.0 to 0.26.0 by [@&#8203;dependabot](https://github.com/dependabot) in https://github.com/lestrrat-go/jwx/pull/1168
+-   Fix document of how to parse PEM via CLI by [@&#8203;kg0r0](https://github.com/kg0r0) in https://github.com/lestrrat-go/jwx/pull/1174
+-   Wrap the errors from functions called within ParseRequest by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1176
+-   V3 modernize infra by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1180
+-   autodoc updates by [@&#8203;github-actions](https://github.com/github-actions) in https://github.com/lestrrat-go/jwx/pull/1181
+-   V3 dependabot by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1184
+-   Completely rework jwk.Cache using github.com/lestrrat-go/httprc/v3 by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1189
+-   autodoc updates by [@&#8203;github-actions](https://github.com/github-actions) in https://github.com/lestrrat-go/jwx/pull/1190
+-   Use import by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1191
+-   include an extra attribute in the trace log for debugging by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1192
+-   remove old references and unused files by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1193
+-   Bump golang.org/x/crypto from 0.26.0 to 0.27.0 by [@&#8203;dependabot](https://github.com/dependabot) in https://github.com/lestrrat-go/jwx/pull/1185
+-   cleanup docs, options around cache by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1194
+-   autodoc updates by [@&#8203;github-actions](https://github.com/github-actions) in https://github.com/lestrrat-go/jwx/pull/1195
+-   fix docs by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1196
+-   Bump golangci/golangci-lint-action from 6.1.0 to 6.1.1 by [@&#8203;dependabot](https://github.com/dependabot) in https://github.com/lestrrat-go/jwx/pull/1197
+-   Allow flexible key usage values by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1198
+-   Remove assert by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1200
+-   Convert jwa constants to function calls returning objects by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1203
+-   Mention RegisterKeyUsage by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1201
+-   autodoc updates by [@&#8203;github-actions](https://github.com/github-actions) in https://github.com/lestrrat-go/jwx/pull/1206
+-   Change accessors in jwk to return (T, bool) by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1207
+-   autodoc updates by [@&#8203;github-actions](https://github.com/github-actions) in https://github.com/lestrrat-go/jwx/pull/1211
+-   Bump golang.org/x/crypto from 0.27.0 to 0.28.0 by [@&#8203;dependabot](https://github.com/dependabot) in https://github.com/lestrrat-go/jwx/pull/1210
+-   Change JWT accessors from returning T to returning (T, bool) by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1212
+-   autodoc updates by [@&#8203;github-actions](https://github.com/github-actions) in https://github.com/lestrrat-go/jwx/pull/1213
+-   update comments to include iat ([#&#8203;1216](https://github.com/lestrrat-go/jwx/issues/1216)) by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1217
+-   Rename the old WithMaxBufferSize option as previously warned by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1218
+-   Streamline errors by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1220
+-   autodoc updates by [@&#8203;github-actions](https://github.com/github-actions) in https://github.com/lestrrat-go/jwx/pull/1221
+-   allow passing context.Contex to jwe.Decrypt by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1222
+-   Remove non-applicable comment by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1224
+-   fix document by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1226
+-   Remove jws.WithHeaders by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1227
+-   tweak badge URL by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1228
+-   Add quid pro quo in README by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1225
+-   Update serialize.go by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1234
+-   Lint fix by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1235
+-   Bump golang.org/x/crypto from 0.28.0 to 0.29.0 by [@&#8203;dependabot](https://github.com/dependabot) in https://github.com/lestrrat-go/jwx/pull/1231
+-   Change random big value to math.MaxInt by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1241
+-   Bump pozil/auto-assign-issue from 2.0.0 to 2.0.1 by [@&#8203;dependabot](https://github.com/dependabot) in https://github.com/lestrrat-go/jwx/pull/1238
+-   Bump github.com/stretchr/testify from 1.9.0 to 1.10.0 by [@&#8203;dependabot](https://github.com/dependabot) in https://github.com/lestrrat-go/jwx/pull/1245
+-   Bump golangci/golangci-lint-action from 6.1.1 to 6.2.0 by [@&#8203;dependabot](https://github.com/dependabot) in https://github.com/lestrrat-go/jwx/pull/1269
+-   Bump pozil/auto-assign-issue from 2.0.1 to 2.1.2 by [@&#8203;dependabot](https://github.com/dependabot) in https://github.com/lestrrat-go/jwx/pull/1261
+-   Bump golang.org/x/crypto from 0.29.0 to 0.32.0 by [@&#8203;dependabot](https://github.com/dependabot) in https://github.com/lestrrat-go/jwx/pull/1263
+-   Bump actions/stale from 9.0.0 to 9.1.0 by [@&#8203;dependabot](https://github.com/dependabot) in https://github.com/lestrrat-go/jwx/pull/1272
+-   \[v3] Fixes to work with go1.24 by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1299
+-   autodoc updates by [@&#8203;github-actions](https://github.com/github-actions) in https://github.com/lestrrat-go/jwx/pull/1300
+-   Bump pozil/auto-assign-issue from 2.1.2 to 2.2.0 by [@&#8203;dependabot](https://github.com/dependabot) in https://github.com/lestrrat-go/jwx/pull/1279
+-   Develop v3 actions cache by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1303
+-   Bump golangci/golangci-lint-action from 6.2.0 to 6.5.0 by [@&#8203;dependabot](https://github.com/dependabot) in https://github.com/lestrrat-go/jwx/pull/1290
+-   Bump github.com/decred/dcrd/dcrec/secp256k1/v4 from 4.3.0 to 4.4.0 by [@&#8203;dependabot](https://github.com/dependabot) in https://github.com/lestrrat-go/jwx/pull/1293
+-   Bump golang.org/x/crypto from 0.32.0 to 0.34.0 by [@&#8203;dependabot](https://github.com/dependabot) in https://github.com/lestrrat-go/jwx/pull/1297
+-   Bump golang.org/x/crypto from 0.34.0 to 0.35.0 by [@&#8203;dependabot](https://github.com/dependabot) in https://github.com/lestrrat-go/jwx/pull/1307
+-   jws/jwe: split token into fixed number of parts by [@&#8203;drakkan](https://github.com/drakkan) in https://github.com/lestrrat-go/jwx/pull/1308
+-   \[jwk] Change ecdh importer/exporter by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1315
+-   Bump golang.org/x/crypto from 0.35.0 to 0.36.0 by [@&#8203;dependabot](https://github.com/dependabot) in https://github.com/lestrrat-go/jwx/pull/1312
+-   Bump golangci/golangci-lint-action from 6.5.0 to 6.5.1 by [@&#8203;dependabot](https://github.com/dependabot) in https://github.com/lestrrat-go/jwx/pull/1316
+-   Change default behavior around truncation of time fields by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1318
+-   Bump golangci/golangci-lint-action from 6.5.1 to 6.5.2 by [@&#8203;dependabot](https://github.com/dependabot) in https://github.com/lestrrat-go/jwx/pull/1320
+-   Tweaks on [#&#8203;1322](https://github.com/lestrrat-go/jwx/issues/1322) by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1323
+-   Bump golangci/golangci-lint-action from 6.5.2 to 7.0.0 by [@&#8203;dependabot](https://github.com/dependabot) in https://github.com/lestrrat-go/jwx/pull/1325
+-   Implement AWS ALB User Claims parser by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1328
+-   Add docs for WithBase64Encoder by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1329
+-   autodoc updates by [@&#8203;github-actions](https://github.com/github-actions) in https://github.com/lestrrat-go/jwx/pull/1330
+-   avoid internal module by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1331
+-   Clear key.Precomputed values before testing equality by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1333
+-   autodoc updates by [@&#8203;github-actions](https://github.com/github-actions) in https://github.com/lestrrat-go/jwx/pull/1332
+-   autodoc updates by [@&#8203;github-actions](https://github.com/github-actions) in https://github.com/lestrrat-go/jwx/pull/1334
+
+#### New Contributors
+
+-   [@&#8203;Hannes-Kunnen](https://github.com/Hannes-Kunnen) made their first contribution in https://github.com/lestrrat-go/jwx/pull/1142
+-   [@&#8203;maro114510](https://github.com/maro114510) made their first contribution in https://github.com/lestrrat-go/jwx/pull/1145
+-   [@&#8203;kg0r0](https://github.com/kg0r0) made their first contribution in https://github.com/lestrrat-go/jwx/pull/1174
+-   [@&#8203;drakkan](https://github.com/drakkan) made their first contribution in https://github.com/lestrrat-go/jwx/pull/1308
+
+**Full Changelog**: https://github.com/lestrrat-go/jwx/compare/v2.1.0...v3.0.0
+
+### [`v2.1.6`](https://github.com/lestrrat-go/jwx/releases/tag/v2.1.6)
+
+[Compare Source](https://github.com/lestrrat-go/jwx/compare/v2.1.5...v2.1.6)
+
+#### What's Changed
+
+Please read the Changes file and upgrade accordingly, especially if you are using the following combinations for JWE:
+
+-   DIRECT mode content encryption
+-   Using A256CBC_HS512
+-   With an erroneously created CEK of exactly 32-bytes.
+
+***
+
+-   jws: backport jws parsing ehancements by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1363
+-   \[v2] Backport [#&#8203;1367](https://github.com/lestrrat-go/jwx/issues/1367) by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1368
+
+**Full Changelog**: https://github.com/lestrrat-go/jwx/compare/v2.1.5...v2.1.6
+
+### [`v2.1.5`](https://github.com/lestrrat-go/jwx/releases/tag/v2.1.5)
+
+[Compare Source](https://github.com/lestrrat-go/jwx/compare/v2.1.4...v2.1.5)
+
+#### What's Changed
+
+-   jws/jwe: split token into fixed number of parts ([#&#8203;1308](https://github.com/lestrrat-go/jwx/issues/1308)) by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1309
+-   Bump golangci/golangci-lint-action from 6.5.0 to 6.5.1 by [@&#8203;dependabot](https://github.com/dependabot) in https://github.com/lestrrat-go/jwx/pull/1317
+-   Bump golangci/golangci-lint-action from 6.5.1 to 6.5.2 by [@&#8203;dependabot](https://github.com/dependabot) in https://github.com/lestrrat-go/jwx/pull/1319
+-   Bump golangci/golangci-lint-action from 6.5.2 to 7.0.0 by [@&#8203;dependabot](https://github.com/dependabot) in https://github.com/lestrrat-go/jwx/pull/1327
+-   Remove use of go1.22 in CI by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1356
+-   v2: jws/jwe: split token into fixed number of parts ([#&#8203;1308](https://github.com/lestrrat-go/jwx/issues/1308)) by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1355
+-   Bump github.com/lestrrat-go/blackmagic from 1.0.2 to 1.0.3 by [@&#8203;dependabot](https://github.com/dependabot) in https://github.com/lestrrat-go/jwx/pull/1354
+-   autodoc updates by [@&#8203;github-actions](https://github.com/github-actions) in https://github.com/lestrrat-go/jwx/pull/1359
+
+**Full Changelog**: https://github.com/lestrrat-go/jwx/compare/v2.1.4...v2.1.5
+
+### [`v2.1.4`](https://github.com/lestrrat-go/jwx/releases/tag/v2.1.4)
+
+[Compare Source](https://github.com/lestrrat-go/jwx/compare/v2.1.3...v2.1.4)
+
+#### What's Changed
+
+-   Bump pozil/auto-assign-issue from 2.0.0 to 2.0.1 by [@&#8203;dependabot](https://github.com/dependabot) in https://github.com/lestrrat-go/jwx/pull/1237
+-   Bump github.com/stretchr/testify from 1.9.0 to 1.10.0 by [@&#8203;dependabot](https://github.com/dependabot) in https://github.com/lestrrat-go/jwx/pull/1243
+-   Bump golangci/golangci-lint-action from 6.1.1 to 6.2.0 by [@&#8203;dependabot](https://github.com/dependabot) in https://github.com/lestrrat-go/jwx/pull/1268
+-   Bump pozil/auto-assign-issue from 2.0.1 to 2.1.2 by [@&#8203;dependabot](https://github.com/dependabot) in https://github.com/lestrrat-go/jwx/pull/1260
+-   Bump golang.org/x/crypto from 0.29.0 to 0.32.0 by [@&#8203;dependabot](https://github.com/dependabot) in https://github.com/lestrrat-go/jwx/pull/1262
+-   Bump actions/stale from 9.0.0 to 9.1.0 by [@&#8203;dependabot](https://github.com/dependabot) in https://github.com/lestrrat-go/jwx/pull/1271
+-   \[v2] Fixes to work with go1.24 by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1298
+-   autodoc updates by [@&#8203;github-actions](https://github.com/github-actions) in https://github.com/lestrrat-go/jwx/pull/1301
+-   Bump pozil/auto-assign-issue from 2.1.2 to 2.2.0 by [@&#8203;dependabot](https://github.com/dependabot) in https://github.com/lestrrat-go/jwx/pull/1276
+-   Develop v2 actions cache by [@&#8203;lestrrat](https://github.com/lestrrat) in https://github.com/lestrrat-go/jwx/pull/1302
+-   Bump golangci/golangci-lint-action from 6.2.0 to 6.5.0 by [@&#8203;dependabot](https://github.com/dependabot) in https://github.com/lestrrat-go/jwx/pull/1289
+-   Bump github.com/decred/dcrd/dcrec/secp256k1/v4 from 4.3.0 to 4.4.0 by [@&#8203;dependabot](https://github.com/dependabot) in https://github.com/lestrrat-go/jwx/pull/1291
+
+**Full Changelog**: https://github.com/lestrrat-go/jwx/compare/v2.1.3...v2.1.4
+
+</details>
+
+---
+
+### Configuration
+
+📅 **Schedule**: Branch creation - "every weekend" (UTC), Automerge - At any time (no schedule defined).
+
+🚦 **Automerge**: Disabled by config. Please merge this manually once you are satisfied.
+
+♻ **Rebasing**: Whenever MR becomes conflicted, or you tick the rebase/retry checkbox.
+
+🔕 **Ignore**: Close this MR and you won't be reminded about this update again.
+
+---
+
+ - [ ] <!-- rebase-check -->If you want to rebase/retry this MR, check this box
+
+---
+
+This MR has been generated by [Renovate Bot](https://github.com/renovatebot/renovate).
+<!--renovate-debug:eyJjcmVhdGVkSW5WZXIiOiI0MC4xNS4wIiwidXBkYXRlZEluVmVyIjoiNDAuMTUuMCIsInRhcmdldEJyYW5jaCI6Im1haW4iLCJsYWJlbHMiOlsiZGVwZW5kZW5jaWVzIiwiZGVwZW5kZW5jeS10eXBlOjptYWpvciIsIm1haW50ZW5hbmNlOjpkZXBlbmRlbmN5IiwidHlwZTo6bWFpbnRlbmFuY2UiXX0=-->'''
+comment_body = "The comment links to v2 documentation, but the code now uses v3. Update the link to point to v3 docs or verify the behavior hasn't changed."
+file_content = """
+package token
+
+import (
+\t"fmt"
+\t"time"
+
+\t"github.com/lestrrat-go/jwx/v3/jwk"
+\t"github.com/lestrrat-go/jwx/v3/jwt"
+)
+
+// Token represents a JWT token. Its main purpose is to abstract the encoding logic performed in Encode.
+type Token struct {
+\tIssuer        string
+\tSubject       string
+\tAudience      []string
+\tIssuedAt      time.Time
+\tExpiration    time.Time
+\tNotBefore     time.Time
+\tPrivateClaims map[string]any
+}
+
+// Encode encodes the token into a JWT token.
+func (t Token) Encode() (jwt.Token, error) {
+\tbuilder := jwt.NewBuilder().
+\t\tIssuer(t.Issuer).
+\t\tSubject(t.Subject).
+\t\tAudience(t.Audience).
+\t\tIssuedAt(t.IssuedAt).
+\t\tExpiration(t.Expiration).
+\t\tNotBefore(t.NotBefore)
+
+\tfor k, v := range t.PrivateClaims {
+\t\tbuilder.Claim(k, v)
+\t}
+
+\tencoded, err := builder.Build()
+\tif err != nil {
+\t\treturn nil, err
+\t}
+\t// https://github.com/lestrrat-go/jwx/blob/develop/v2/docs/01-jwt.md#serialize-the-the-aud-field-as-a-single-string
+\tencoded.Options().Enable(jwt.FlattenAudience)
+
+\treturn encoded, nil
+}
+
+// EncodeAndSign encodes the token into a JWT token and signs it with the given key.
+func (t Token) EncodeAndSign(key jwk.Key) ([]byte, error) {
+\tencoded, err := t.Encode()
+\tif err != nil {
+\t\treturn nil, fmt.Errorf("failed to encode token: %w", err)
+\t}
+
+\tsigned, err := jwt.Sign(encoded, jwt.WithKey(key.Algorithm(), key))
+\tif err != nil {
+\t\treturn nil, fmt.Errorf("failed to sign token: %w", err)
+\t}
+
+\treturn signed, nil
+}
+"""
+file_diff = """
+@@ -4,8 +4,8 @@ import (
+ \t"fmt"
+ \t"time"
+ 
+-\t"github.com/lestrrat-go/jwx/v2/jwk"
+-\t"github.com/lestrrat-go/jwx/v2/jwt"
++\t"github.com/lestrrat-go/jwx/v3/jwk"
++\t"github.com/lestrrat-go/jwx/v3/jwt"
+ )
+ 
+ // Token represents a JWT token. Its main purpose is to abstract the encoding logic performed in Encode.
+"""
+created_at = "2026-03-15T20:59:45.607433Z"
+source_url = "https://gitlab.com/gitlab-org/auth/glgo/-/merge_requests/187"

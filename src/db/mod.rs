@@ -58,6 +58,11 @@ async fn migrate(pool: &SqlitePool) -> Result<()> {
         .await
         .context("migration 003 failed")?;
 
+    sqlx::query(MIGRATION_004)
+        .execute(pool)
+        .await
+        .context("migration 004 failed")?;
+
     info!("migrations complete");
     Ok(())
 }
@@ -204,5 +209,22 @@ CREATE TABLE IF NOT EXISTS repo_configs (
     sandbox_image TEXT,
     fetched_at   INTEGER NOT NULL,
     expires_at   INTEGER NOT NULL
+);
+"#;
+
+const MIGRATION_004: &str = r#"
+-- Cached setup recipes: the sequence of shell commands the AI discovered
+-- during a successful sandbox setup. Keyed by project + base image because
+-- different images need different setup steps (e.g., alpine vs debian).
+-- Replayed on cold containers to skip the AI setup loop entirely.
+CREATE TABLE IF NOT EXISTS setup_recipes (
+    project_path TEXT NOT NULL,
+    base_image   TEXT NOT NULL,
+    commands     TEXT NOT NULL,
+    setup_steps  INTEGER NOT NULL DEFAULT 0,
+    created_at   INTEGER NOT NULL,
+    last_used_at INTEGER NOT NULL,
+    use_count    INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (project_path, base_image)
 );
 "#;
