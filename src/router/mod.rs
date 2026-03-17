@@ -62,6 +62,8 @@ pub async fn handle_request(state: &AppState, payload: &Value) -> Value {
         "CANCEL_REVIEW" => handlers::cancel_review(state, effective_payload).await,
         "GET_SANDBOX_JOB" => handlers::get_sandbox_job(state, effective_payload).await,
         "GET_TEAM_DIGEST" => handlers::get_team_digest(state, effective_payload).await,
+        "GET_REPO_CONFIG" => handlers::get_repo_config(state, effective_payload).await,
+        "INVALIDATE_REPO_CONFIG" => handlers::invalidate_repo_config(state, effective_payload).await,
         _ => {
             warn!("unknown request type: {}", msg_type);
             serde_json::json!({
@@ -362,6 +364,7 @@ pub async fn handle_fix_request(
         state.pool().clone(),
         state.event_bus().clone(),
         broadcaster,
+        state.warm_pool().cloned(),
     );
 
     match sandbox_mgr {

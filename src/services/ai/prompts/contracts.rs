@@ -7,7 +7,11 @@ use super::shared::OTTO_IDENTITY;
 use crate::services::ai::client::ChatMessage;
 use crate::types::review::MrContext;
 
-pub fn build(mr: &MrContext, custom_prompt: Option<&str>) -> Vec<ChatMessage> {
+pub fn build(
+    mr: &MrContext,
+    custom_prompt: Option<&str>,
+    repo_config: Option<&str>,
+) -> Vec<ChatMessage> {
     let system = if let Some(custom) = custom_prompt {
         format!("{}\n\n{}", OTTO_IDENTITY, custom)
     } else {
@@ -54,6 +58,12 @@ Rules:
             "### {}\n```diff\n{}\n```",
             file.file_path, file.diff
         ));
+    }
+
+    if let Some(rc) = repo_config {
+        if !rc.is_empty() {
+            user_parts.push(rc.to_string());
+        }
     }
 
     vec![

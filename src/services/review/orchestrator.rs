@@ -19,6 +19,7 @@
 use crate::config::BottoConfig;
 use crate::services::ai::service::{self, FileReviewContext};
 use crate::services::gitlab::client as gitlab;
+use crate::services::repo_config;
 use crate::services::review::cache;
 use crate::services::verification::trust;
 use crate::types::review::*;
@@ -159,10 +160,26 @@ pub async fn execute_review(
         token: cfg.gitlab.bot_token.clone(),
     };
 
-    // --- Phase 1: Parallel — summary + file content fetch ---
+    // --- Phase 1: Parallel — summary + file activity + repo config fetch ---
     let _ = send
         .send(json!({ "type": "STREAM_PROGRESS", "payload": { "message": "starting review..." } }))
         .await;
+
+    // Spawn repo config fetch (parallel with everything else in Phase 1)
+    let repo_config_handle = {
+        let pool = pool.clone();
+        let gl_cfg = gl_cfg.clone();
+        let project_path = mr.project_path.clone();
+        let project_id = mr.project_id;
+        let source_branch = mr.source_branch.clone();
+        tokio::spawn(async move {
+            if let Some(pid) = project_id {
+                repo_config::get_or_fetch(&pool, &gl_cfg, &project_path, pid, &source_branch).await
+            } else {
+                None
+            }
+        })
+    };
 
     // Collect results
     let mut collected_summary: Option<MrSummary> = None;
@@ -253,6 +270,17 @@ pub async fn execute_review(
         None
     };
 
+    // --- Collect repo config (awaited before summary so all AI tasks can use it) ---
+    let repo_config_result = match repo_config_handle.await {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            warn!("repo config task panicked: {}", e);
+            None
+        }
+    };
+    let repo_config_text = repo_config_result.as_ref().map(repo_config::format_for_prompt);
+    let repo_config_str = repo_config_text.as_deref();
+
     // --- Run summary task (on current task, streams deltas inline) ---
     if tasks.contains(&ReviewTask::Summary) && !cancel.is_cancelled() {
         let _ = send
@@ -278,7 +306,7 @@ pub async fn execute_review(
             None
         };
 
-        match service::generate_summary(cfg, mr, None, Some(&delta_tx), cancel.clone()).await {
+        match service::generate_summary(cfg, mr, None, Some(&delta_tx), cancel.clone(), repo_config_str).await {
             Ok(summary) => {
                 drop(_ai_permit);
                 drop(delta_tx);
@@ -356,9 +384,13 @@ pub async fn execute_review(
                     collected_file_activity.as_ref(),
                 );
 
+                // Clone repo config text for the spawned task ('static requirement)
+                let repo_config_owned = repo_config_text.clone();
+
                 let handle = tokio::spawn(async move {
                     let context = FileReviewContext {
                         file_activity: file_activity_ctx,
+                        repo_config: repo_config_owned,
                         ..FileReviewContext::default()
                     };
 
@@ -470,7 +502,7 @@ pub async fn execute_review(
                 None
             };
 
-            match service::analyze_edge_cases(cfg, mr, summary, None, cancel.clone()).await {
+            match service::analyze_edge_cases(cfg, mr, summary, None, cancel.clone(), repo_config_str).await {
                 Ok(cases) => {
                     drop(_ai_permit);
                     let _ = send
@@ -509,7 +541,7 @@ pub async fn execute_review(
             None
         };
 
-        match service::discover_related_files(cfg, mr, cancel.clone()).await {
+        match service::discover_related_files(cfg, mr, cancel.clone(), repo_config_str).await {
             Ok(files) => {
                 drop(_ai_permit);
                 let _ = send
@@ -552,7 +584,7 @@ pub async fn execute_review(
             None
         };
 
-        match service::generate_adversarial_tests(cfg, mr, &collected_edge_cases, cancel.clone()).await {
+        match service::generate_adversarial_tests(cfg, mr, &collected_edge_cases, cancel.clone(), repo_config_str).await {
             Ok(data) => {
                 drop(_ai_permit);
                 let _ = send
@@ -590,7 +622,7 @@ pub async fn execute_review(
             None
         };
 
-        match service::generate_contracts(cfg, mr, cancel.clone()).await {
+        match service::generate_contracts(cfg, mr, cancel.clone(), repo_config_str).await {
             Ok(data) => {
                 drop(_ai_permit);
                 let _ = send
@@ -629,7 +661,7 @@ pub async fn execute_review(
                 None
             };
 
-            match service::analyze_behavioral_delta(cfg, mr, summary, cancel.clone()).await {
+            match service::analyze_behavioral_delta(cfg, mr, summary, cancel.clone(), repo_config_str).await {
                 Ok(data) => {
                     drop(_ai_permit);
                     let _ = send

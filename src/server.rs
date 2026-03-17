@@ -36,6 +36,8 @@ pub async fn run(state: AppState) -> Result<()> {
         .route("/admin", get(api::admin::page))
         .route("/api/admin/config", get(api::admin::get_config).put(api::admin::update_config))
         .route("/api/admin/status", get(api::admin::get_status))
+        .route("/api/admin/repo-configs", get(api::admin::list_repo_configs))
+        .route("/api/admin/repo-configs/{*project_path}", axum::routing::delete(api::admin::delete_repo_config))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state.clone());

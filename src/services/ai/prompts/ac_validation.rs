@@ -12,6 +12,7 @@ pub fn build(
     criteria: &[String],
     ticket_key: &str,
     custom_prompt: Option<&str>,
+    repo_config: Option<&str>,
 ) -> Vec<ChatMessage> {
     let system = if let Some(custom) = custom_prompt {
         format!("{}\n\n{}", OTTO_IDENTITY, custom)
@@ -69,6 +70,12 @@ Rules:
             "### {}\n```diff\n{}\n```",
             file.file_path, file.diff
         ));
+    }
+
+    if let Some(rc) = repo_config {
+        if !rc.is_empty() {
+            user_parts.push(rc.to_string());
+        }
     }
 
     vec![

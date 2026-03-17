@@ -32,15 +32,202 @@ use bollard::container::{
 };
 use bollard::exec::{CreateExecOptions, StartExecResults};
 use bollard::Docker;
+use dashmap::DashMap;
 use futures::StreamExt;
 use serde_json::json;
 use sqlx::SqlitePool;
+use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::{Mutex, Semaphore};
 use tracing::{debug, info, warn};
 
 /// Default sandbox timeout — 30 minutes for the full pipeline.
 const DEFAULT_SANDBOX_TIMEOUT_SECS: u64 = 1800;
+
+// ---------------------------------------------------------------------------
+// Warm container pool — reuse containers across fixes on the same MR.
+//
+// First fix on an MR pays the full setup cost (clone, deps, build).
+// Subsequent fixes reuse the same container: git reset + pull, then
+// jump straight to apply → test. Seconds instead of minutes.
+//
+// Lifecycle:
+//   First fix  → cold path (create, clone, deps, setup) → keep alive
+//   Next fix   → warm path (reset, pull) → apply → test → keep alive
+//   Idle timer → kill
+//   Author push → kill (stale checkout)
+//   Botto push → reset + pull (own commit, keep warm)
+//   MR merged/closed → kill
+//   Max lifetime → kill
+//   Botto restart → kill all
+// ---------------------------------------------------------------------------
+
+/// A warm container kept alive between fixes on the same MR.
+struct WarmContainer {
+    container_id: String,
+    /// "{project_path}:{mr_iid}" — matches MrRef::key() format.
+    mr_key: String,
+    source_branch: String,
+    /// Docker image used to create this container. If the detected image
+    /// changes between fixes (e.g. .otto.json updated), we evict and cold-start.
+    image: String,
+    created_at: tokio::time::Instant,
+    last_used: tokio::time::Instant,
+    /// Commit SHAs pushed by Botto from this container. When a push webhook
+    /// fires for one of these SHAs, we know it's our own push and keep the
+    /// container warm instead of evicting it.
+    bot_push_shas: HashSet<String>,
+    /// Per-container mutex — only one fix at a time in a given container.
+    /// Second fix on the same MR waits for the first to finish.
+    lock: Arc<Mutex<()>>,
+}
+
+/// Pool of warm containers, keyed by MR. Shared across the application via AppState.
+pub struct WarmPool {
+    containers: DashMap<String, WarmContainer>,
+    docker: Docker,
+}
+
+impl WarmPool {
+    pub fn new() -> Option<Self> {
+        let docker = Docker::connect_with_local_defaults().ok()?;
+        Some(Self {
+            containers: DashMap::new(),
+            docker,
+        })
+    }
+
+    /// Get the container ID and lock for a warm container, if one exists for this MR.
+    /// Returns None if no warm container exists or the image doesn't match.
+    pub fn get(&self, mr_key: &str, expected_image: &str) -> Option<(String, Arc<Mutex<()>>)> {
+        let entry = self.containers.get(mr_key)?;
+        // Image mismatch — .otto.json changed the sandbox image between fixes.
+        // Evict and let the caller cold-start with the new image.
+        if entry.image != expected_image {
+            drop(entry);
+            info!("warm pool: image mismatch for {}, evicting", mr_key);
+            self.remove(mr_key);
+            return None;
+        }
+        Some((entry.container_id.clone(), entry.lock.clone()))
+    }
+
+    /// Store a container in the warm pool after a successful fix.
+    pub fn insert(
+        &self,
+        mr_key: String,
+        container_id: String,
+        source_branch: String,
+        image: String,
+    ) {
+        let now = tokio::time::Instant::now();
+        self.containers.insert(mr_key, WarmContainer {
+            container_id,
+            mr_key: String::new(), // not needed — the DashMap key is the mr_key
+            source_branch,
+            image,
+            created_at: now,
+            last_used: now,
+            bot_push_shas: HashSet::new(),
+            lock: Arc::new(Mutex::new(())),
+        });
+    }
+
+    /// Update last_used timestamp (reset idle timer).
+    pub fn touch(&self, mr_key: &str) {
+        if let Some(mut entry) = self.containers.get_mut(mr_key) {
+            entry.last_used = tokio::time::Instant::now();
+        }
+    }
+
+    /// Register a commit SHA as pushed by Botto. Prevents self-eviction
+    /// when the push webhook fires for this SHA.
+    pub fn register_bot_push(&self, mr_key: &str, sha: &str) {
+        if let Some(mut entry) = self.containers.get_mut(mr_key) {
+            entry.bot_push_shas.insert(sha.to_string());
+        }
+    }
+
+    /// Check if a commit SHA was pushed by Botto from this container.
+    pub fn is_bot_push(&self, mr_key: &str, sha: &str) -> bool {
+        self.containers
+            .get(mr_key)
+            .map(|e| e.bot_push_shas.contains(sha))
+            .unwrap_or(false)
+    }
+
+    /// Get the source branch for a warm container (for webhook matching).
+    pub fn get_branch(&self, mr_key: &str) -> Option<String> {
+        self.containers.get(mr_key).map(|e| e.source_branch.clone())
+    }
+
+    /// Evict and destroy a warm container. Returns true if a container was removed.
+    pub fn remove(&self, mr_key: &str) -> bool {
+        if let Some((_, container)) = self.containers.remove(mr_key) {
+            let docker = self.docker.clone();
+            let container_id = container.container_id;
+            // Spawn removal so we don't block the caller
+            tokio::spawn(async move {
+                let opts = RemoveContainerOptions { force: true, ..Default::default() };
+                if let Err(e) = docker.remove_container(&container_id, Some(opts)).await {
+                    warn!("warm pool: failed to remove container {}: {}", container_id, e);
+                } else {
+                    debug!("warm pool: removed container {}", container_id);
+                }
+            });
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Evict all warm containers (shutdown cleanup).
+    pub fn remove_all(&self) {
+        let keys: Vec<String> = self.containers.iter().map(|e| e.key().clone()).collect();
+        for key in keys {
+            self.remove(&key);
+        }
+    }
+
+    /// Reap idle and expired containers. Called periodically by the background task.
+    pub fn reap(&self, idle_timeout_secs: u64, max_lifetime_secs: u64) -> usize {
+        let now = tokio::time::Instant::now();
+        let mut reaped = 0;
+
+        let keys: Vec<String> = self.containers.iter().map(|e| e.key().clone()).collect();
+        for key in keys {
+            let should_remove = self.containers.get(&key).map(|e| {
+                let idle = now.duration_since(e.last_used).as_secs() > idle_timeout_secs;
+                let expired = now.duration_since(e.created_at).as_secs() > max_lifetime_secs;
+                idle || expired
+            }).unwrap_or(false);
+
+            if should_remove {
+                info!("warm pool: reaping container for {}", key);
+                self.remove(&key);
+                reaped += 1;
+            }
+        }
+        reaped
+    }
+
+    /// Find all MR keys that have a warm container with the given source branch.
+    /// Used by webhook handler to find which MRs are affected by a push to a branch.
+    pub fn find_by_branch(&self, project_path: &str, branch: &str) -> Vec<String> {
+        self.containers
+            .iter()
+            .filter(|e| {
+                e.source_branch == branch && e.key().starts_with(project_path)
+            })
+            .map(|e| e.key().clone())
+            .collect()
+    }
+
+    /// Number of warm containers currently in the pool.
+    pub fn count(&self) -> usize {
+        self.containers.len()
+    }
+}
 
 /// Telemetry collector for harness runs. Zero-cost when None.
 /// The sandbox manager writes to this during agent loops so the harness
@@ -92,6 +279,8 @@ pub struct SandboxManager {
     harness_mode: bool,
     /// Optional telemetry collector for harness runs.
     telemetry: Option<Arc<HarnessTelemetry>>,
+    /// Warm container pool — reuse containers across fixes on the same MR.
+    warm_pool: Option<Arc<WarmPool>>,
 }
 
 /// Input for a fix request.
@@ -143,8 +332,9 @@ impl SandboxManager {
         pool: SqlitePool,
         event_bus: EventBus,
         broadcaster: Arc<dyn Fn(&MrRef, &str) + Send + Sync>,
+        warm_pool: Option<Arc<WarmPool>>,
     ) -> Option<Self> {
-        Self::with_prompts(cfg, pool, event_bus, broadcaster, SandboxPrompts::default(), false, None)
+        Self::with_prompts(cfg, pool, event_bus, broadcaster, SandboxPrompts::default(), false, None, warm_pool)
     }
 
     /// Create a sandbox manager with custom prompts and optional harness mode.
@@ -157,6 +347,7 @@ impl SandboxManager {
         prompts: SandboxPrompts,
         harness_mode: bool,
         telemetry: Option<Arc<HarnessTelemetry>>,
+        warm_pool: Option<Arc<WarmPool>>,
     ) -> Option<Self> {
         if !cfg.sandbox.enabled {
             return None;
@@ -180,10 +371,14 @@ impl SandboxManager {
             prompts,
             harness_mode,
             telemetry,
+            warm_pool,
         })
     }
 
     /// Execute a fix in a sandboxed Docker container.
+    /// Checks the warm pool first — if a container exists for this MR, reuses it
+    /// (git reset + pull instead of clone + deps). Falls back to cold path on miss
+    /// or if the warm container is stale.
     pub async fn run_fix(&self, req: FixRequest) -> FixResult {
         // Acquire semaphore permit (blocks if at max concurrency)
         let _permit = match self.semaphore.acquire().await {
@@ -204,8 +399,9 @@ impl SandboxManager {
             project_path: req.project_path.clone(),
             mr_iid: req.mr_iid,
         };
+        let mr_key = mr_ref.key();
 
-        self.send_progress(&req.job_id, &req.comment_id, &mr_ref, "cloning", "cloning repository...");
+        self.send_progress(&req.job_id, &req.comment_id, &mr_ref, "cloning", "preparing sandbox...");
         self.update_job_status(&req.job_id, "cloning").await;
 
         // Detect base image and strategy
@@ -229,13 +425,11 @@ impl SandboxManager {
             }
         };
 
-        // Try to fetch .otto.json for user-configured sandbox settings
-        let otto_config = match crate::services::gitlab::client::fetch_file_content(
-            &gl_cfg, project_id, ".otto.json", &req.source_branch,
-        ).await {
-            Ok(content) => serde_json::from_str::<serde_json::Value>(&content).ok(),
-            Err(_) => None, // File doesn't exist or can't be read — that's fine
-        };
+        // Try to fetch .otto.json for user-configured sandbox settings (cached)
+        let repo_cfg = crate::services::repo_config::get_or_fetch(
+            &self.pool, &gl_cfg, &req.project_path, project_id, &req.source_branch,
+        ).await;
+        let otto_config = repo_cfg.as_ref().map(|c| c.to_otto_json_value());
 
         let detection = detector::detect_base_image(
             &gl_cfg,
@@ -276,74 +470,169 @@ impl SandboxManager {
             info!("sandbox fix: fork detected, cloning from {}", clone_project);
         }
 
-        // Create container — use resource hints to size appropriately.
-        // Compiled languages (Rust, Java, C++) need more CPU/memory than
-        // interpreted ones (Python, Ruby). The hints come from the detector.
-        let container_name = format!("botto-fix-{}", &req.job_id[..8]);
-        let hints = &detection.resource_hints;
-        let memory_limit = {
-            let configured = self.cfg.sandbox.max_memory_mb;
-            let recommended = hints.min_memory_mb;
-            // Use the larger of configured and recommended, capped at configured * 2
-            let effective = configured.max(recommended).min(configured * 2);
-            (effective * 1024 * 1024) as i64
-        };
-        let cpu_quota = {
-            // Scale CPU quota based on hints. Default is 100_000 (1 CPU).
-            // Resource hints suggest min_cpus; cap at host-available or 4.
-            let effective_cpus = (hints.min_cpus).min(4).max(1);
-            (effective_cpus as i64) * 100_000
+        // --- Warm container check ---
+        // Try to reuse an existing container for this MR. The warm pool
+        // returns the container ID + a per-MR mutex (only one fix at a time).
+        // The lock guard must be held for the entire fix duration, not just
+        // the reset+pull — otherwise a second fix could start in the same
+        // container while the first is still running.
+        let mut _warm_lock_guard: Option<tokio::sync::OwnedMutexGuard<()>> = None;
+        let warm_hit = if let Some(ref pool) = self.warm_pool {
+            if let Some((warm_id, lock)) = pool.get(&mr_key, &base_image) {
+                // Acquire per-MR lock — second fix waits for first to finish.
+                // Use owned guard so it lives as long as we need it.
+                let guard = lock.lock_owned().await;
+
+                self.send_progress(&req.job_id, &req.comment_id, &mr_ref, "cloning", "warm container found, syncing branch...");
+                info!("sandbox fix: warm hit for {} (container {})", mr_key, &warm_id[..12]);
+
+                // Reset to clean state and pull latest commits
+                let reset_cmd = format!(
+                    "cd /workspace && git reset --hard && git clean -fd && git pull origin {}",
+                    shell_escape(&req.source_branch),
+                );
+                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+                match self.exec_in_container(&warm_id, &reset_cmd, deadline).await {
+                    Ok(output) if output.exit_code == 0 => {
+                        info!("sandbox fix: warm reset+pull succeeded for {}", mr_key);
+                        pool.touch(&mr_key);
+                        // Keep the guard alive through the entire fix
+                        _warm_lock_guard = Some(guard);
+                        Some(warm_id)
+                    }
+                    Ok(output) => {
+                        warn!(
+                            "sandbox fix: warm reset+pull failed (exit {}), evicting: {}",
+                            output.exit_code,
+                            truncate_output(&output.stdout, 200),
+                        );
+                        drop(guard);
+                        pool.remove(&mr_key);
+                        None
+                    }
+                    Err(e) => {
+                        warn!("sandbox fix: warm container exec failed, evicting: {}", e);
+                        drop(guard);
+                        pool.remove(&mr_key);
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
         };
 
-        // Build environment variables for the container. Every exec inherits
-        // these, which prevents the AI from wasting steps on `export PATH=...`
-        // after installing a runtime. We include common runtime paths upfront.
-        let container_env = build_container_env(&detection.lang);
+        // --- Cold path: create new container if no warm hit ---
+        let (container_id, is_warm) = if let Some(warm_id) = warm_hit {
+            (warm_id, true)
+        } else {
+            // Create container — use resource hints to size appropriately.
+            let container_name = format!("botto-fix-{}", &req.job_id[..8]);
+            let hints = &detection.resource_hints;
+            let memory_limit = {
+                let configured = self.cfg.sandbox.max_memory_mb;
+                let recommended = hints.min_memory_mb;
+                let effective = configured.max(recommended).min(configured * 2);
+                (effective * 1024 * 1024) as i64
+            };
+            let cpu_quota = {
+                let effective_cpus = (hints.min_cpus).min(4).max(1);
+                (effective_cpus as i64) * 100_000
+            };
 
-        let container_id = match self
-            .create_container(&container_name, &base_image, memory_limit, cpu_quota, &container_env, &detection.lang)
-            .await
-        {
-            Ok(id) => id,
-            Err(e) => {
+            let container_env = build_container_env(&detection.lang);
+
+            let cid = match self
+                .create_container(&container_name, &base_image, memory_limit, cpu_quota, &container_env, &detection.lang)
+                .await
+            {
+                Ok(id) => id,
+                Err(e) => {
+                    return FixResult {
+                        job_id: req.job_id,
+                        success: false,
+                        commit_sha: None,
+                        test_output: None,
+                        error: Some(format!("failed to create container: {}", e)),
+                        fix_mr_url: None,
+                    };
+                }
+            };
+
+            // Start container
+            if let Err(e) = self
+                .docker
+                .start_container(&cid, None::<StartContainerOptions<String>>)
+                .await
+            {
+                self.cleanup_container(&cid).await;
                 return FixResult {
                     job_id: req.job_id,
                     success: false,
                     commit_sha: None,
                     test_output: None,
-                    error: Some(format!("failed to create container: {}", e)),
+                    error: Some(format!("failed to start container: {}", e)),
                     fix_mr_url: None,
                 };
             }
+
+            (cid, false)
         };
 
         self.update_job_status_with_container(&req.job_id, "cloning", &container_id)
             .await;
 
-        // Start container
-        if let Err(e) = self
-            .docker
-            .start_container(&container_id, None::<StartContainerOptions<String>>)
-            .await
-        {
-            self.cleanup_container(&container_id).await;
-            return FixResult {
-                job_id: req.job_id,
-                success: false,
-                commit_sha: None,
-                test_output: None,
-                error: Some(format!("failed to start container: {}", e)),
-                fix_mr_url: None,
-            };
-        }
-
-        // Execute the fix pipeline inside the container
+        // Execute the fix pipeline inside the container.
+        // Warm hits skip the setup phase (prereqs, clone, deps, AI setup).
+        let repo_context_text = repo_cfg.as_ref().map(crate::services::repo_config::format_for_prompt);
         let result = self
-            .execute_fix_pipeline(&container_id, &req, &clone_url_authed, &strategy, &mr_ref, &detection.lang)
+            .execute_fix_pipeline(&container_id, &req, &clone_url_authed, &strategy, &mr_ref, &detection.lang, is_warm, repo_context_text.as_deref())
             .await;
 
-        // Cleanup
-        self.cleanup_container(&container_id).await;
+        // --- Post-fix: warm pool management ---
+        // Store in warm pool (or keep warm) instead of destroying the container.
+        // Only if warm containers are enabled and this isn't a harness run.
+        // On failure, evict the container — it may be in a corrupted state
+        // (OOM killed, broken deps, stale files) and the next fix would fail too.
+        let should_keep_warm = self.warm_pool.is_some() && !self.harness_mode;
+
+        if should_keep_warm && result.success {
+            let pool = self.warm_pool.as_ref().unwrap();
+
+            // Register bot push SHA so webhook doesn't evict us
+            if let Some(ref sha) = result.commit_sha {
+                pool.register_bot_push(&mr_key, sha);
+            }
+
+            if !is_warm {
+                // Cold path completed — store container in warm pool for next fix
+                pool.insert(
+                    mr_key.clone(),
+                    container_id.clone(),
+                    req.source_branch.clone(),
+                    base_image,
+                );
+                info!("sandbox fix: stored warm container for {}", mr_key);
+            } else {
+                // Already warm — just touch to reset idle timer
+                pool.touch(&mr_key);
+            }
+        } else if should_keep_warm && !result.success {
+            // Fix failed — evict warm container if it was a warm hit,
+            // or destroy the cold container. Don't keep broken state.
+            if is_warm {
+                let pool = self.warm_pool.as_ref().unwrap();
+                pool.remove(&mr_key);
+                info!("sandbox fix: evicted failed warm container for {}", mr_key);
+            } else {
+                self.cleanup_container(&container_id).await;
+            }
+        } else {
+            // Warm containers disabled or harness mode — clean up as before
+            self.cleanup_container(&container_id).await;
+        }
 
         // Update DB
         let status = if result.success { "complete" } else { "failed" };
@@ -379,6 +668,10 @@ impl SandboxManager {
     /// Each step uses AI-assisted retry — if a command fails, the AI diagnoses
     /// the error, suggests a remediation command, and the step is retried.
     /// Test failures get special treatment: the AI rewrites the fix itself.
+    ///
+    /// When `is_warm` is true, steps 0-2 (prereqs, clone, native deps, AI setup)
+    /// are skipped — the container already has the repo cloned and deps installed.
+    /// The warm path starts directly at pre-validate → apply → test → push.
     async fn execute_fix_pipeline(
         &self,
         container_id: &str,
@@ -387,6 +680,8 @@ impl SandboxManager {
         strategy: &FixStrategy,
         mr_ref: &MrRef,
         lang: &crate::services::sandbox::detector::ProjectLang,
+        is_warm: bool,
+        repo_context: Option<&str>,
     ) -> FixResult {
         // Harness runs get 25 minutes — real projects (Rust, Java) need time
         // for cargo check, mvn compile, etc. Production uses the configured timeout.
@@ -397,6 +692,18 @@ impl SandboxManager {
         };
         let timeout = std::time::Duration::from_secs(timeout_secs);
         let deadline = tokio::time::Instant::now() + timeout;
+
+        // Build output context for live streaming to Otto.
+        // All exec_in_container_streaming calls use this to broadcast lines.
+        let output_ctx = OutputContext {
+            job_id: req.job_id.clone(),
+            comment_id: req.comment_id.clone(),
+            mr_ref: mr_ref.clone(),
+        };
+
+        // Steps 0-2 are the cold path: prereqs, clone, native deps, AI setup.
+        // Warm containers already have all of this — skip straight to pre-validate.
+        if !is_warm {
 
         // Step 0: Ensure git, python3, and CA certificates are available.
         // Slim/alpine base images don't ship git or CA certs, and python3 is
@@ -480,7 +787,8 @@ impl SandboxManager {
                     self.prompts.setup_system
                         .replace("{project}", &req.project_path)
                         .replace("{file_path}", &req.file_path)
-                        .replace("{test_cmd}", &test_cmd_preview),
+                        .replace("{test_cmd}", &test_cmd_preview)
+                        .replace("{repo_context}", &format_repo_context_block(repo_context)),
                 ),
                 tool_calls: None,
                 tool_call_id: None,
@@ -576,7 +884,7 @@ impl SandboxManager {
                 let detail = format!("setup step {}: {}", setup_step, cmd_preview);
                 self.send_progress(&req.job_id, &req.comment_id, mr_ref, "setting_up", &detail);
 
-                let (cmd_exit, cmd_output) = match self.exec_in_container(container_id, &cmd, deadline).await {
+                let (cmd_exit, cmd_output) = match self.exec_in_container_streaming(container_id, &cmd, deadline, &output_ctx).await {
                     Ok(o) => (o.exit_code, o.stdout),
                     Err(e) => (-1, format!("exec error: {}", e)),
                 };
@@ -600,6 +908,8 @@ impl SandboxManager {
                 }
             }
         }
+
+        } // end if !is_warm (cold path: steps 0-2)
 
         // Step 3: Pre-validate — verify the target file exists and contains
         // the original code BEFORE attempting the apply. This catches the common
@@ -716,7 +1026,7 @@ else:
         let mut test_output;
 
         // First test run
-        match self.exec_in_container(container_id, &test_cmd, deadline).await {
+        match self.exec_in_container_streaming(container_id, &test_cmd, deadline, &output_ctx).await {
             Ok(output) if output.exit_code == 0 => {
                 test_passed = true;
                 test_output = output.stdout;
@@ -781,7 +1091,8 @@ else:
                         .replace("{context}", &context_sections.join("\n\n"))
                         .replace("{original}", &req.original_code)
                         .replace("{suggestion}", &current_suggestion)
-                        .replace("{test_cmd}", &test_cmd),
+                        .replace("{test_cmd}", &test_cmd)
+                        .replace("{repo_context}", &format_repo_context_block(repo_context)),
                 ),
                 tool_calls: None,
                 tool_call_id: None,
@@ -867,7 +1178,7 @@ else:
                     let detail = format!("running tests (AI step {})...", step_count);
                     self.send_progress(&req.job_id, &req.comment_id, mr_ref, "testing", &detail);
 
-                    match self.exec_in_container(container_id, &test_cmd, deadline).await {
+                    match self.exec_in_container_streaming(container_id, &test_cmd, deadline, &output_ctx).await {
                         Ok(output) if output.exit_code == 0 => {
                             info!("tests passed after AI step {}", step_count);
                             test_passed = true;
@@ -905,7 +1216,7 @@ else:
                     let detail = format!("fix step {}: {}", step_count, cmd_preview);
                     self.send_progress(&req.job_id, &req.comment_id, mr_ref, "testing", &detail);
 
-                    let (cmd_exit, cmd_output) = match self.exec_in_container(container_id, &cmd, deadline).await {
+                    let (cmd_exit, cmd_output) = match self.exec_in_container_streaming(container_id, &cmd, deadline, &output_ctx).await {
                         Ok(o) => (o.exit_code, o.stdout),
                         Err(e) => (-1, format!("exec error: {}", e)),
                     };
@@ -1489,6 +1800,32 @@ else:
         cmd: &str,
         deadline: tokio::time::Instant,
     ) -> Result<ExecOutput, String> {
+        self.exec_in_container_inner(container_id, cmd, deadline, None).await
+    }
+
+    /// Execute a command in the container and optionally stream live output
+    /// to connected Otto extensions via the broadcaster.
+    async fn exec_in_container_streaming(
+        &self,
+        container_id: &str,
+        cmd: &str,
+        deadline: tokio::time::Instant,
+        output_ctx: &OutputContext,
+    ) -> Result<ExecOutput, String> {
+        if self.cfg.sandbox.live_output {
+            self.exec_in_container_inner(container_id, cmd, deadline, Some(output_ctx)).await
+        } else {
+            self.exec_in_container_inner(container_id, cmd, deadline, None).await
+        }
+    }
+
+    async fn exec_in_container_inner(
+        &self,
+        container_id: &str,
+        cmd: &str,
+        deadline: tokio::time::Instant,
+        output_ctx: Option<&OutputContext>,
+    ) -> Result<ExecOutput, String> {
         let exec_opts = CreateExecOptions {
             cmd: Some(vec!["sh", "-c", cmd]),
             attach_stdout: Some(true),
@@ -1513,8 +1850,40 @@ else:
             let mut stdout = String::new();
 
             if let StartExecResults::Attached { mut output, .. } = start_result {
+                // When streaming, buffer lines and flush periodically.
+                let mut line_buffer: Vec<String> = Vec::new();
+                let mut last_flush = tokio::time::Instant::now();
+                let flush_interval = std::time::Duration::from_millis(100);
+                let redact = self.cfg.sandbox.output_redaction;
+
                 while let Some(Ok(msg)) = output.next().await {
-                    stdout.push_str(&msg.to_string());
+                    let text = msg.to_string();
+                    stdout.push_str(&text);
+
+                    if let Some(ctx) = output_ctx {
+                        // Split into lines and buffer
+                        for line in text.lines() {
+                            let line = if redact { redact_line(line) } else { line.to_string() };
+                            line_buffer.push(line);
+                        }
+
+                        // Flush if buffer is large enough or enough time has passed
+                        let now = tokio::time::Instant::now();
+                        if line_buffer.len() >= 20 || now.duration_since(last_flush) >= flush_interval {
+                            if !line_buffer.is_empty() {
+                                self.send_output(ctx, &line_buffer, "stdout");
+                                line_buffer.clear();
+                            }
+                            last_flush = now;
+                        }
+                    }
+                }
+
+                // Flush remaining lines
+                if let Some(ctx) = output_ctx {
+                    if !line_buffer.is_empty() {
+                        self.send_output(ctx, &line_buffer, "stdout");
+                    }
                 }
             }
 
@@ -1560,6 +1929,18 @@ else:
         (self.broadcaster)(mr_ref, &msg.to_string());
     }
 
+    /// Send live container output lines to all MR viewers.
+    fn send_output(&self, ctx: &OutputContext, lines: &[String], stream: &str) {
+        let msg = json!({
+            "type": "FIX_OUTPUT",
+            "job_id": ctx.job_id,
+            "comment_id": ctx.comment_id,
+            "lines": lines,
+            "stream": stream,
+        });
+        (self.broadcaster)(&ctx.mr_ref, &msg.to_string());
+    }
+
     async fn update_job_status(&self, job_id: &str, status: &str) {
         let _ = db::queries::update_sandbox_job_status(
             &self.pool, job_id, status, None, None, None, None, None,
@@ -1591,6 +1972,14 @@ struct ExecOutput {
     exit_code: i32,
 }
 
+/// Context for streaming live output to Otto during a fix.
+/// Passed to `exec_in_container_streaming` so it knows where to broadcast.
+struct OutputContext {
+    job_id: String,
+    comment_id: String,
+    mr_ref: MrRef,
+}
+
 /// Error from a pipeline step (with optional captured output).
 struct StepError {
     output: Option<String>,
@@ -1600,6 +1989,78 @@ struct StepError {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Redact secrets from container output before streaming to Otto.
+/// Catches common patterns: API keys, tokens, passwords in env vars, bearer tokens.
+/// Best-effort — not a security boundary, just reduces accidental exposure.
+fn redact_line(line: &str) -> String {
+    // Fast path: most lines don't contain secrets
+    let lower = line.to_lowercase();
+    let has_suspect = lower.contains("token") || lower.contains("key") || lower.contains("secret")
+        || lower.contains("password") || lower.contains("auth") || lower.contains("bearer")
+        || lower.contains("glpat-") || lower.contains("sk-");
+    if !has_suspect {
+        return line.to_string();
+    }
+
+    let mut result = line.to_string();
+
+    // GitLab PATs: glpat-XXXX
+    if let Some(start) = result.find("glpat-") {
+        let end = result[start..].find(|c: char| c.is_whitespace() || c == '\'' || c == '"' || c == '@')
+            .map(|i| start + i)
+            .unwrap_or(result.len());
+        result.replace_range(start..end, "[REDACTED]");
+    }
+
+    // OpenAI-style keys: sk-XXXX
+    if let Some(start) = result.find("sk-") {
+        // Only redact if it looks like a real key (followed by alphanumeric chars)
+        let after = &result[start + 3..];
+        if after.starts_with(|c: char| c.is_alphanumeric()) {
+            let end = result[start..].find(|c: char| c.is_whitespace() || c == '\'' || c == '"')
+                .map(|i| start + i)
+                .unwrap_or(result.len());
+            result.replace_range(start..end, "[REDACTED]");
+        }
+    }
+
+    // Bearer tokens
+    if let Some(start) = lower.find("bearer ") {
+        let value_start = start + 7;
+        let end = result[value_start..].find(|c: char| c.is_whitespace() || c == '\'' || c == '"')
+            .map(|i| value_start + i)
+            .unwrap_or(result.len());
+        if end > value_start {
+            result.replace_range(value_start..end, "[REDACTED]");
+        }
+    }
+
+    // Key=value patterns in env-like output: TOKEN=xxx, PASSWORD=xxx, etc.
+    for pattern in &["TOKEN=", "KEY=", "SECRET=", "PASSWORD=", "token=", "key=", "secret=", "password="] {
+        if let Some(start) = result.find(pattern) {
+            let value_start = start + pattern.len();
+            let end = result[value_start..].find(|c: char| c.is_whitespace() || c == '\'' || c == '"' || c == ';')
+                .map(|i| value_start + i)
+                .unwrap_or(result.len());
+            if end > value_start {
+                result.replace_range(value_start..end, "[REDACTED]");
+            }
+        }
+    }
+
+    result
+}
+
+/// Format repo context for injection into sandbox prompt templates.
+/// Returns a newline-prefixed block when context exists, or an empty string
+/// so the `{repo_context}` placeholder collapses cleanly when absent.
+fn format_repo_context_block(repo_context: Option<&str>) -> String {
+    match repo_context {
+        Some(ctx) if !ctx.is_empty() => format!("\n{}\n", ctx),
+        _ => String::new(),
+    }
+}
 
 /// Truncate output to a max byte length for AI prompts (avoids blowing context).
 fn truncate_output(s: &str, max_bytes: usize) -> &str {

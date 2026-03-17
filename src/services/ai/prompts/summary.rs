@@ -11,6 +11,7 @@ pub fn build(
     mr: &MrContext,
     ticket_context: Option<&str>,
     custom_prompt: Option<&str>,
+    repo_config: Option<&str>,
 ) -> Vec<ChatMessage> {
     let system = if let Some(custom) = custom_prompt {
         format!("{}\n\n{}", OTTO_IDENTITY, custom)
@@ -45,6 +46,12 @@ Return ONLY valid JSON. No markdown fences. No explanation outside the JSON."#,
     if let Some(ticket) = ticket_context {
         if !ticket.is_empty() {
             user_parts.push(format!("## Linked Ticket\n{}", ticket));
+        }
+    }
+
+    if let Some(rc) = repo_config {
+        if !rc.is_empty() {
+            user_parts.push(rc.to_string());
         }
     }
 

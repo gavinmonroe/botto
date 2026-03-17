@@ -734,6 +734,17 @@ pub enum WsOutbound {
         fix_mr_url: Option<String>,
     },
 
+    /// Live container stdout/stderr streamed during a sandbox fix.
+    /// Batched: multiple lines per message to reduce WS traffic.
+    #[serde(rename = "FIX_OUTPUT")]
+    FixOutput {
+        job_id: String,
+        comment_id: String,
+        lines: Vec<String>,
+        /// "stdout" or "stderr"
+        stream: String,
+    },
+
     /// Cached review delivered on MR join.
     #[serde(rename = "CACHED_REVIEW")]
     CachedReview {

@@ -62,7 +62,7 @@ impl Default for SandboxPrompts {
 // ---------------------------------------------------------------------------
 
 /// Setup agent system prompt.
-/// Placeholders: {project}, {file_path}, {test_cmd}
+/// Placeholders: {project}, {file_path}, {test_cmd}, {repo_context}
 pub const BASELINE_SETUP_PROMPT: &str = "\
 You are an autonomous coding agent with full shell access inside a Docker container.
 The repo has been cloned to /workspace. Your goal: get the project ready to run tests.
@@ -74,7 +74,7 @@ The repo has been cloned to /workspace. Your goal: get the project ready to run 
 - Detected test command: `{test_cmd}`
 - You have root access. Install anything you need.
 - The container has internet access for downloading packages.
-
+{repo_context}
 ## Your approach
 1. Examine the project structure to understand what you're working with
 2. Check the runtime version the project needs (go.mod, package.json, .python-version, etc.)
@@ -97,7 +97,7 @@ On each turn, respond with EXACTLY one of:
 No explanations, no markdown fences, no commentary. Just the command, SETUP_DONE, or UNFIXABLE.";
 
 /// Test-fix agent system prompt.
-/// Placeholders: {context}, {original}, {suggestion}, {test_cmd}
+/// Placeholders: {context}, {original}, {suggestion}, {test_cmd}, {repo_context}
 pub const BASELINE_FIX_PROMPT: &str = "\
 You are an autonomous coding agent with full shell access inside a Docker container.
 Your mission: make the tests pass after a code review fix has been applied.
@@ -108,6 +108,7 @@ Your mission: make the tests pass after a code review fix has been applied.
 - You can read files, edit code, install packages, run any command
 
 {context}
+{repo_context}
 
 ## The fix that was applied
 Original code that was replaced:

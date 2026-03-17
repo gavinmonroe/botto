@@ -102,6 +102,16 @@ pub struct SandboxConfig {
     pub max_disk_mb: u64,
     /// How to push fix commits: directly to the source branch, or to a new branch with an MR.
     pub fix_branch_mode: FixBranchMode,
+    /// Keep containers alive between fixes on the same MR (skip clone + deps on subsequent fixes).
+    pub warm_containers: bool,
+    /// Kill warm containers after this many seconds of inactivity.
+    pub warm_idle_timeout_secs: u64,
+    /// Kill warm containers after this many seconds regardless of activity.
+    pub warm_max_lifetime_secs: u64,
+    /// Stream live container stdout/stderr to connected Ottos.
+    pub live_output: bool,
+    /// Redact secrets (tokens, passwords) from live output before streaming.
+    pub output_redaction: bool,
 }
 
 /// Controls where sandbox fix commits are pushed.
@@ -205,6 +215,11 @@ struct TomlSandbox {
     max_disk_mb: Option<u64>,
     /// "same_branch" (default) or "new_branch"
     fix_branch_mode: Option<String>,
+    warm_containers: Option<bool>,
+    warm_idle_timeout_secs: Option<u64>,
+    warm_max_lifetime_secs: Option<u64>,
+    live_output: Option<bool>,
+    output_redaction: Option<bool>,
 }
 
 #[derive(Deserialize, Default)]
@@ -363,6 +378,11 @@ pub async fn load(config_path: &Option<PathBuf>, data_dir: &Path) -> Result<Bott
                 Some("new_branch") => FixBranchMode::NewBranch,
                 _ => FixBranchMode::SameBranch,
             },
+            warm_containers: toml_sandbox.warm_containers.unwrap_or(true),
+            warm_idle_timeout_secs: toml_sandbox.warm_idle_timeout_secs.unwrap_or(600),
+            warm_max_lifetime_secs: toml_sandbox.warm_max_lifetime_secs.unwrap_or(3600),
+            live_output: toml_sandbox.live_output.unwrap_or(true),
+            output_redaction: toml_sandbox.output_redaction.unwrap_or(true),
         },
         cache: CacheConfig {
             review_ttl_days: toml_cache.review_ttl_days.unwrap_or(7),
@@ -397,11 +417,13 @@ pub fn print_summary(cfg: &BottoConfig) {
     info!("ai:     {}", if cfg.ai.base_url.is_empty() { "(not configured)" } else { &cfg.ai.base_url });
     info!("auth:   {}", if cfg.auth.api_key.is_empty() { "OPEN (no API key)" } else { "API key required" });
     info!(
-        "sandbox: {} (docker={}, max_concurrent={}, memory={}MB)",
+        "sandbox: {} (docker={}, max_concurrent={}, memory={}MB, warm={}, live_output={})",
         if cfg.sandbox.enabled { "enabled" } else { "disabled" },
         cfg.sandbox.docker_available,
         cfg.sandbox.max_concurrent,
         cfg.sandbox.max_memory_mb,
+        if cfg.sandbox.warm_containers { "on" } else { "off" },
+        if cfg.sandbox.live_output { "on" } else { "off" },
     );
     info!(
         "limits: max_reviews={}, max_ai_calls={}",
@@ -575,6 +597,11 @@ pub struct SandboxConfigUpdate {
     pub max_memory_mb: Option<u64>,
     pub max_disk_mb: Option<u64>,
     pub fix_branch_mode: Option<String>,
+    pub warm_containers: Option<bool>,
+    pub warm_idle_timeout_secs: Option<u64>,
+    pub warm_max_lifetime_secs: Option<u64>,
+    pub live_output: Option<bool>,
+    pub output_redaction: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -690,6 +717,11 @@ pub fn apply_update(current: &BottoConfig, update: ConfigUpdate) -> (BottoConfig
                 _ => FixBranchMode::SameBranch,
             };
         }
+        if let Some(v) = s.warm_containers { cfg.sandbox.warm_containers = v; }
+        if let Some(v) = s.warm_idle_timeout_secs { cfg.sandbox.warm_idle_timeout_secs = v; }
+        if let Some(v) = s.warm_max_lifetime_secs { cfg.sandbox.warm_max_lifetime_secs = v; }
+        if let Some(v) = s.live_output { cfg.sandbox.live_output = v; }
+        if let Some(v) = s.output_redaction { cfg.sandbox.output_redaction = v; }
     }
 
     if let Some(c) = update.cache {
@@ -749,6 +781,11 @@ pub fn to_toml_string(cfg: &BottoConfig) -> Result<String> {
         max_memory_mb: u64,
         max_disk_mb: u64,
         fix_branch_mode: &'a str,
+        warm_containers: bool,
+        warm_idle_timeout_secs: u64,
+        warm_max_lifetime_secs: u64,
+        live_output: bool,
+        output_redaction: bool,
     }
 
     #[derive(Serialize)]
@@ -786,6 +823,11 @@ pub fn to_toml_string(cfg: &BottoConfig) -> Result<String> {
                 FixBranchMode::SameBranch => "same_branch",
                 FixBranchMode::NewBranch => "new_branch",
             },
+            warm_containers: cfg.sandbox.warm_containers,
+            warm_idle_timeout_secs: cfg.sandbox.warm_idle_timeout_secs,
+            warm_max_lifetime_secs: cfg.sandbox.warm_max_lifetime_secs,
+            live_output: cfg.sandbox.live_output,
+            output_redaction: cfg.sandbox.output_redaction,
         },
         cache: &cfg.cache,
         harness: HarnessOut {
@@ -852,6 +894,11 @@ mod tests {
                 max_memory_mb: 2048,
                 max_disk_mb: 4096,
                 fix_branch_mode: FixBranchMode::SameBranch,
+                warm_containers: true,
+                warm_idle_timeout_secs: 600,
+                warm_max_lifetime_secs: 3600,
+                live_output: true,
+                output_redaction: true,
             },
             cache: CacheConfig {
                 review_ttl_days: 7,
@@ -1073,6 +1120,11 @@ mod tests {
                 max_memory_mb: None,
                 max_disk_mb: None,
                 fix_branch_mode: Some("new_branch".into()),
+                warm_containers: None,
+                warm_idle_timeout_secs: None,
+                warm_max_lifetime_secs: None,
+                live_output: None,
+                output_redaction: None,
             }),
             cache: None,
             harness: None,

@@ -53,6 +53,11 @@ async fn migrate(pool: &SqlitePool) -> Result<()> {
         .await
         .context("migration 002 failed")?;
 
+    sqlx::query(MIGRATION_003)
+        .execute(pool)
+        .await
+        .context("migration 003 failed")?;
+
     info!("migrations complete");
     Ok(())
 }
@@ -184,5 +189,20 @@ CREATE TABLE IF NOT EXISTS digests (
     generated_at INTEGER NOT NULL,
     expires_at INTEGER NOT NULL,
     UNIQUE(project_path, period)
+);
+"#;
+
+const MIGRATION_003: &str = r#"
+-- Cached .otto.json repo configs (fetched from GitLab, TTL-based).
+-- config_json = "{}" is the null sentinel: "we checked, no .otto.json exists".
+-- formatted = pre-built prompt text (empty string for null sentinel).
+-- sandbox_image = extracted sandbox.image for quick access by sandbox manager.
+CREATE TABLE IF NOT EXISTS repo_configs (
+    project_path TEXT PRIMARY KEY,
+    config_json  TEXT NOT NULL,
+    formatted    TEXT NOT NULL,
+    sandbox_image TEXT,
+    fetched_at   INTEGER NOT NULL,
+    expires_at   INTEGER NOT NULL
 );
 "#;

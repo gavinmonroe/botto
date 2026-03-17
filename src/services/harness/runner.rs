@@ -186,6 +186,7 @@ pub async fn run_single(
         prompts,
         true, // harness_mode: skip push
         Some(telemetry.clone()),
+        None, // no warm pool for harness runs
     ) {
         Some(m) => m,
         None => return fail("sandbox manager unavailable (Docker not running or sandbox disabled)".into()),

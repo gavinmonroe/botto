@@ -11,6 +11,7 @@ pub fn build(
     thread_context: &str,
     diff_context: &str,
     custom_prompt: Option<&str>,
+    repo_config: Option<&str>,
 ) -> Vec<ChatMessage> {
     let system = if let Some(custom) = custom_prompt {
         format!("{}\n\n{}", OTTO_IDENTITY, custom)
@@ -33,10 +34,17 @@ Return ONLY valid JSON."#,
         )
     };
 
-    let user = format!(
+    let mut user = format!(
         "## Comment\n{}\n\n## Thread Context\n{}\n\n## Diff Context\n{}",
         comment_body, thread_context, diff_context
     );
+
+    if let Some(rc) = repo_config {
+        if !rc.is_empty() {
+            user.push_str("\n\n");
+            user.push_str(rc);
+        }
+    }
 
     vec![
         ChatMessage {

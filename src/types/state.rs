@@ -8,6 +8,7 @@
 
 use crate::config::BottoConfig;
 use crate::services::events::EventBus;
+use crate::services::sandbox::manager::WarmPool;
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
@@ -16,6 +17,7 @@ use sqlx::SqlitePool;
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::{broadcast, watch, Semaphore};
+use tracing::info;
 
 /// A file (and optional line range) a user is currently viewing in a diff.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -134,12 +136,29 @@ pub struct AppStateInner {
     pub review_semaphore: Arc<Semaphore>,
     /// Limits how many AI API calls can be in-flight across all reviews.
     pub ai_semaphore: Arc<Semaphore>,
+    /// Warm container pool for sandbox fix reuse across fixes on the same MR.
+    /// None if Docker is not available or warm containers are disabled.
+    pub warm_pool: Option<Arc<WarmPool>>,
 }
 
 impl AppState {
     pub fn new(config: BottoConfig, pool: SqlitePool) -> Self {
         let review_semaphore = Arc::new(Semaphore::new(config.server.max_concurrent_reviews));
         let ai_semaphore = Arc::new(Semaphore::new(config.server.max_concurrent_ai_calls));
+
+        // Initialize warm pool if sandbox + warm containers are both enabled
+        let warm_pool = if config.sandbox.enabled && config.sandbox.warm_containers {
+            WarmPool::new().map(|p| {
+                info!(
+                    "warm container pool enabled (idle={}s, max_lifetime={}s)",
+                    config.sandbox.warm_idle_timeout_secs, config.sandbox.warm_max_lifetime_secs,
+                );
+                Arc::new(p)
+            })
+        } else {
+            None
+        };
+
         Self {
             inner: Arc::new(AppStateInner {
                 config: ArcSwap::from_pointee(config),
@@ -150,6 +169,7 @@ impl AppState {
                 in_flight: DashMap::new(),
                 review_semaphore,
                 ai_semaphore,
+                warm_pool,
             }),
         }
     }
@@ -189,6 +209,10 @@ impl AppState {
 
     pub fn ai_semaphore(&self) -> &Arc<Semaphore> {
         &self.inner.ai_semaphore
+    }
+
+    pub fn warm_pool(&self) -> Option<&Arc<WarmPool>> {
+        self.inner.warm_pool.as_ref()
     }
 
     /// Get all connection IDs currently viewing a specific MR.

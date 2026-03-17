@@ -477,6 +477,85 @@ pub async fn get_recent_events(
 }
 
 // ---------------------------------------------------------------------------
+// Repo configs (cached .otto.json)
+// ---------------------------------------------------------------------------
+
+/// Get a cached repo config if it exists and hasn't expired.
+/// Returns (config_json, formatted, sandbox_image, fetched_at).
+pub async fn get_repo_config(
+    pool: &SqlitePool,
+    project_path: &str,
+) -> Result<Option<(String, String, Option<String>, i64)>> {
+    let now = epoch_secs();
+    let row: Option<(String, String, Option<String>, i64)> = sqlx::query_as(
+        "SELECT config_json, formatted, sandbox_image, fetched_at
+         FROM repo_configs
+         WHERE project_path = ? AND expires_at > ?",
+    )
+    .bind(project_path)
+    .bind(now)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row)
+}
+
+/// Insert or update a cached repo config with TTL.
+/// Use config_json="{}" and formatted="" for the null sentinel (no .otto.json in repo).
+pub async fn upsert_repo_config(
+    pool: &SqlitePool,
+    project_path: &str,
+    config_json: &str,
+    formatted: &str,
+    sandbox_image: Option<&str>,
+    ttl_secs: i64,
+) -> Result<()> {
+    let now = epoch_secs();
+    let expires_at = now + ttl_secs;
+    sqlx::query(
+        "INSERT INTO repo_configs (project_path, config_json, formatted, sandbox_image, fetched_at, expires_at)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(project_path) DO UPDATE SET
+           config_json = excluded.config_json,
+           formatted = excluded.formatted,
+           sandbox_image = excluded.sandbox_image,
+           fetched_at = excluded.fetched_at,
+           expires_at = excluded.expires_at",
+    )
+    .bind(project_path)
+    .bind(config_json)
+    .bind(formatted)
+    .bind(sandbox_image)
+    .bind(now)
+    .bind(expires_at)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Delete a cached repo config (webhook invalidation).
+pub async fn delete_repo_config(pool: &SqlitePool, project_path: &str) -> Result<()> {
+    sqlx::query("DELETE FROM repo_configs WHERE project_path = ?")
+        .bind(project_path)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// List all cached repo configs (for admin API). Returns entries regardless of expiry.
+pub async fn list_repo_configs(
+    pool: &SqlitePool,
+) -> Result<Vec<(String, String, String, Option<String>, i64, i64)>> {
+    let rows: Vec<(String, String, String, Option<String>, i64, i64)> = sqlx::query_as(
+        "SELECT project_path, config_json, formatted, sandbox_image, fetched_at, expires_at
+         FROM repo_configs
+         ORDER BY fetched_at DESC",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 

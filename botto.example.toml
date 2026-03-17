@@ -47,6 +47,11 @@ api_key = ""
 # max_memory_mb = 2048      # auto-detected from system memory
 # max_disk_mb = 4096
 # fix_branch_mode = "same_branch"  # "same_branch" (push to MR branch) or "new_branch" (create botto/fix/... branch + MR)
+# warm_containers = true           # reuse containers across fixes on the same MR
+# warm_idle_timeout_secs = 600     # kill warm containers after 10 min idle
+# warm_max_lifetime_secs = 3600    # kill warm containers after 1 hour regardless
+# live_output = true               # stream container stdout/stderr to Otto in real-time
+# output_redaction = true          # redact secrets from live output before streaming
 
 [cache]
 # review_ttl_days = 7

@@ -4,6 +4,7 @@ pub mod events;
 pub mod gitlab;
 pub mod harness;
 pub mod queue;
+pub mod repo_config;
 pub mod review;
 pub mod sandbox;
 pub mod ticket;

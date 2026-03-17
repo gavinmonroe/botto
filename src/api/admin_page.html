@@ -259,6 +259,16 @@ input[type="checkbox"]{width:auto;margin-right:4px}
       <button type="button" class="btn" onclick="loadConfig()">Reset</button>
     </div>
   </form>
+
+  <!-- Repo Configs (read-only, outside the settings form) -->
+  <div class="section" id="sec-repo-configs" style="margin-top:24px">
+    <div class="section-head" onclick="toggle('sec-repo-configs')">
+      <h2>Cached Repo Configs</h2><span class="arrow">▼</span>
+    </div>
+    <div class="section-body single">
+      <div id="repo-configs-list" style="font-size:13px;color:var(--text2)">Loading...</div>
+    </div>
+  </div>
 </div>
 
 <div class="toast" id="toast"></div>
@@ -438,7 +448,64 @@ async function saveConfig(e) {
 document.getElementById('cfg-form').addEventListener('submit', saveConfig);
 loadConfig();
 loadStatus();
+loadRepoConfigs();
 setInterval(loadStatus, 15000);
+
+async function loadRepoConfigs() {
+  const el = document.getElementById('repo-configs-list');
+  try {
+    const r = await fetch('/api/admin/repo-configs', {headers});
+    if (!r.ok) { el.textContent = 'Failed to load'; return; }
+    const data = await r.json();
+    const configs = data.configs || [];
+    if (configs.length === 0) {
+      el.textContent = 'No cached repo configs yet. Configs are cached when reviews or sandbox fixes run.';
+      return;
+    }
+    let html = '<table style="width:100%;border-collapse:collapse;font-size:12px">';
+    html += '<tr style="text-align:left;border-bottom:1px solid var(--border)">' +
+      '<th style="padding:4px 8px">Project</th>' +
+      '<th style="padding:4px 8px">Context</th>' +
+      '<th style="padding:4px 8px">Focus</th>' +
+      '<th style="padding:4px 8px">Image</th>' +
+      '<th style="padding:4px 8px">Status</th>' +
+      '<th style="padding:4px 8px"></th></tr>';
+    for (const c of configs) {
+      const cfg = c.config || {};
+      const isNull = Object.keys(cfg).length === 0;
+      const ctx = (cfg.context || '').slice(0, 40) || (isNull ? '(no .otto.json)' : '—');
+      const focus = (cfg.focus || []).join(', ').slice(0, 30) || '—';
+      const img = c.sandbox_image || '—';
+      const status = c.expired
+        ? '<span style="color:var(--text2)">expired</span>'
+        : '<span style="color:var(--success)">cached</span>';
+      html += '<tr style="border-bottom:1px solid var(--border)">' +
+        '<td style="padding:4px 8px;font-family:monospace">' + esc(c.project_path) + '</td>' +
+        '<td style="padding:4px 8px">' + esc(ctx) + '</td>' +
+        '<td style="padding:4px 8px">' + esc(focus) + '</td>' +
+        '<td style="padding:4px 8px;font-family:monospace">' + esc(img) + '</td>' +
+        '<td style="padding:4px 8px">' + status + '</td>' +
+        '<td style="padding:4px 8px"><button class="btn" style="font-size:11px;padding:2px 8px" ' +
+        'onclick="invalidateRepoConfig(\'' + esc(c.project_path) + '\')">Invalidate</button></td></tr>';
+    }
+    html += '</table>';
+    el.innerHTML = html;
+  } catch(e) {
+    el.textContent = 'Error: ' + e.message;
+  }
+}
+
+function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+
+async function invalidateRepoConfig(path) {
+  try {
+    await fetch('/api/admin/repo-configs/' + encodeURIComponent(path), {method:'DELETE', headers});
+    toast('Invalidated ' + path, true);
+    loadRepoConfigs();
+  } catch(e) {
+    toast('Failed: ' + e.message, false);
+  }
+}
 </script>
 </body>
 </html>

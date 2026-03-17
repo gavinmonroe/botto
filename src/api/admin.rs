@@ -180,7 +180,66 @@ pub async fn get_status(
             "enabled": cfg.sandbox.enabled,
             "docker_available": cfg.sandbox.docker_available,
             "max_concurrent": cfg.sandbox.max_concurrent,
+            "warm_containers": cfg.sandbox.warm_containers,
+            "warm_active": state.warm_pool().map(|p| p.count()).unwrap_or(0),
         },
         "version": env!("CARGO_PKG_VERSION"),
     })).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Repo configs — cached .otto.json management
+// ---------------------------------------------------------------------------
+
+/// List all cached repo configs.
+pub async fn list_repo_configs(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AdminQuery>,
+) -> impl IntoResponse {
+    if let Err(e) = check_auth(&state, &headers, &query) {
+        return e.into_response();
+    }
+
+    match crate::db::queries::list_repo_configs(state.pool()).await {
+        Ok(rows) => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64;
+            let configs: Vec<serde_json::Value> = rows
+                .into_iter()
+                .map(|(project_path, config_json, _formatted, sandbox_image, fetched_at, expires_at)| {
+                    serde_json::json!({
+                        "project_path": project_path,
+                        "config": serde_json::from_str::<serde_json::Value>(&config_json).unwrap_or_default(),
+                        "sandbox_image": sandbox_image,
+                        "fetched_at": fetched_at,
+                        "expires_at": expires_at,
+                        "expired": expires_at <= now,
+                    })
+                })
+                .collect();
+            Json(serde_json::json!({ "configs": configs })).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("failed to list repo configs: {}", e) })),
+        ).into_response(),
+    }
+}
+
+/// Force-invalidate a cached repo config.
+pub async fn delete_repo_config(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AdminQuery>,
+    axum::extract::Path(project_path): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = check_auth(&state, &headers, &query) {
+        return e.into_response();
+    }
+
+    crate::services::repo_config::invalidate(state.pool(), &project_path).await;
+    Json(serde_json::json!({ "invalidated": true, "project_path": project_path })).into_response()
 }

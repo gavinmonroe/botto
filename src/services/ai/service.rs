@@ -156,10 +156,11 @@ pub async fn generate_summary(
     ticket_context: Option<&str>,
     delta_tx: Option<&mpsc::Sender<String>>,
     cancel: CancellationToken,
+    repo_config: Option<&str>,
 ) -> Result<MrSummary, AiError> {
     let client_cfg = ai_config(cfg);
     let task_cfg = TaskConfig::from_botto_config(cfg, crate::types::settings::AiTaskType::Summary);
-    let messages = prompts::summary::build(mr, ticket_context, None);
+    let messages = prompts::summary::build(mr, ticket_context, None, repo_config);
 
     if delta_tx.is_some() {
         call_streaming_and_parse(&client_cfg, &task_cfg, messages, delta_tx, cancel).await
@@ -197,11 +198,12 @@ pub async fn analyze_edge_cases(
     summary: &MrSummary,
     delta_tx: Option<&mpsc::Sender<String>>,
     cancel: CancellationToken,
+    repo_config: Option<&str>,
 ) -> Result<Vec<EdgeCase>, AiError> {
     let client_cfg = ai_config(cfg);
     let task_cfg =
         TaskConfig::from_botto_config(cfg, crate::types::settings::AiTaskType::EdgeCases);
-    let messages = prompts::edge_cases::build(mr, summary, None);
+    let messages = prompts::edge_cases::build(mr, summary, None, repo_config);
 
     if delta_tx.is_some() {
         call_streaming_and_parse(&client_cfg, &task_cfg, messages, delta_tx, cancel).await
@@ -257,11 +259,12 @@ pub async fn discover_related_files(
     cfg: &crate::config::BottoConfig,
     mr: &MrContext,
     cancel: CancellationToken,
+    repo_config: Option<&str>,
 ) -> Result<Vec<RelatedFile>, AiError> {
     let client_cfg = ai_config(cfg);
     let task_cfg =
         TaskConfig::from_botto_config(cfg, crate::types::settings::AiTaskType::RelatedFiles);
-    let messages = prompts::related_files::build(mr, None);
+    let messages = prompts::related_files::build(mr, None, repo_config);
 
     call_streaming_and_parse(&client_cfg, &task_cfg, messages, None, cancel).await
 }
@@ -276,11 +279,12 @@ pub async fn generate_adversarial_tests(
     mr: &MrContext,
     edge_cases: &[EdgeCase],
     cancel: CancellationToken,
+    repo_config: Option<&str>,
 ) -> Result<crate::types::verification::AdversarialTestData, AiError> {
     let client_cfg = ai_config(cfg);
     let task_cfg =
         TaskConfig::from_botto_config(cfg, crate::types::settings::AiTaskType::AdversarialTests);
-    let messages = prompts::adversarial_tests::build(mr, edge_cases, None);
+    let messages = prompts::adversarial_tests::build(mr, edge_cases, None, repo_config);
 
     call_streaming_and_parse(&client_cfg, &task_cfg, messages, None, cancel).await
 }
@@ -290,11 +294,12 @@ pub async fn generate_contracts(
     cfg: &crate::config::BottoConfig,
     mr: &MrContext,
     cancel: CancellationToken,
+    repo_config: Option<&str>,
 ) -> Result<crate::types::verification::ContractData, AiError> {
     let client_cfg = ai_config(cfg);
     let task_cfg =
         TaskConfig::from_botto_config(cfg, crate::types::settings::AiTaskType::Contracts);
-    let messages = prompts::contracts::build(mr, None);
+    let messages = prompts::contracts::build(mr, None, repo_config);
 
     call_streaming_and_parse(&client_cfg, &task_cfg, messages, None, cancel).await
 }
@@ -305,11 +310,12 @@ pub async fn analyze_behavioral_delta(
     mr: &MrContext,
     summary: &MrSummary,
     cancel: CancellationToken,
+    repo_config: Option<&str>,
 ) -> Result<crate::types::verification::BehavioralDeltaData, AiError> {
     let client_cfg = ai_config(cfg);
     let task_cfg =
         TaskConfig::from_botto_config(cfg, crate::types::settings::AiTaskType::BehavioralDelta);
-    let messages = prompts::behavioral_delta::build(mr, summary, None);
+    let messages = prompts::behavioral_delta::build(mr, summary, None, repo_config);
 
     call_streaming_and_parse(&client_cfg, &task_cfg, messages, None, cancel).await
 }

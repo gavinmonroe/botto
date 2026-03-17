@@ -152,13 +152,44 @@ async fn run_server(cfg: config::BottoConfig, data_dir: &PathBuf) -> anyhow::Res
         }
     });
 
+    // Warm container reaper — periodically evicts idle and expired containers.
+    // Runs every 30s, checks each container against configured timeouts.
+    let reaper_handle = if let Some(pool) = state.warm_pool().cloned() {
+        let state_for_reaper = state.clone();
+        Some(tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+            loop {
+                interval.tick().await;
+                let cfg = state_for_reaper.config();
+                let reaped = pool.reap(
+                    cfg.sandbox.warm_idle_timeout_secs,
+                    cfg.sandbox.warm_max_lifetime_secs,
+                );
+                if reaped > 0 {
+                    info!("warm pool reaper: evicted {} containers", reaped);
+                }
+            }
+        }))
+    } else {
+        None
+    };
+
     // Start HTTP + WebSocket server (blocks until shutdown)
-    let result = server::run(state).await;
+    let result = server::run(state.clone()).await;
 
     // Shutdown background tasks
     queue_shutdown.cancel();
     cleanup_handle.abort();
+    if let Some(h) = reaper_handle {
+        h.abort();
+    }
     let _ = queue_handle.await;
+
+    // Clean up all warm containers on shutdown
+    if let Some(pool) = state.warm_pool() {
+        info!("shutting down: cleaning up warm containers...");
+        pool.remove_all();
+    }
 
     result
 }

@@ -832,11 +832,33 @@ pub async fn stream_chat(
 
     // Parse chat payload
     let question = payload.get("question").and_then(|v| v.as_str()).unwrap_or("");
-    let review_context = payload.get("reviewContext").and_then(|v| v.as_str()).unwrap_or("");
+
+    // Build structured review context from Otto's ChatReviewContext JSON object.
+    // Otto sends reviewContext as { mrContext, summary, fileReviews, edgeCases, relatedFiles }.
+    // We parse it into a structured context string matching Otto's buildContextMessage().
+    let review_context = crate::services::ai::prompts::chat::build_context_from_payload(payload);
+
+    // Extract project_path from the review context to fetch cached repo config.
+    // The project_path lives inside reviewContext.mrContext.projectPath.
+    let project_path = payload
+        .get("reviewContext")
+        .and_then(|rc| rc.get("mrContext"))
+        .and_then(|mr| mr.get("projectPath"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    // Fetch cached repo config (non-blocking — returns None if not cached).
+    // We don't trigger a GitLab API fetch here because chat is latency-sensitive.
+    // The config will already be cached if a review was run on this project.
+    let repo_config_text = if !project_path.is_empty() {
+        crate::services::repo_config::get_cached_formatted(state.pool(), project_path).await
+    } else {
+        None
+    };
 
     // Build message history
     let mut messages = vec![
-        crate::services::ai::prompts::chat::build_system(review_context, None),
+        crate::services::ai::prompts::chat::build_system(&review_context, None, repo_config_text.as_deref()),
     ];
 
     // Add conversation history if provided
@@ -936,4 +958,60 @@ pub async fn get_team_digest(state: &AppState, payload: &Value) -> Value {
             err(&format!("failed to compute digest: {}", e))
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Repo config
+// ---------------------------------------------------------------------------
+
+pub async fn get_repo_config(state: &AppState, payload: &Value) -> Value {
+    let project_path = match extract_str(payload, "project_path") {
+        Some(p) => p,
+        None => return err("missing project_path"),
+    };
+
+    // Try cache first. If not cached, attempt a fetch using project_id + ref.
+    let project_id = extract_i64(payload, "project_id");
+    let ref_name = extract_str(payload, "ref").unwrap_or("main");
+
+    let cfg = state.config();
+    let gl_cfg = crate::services::gitlab::client::GitLabConfig {
+        base_url: cfg.gitlab.url.clone(),
+        token: cfg.gitlab.bot_token.clone(),
+    };
+
+    // If project_id is provided, do a full get_or_fetch (cache + API fallback).
+    // Otherwise, only return what's already cached.
+    let config = if let Some(pid) = project_id {
+        crate::services::repo_config::get_or_fetch(
+            state.pool(), &gl_cfg, project_path, pid, ref_name,
+        ).await
+    } else {
+        // No project_id — check cache only, don't hit GitLab API
+        match crate::services::repo_config::get_cached_formatted(state.pool(), project_path).await {
+            Some(formatted) => {
+                // Return just the formatted text — caller doesn't need the full struct
+                return ok(json!({ "formatted": formatted }));
+            }
+            None => None,
+        }
+    };
+
+    match config {
+        Some(rc) => ok(json!({
+            "config": serde_json::to_value(&rc).unwrap_or_default(),
+            "formatted": crate::services::repo_config::format_for_prompt(&rc),
+        })),
+        None => ok(json!({ "config": null, "formatted": null })),
+    }
+}
+
+pub async fn invalidate_repo_config(state: &AppState, payload: &Value) -> Value {
+    let project_path = match extract_str(payload, "project_path") {
+        Some(p) => p,
+        None => return err("missing project_path"),
+    };
+
+    crate::services::repo_config::invalidate(state.pool(), project_path).await;
+    ok(json!({ "invalidated": true }))
 }
