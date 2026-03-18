@@ -42,7 +42,18 @@ use tokio::sync::{Mutex, Semaphore};
 use tracing::{debug, info, warn};
 
 /// Default sandbox timeout — 30 minutes for the full pipeline.
+/// This value is also used as the default in config.rs (SandboxConfig).
 const DEFAULT_SANDBOX_TIMEOUT_SECS: u64 = 1800;
+
+/// Minimum number of AI fix steps before UNFIXABLE is accepted.
+/// Forces the agent to try multiple approaches before giving up.
+const MIN_FIX_STEPS: u32 = 3;
+
+/// Maximum retries for a single AI API call before giving up.
+const AI_API_MAX_RETRIES: u32 = 2;
+
+/// Base delay between AI API retries (doubled each attempt).
+const AI_API_RETRY_BASE_MS: u64 = 1000;
 
 // ---------------------------------------------------------------------------
 // Warm container pool — reuse containers across fixes on the same MR.
@@ -1305,7 +1316,8 @@ else:
 
         // Step 4: Run tests — with AI-powered autonomous agent loop.
         // The AI has full shell access and decides when to run tests.
-        // No iteration cap — only the pipeline timeout (30 min default).
+        // No iteration cap — only the pipeline timeout (default 30 min, configurable via
+        // sandbox.timeout_seconds). AI must try MIN_FIX_STEPS approaches before UNFIXABLE.
         self.send_progress(&req.job_id, &req.comment_id, mr_ref, "testing", "running tests...");
         self.update_job_status(&req.job_id, "testing").await;
 
@@ -1418,7 +1430,7 @@ else:
                 self.send_progress(&req.job_id, &req.comment_id, mr_ref, "testing",
                     &format!("AI analyzing (step {})...", step_count));
 
-                // Ask AI
+                // Ask AI (with retry on transient failures)
                 let ai_request = ChatCompletionRequest {
                     model: self.cfg.ai.models.fix.clone(),
                     messages: messages.clone(),
@@ -1429,11 +1441,45 @@ else:
                     tool_choice: None,
                 };
 
-                let ai_response = match ai_client::chat_completion(&self.ai_config(), ai_request).await {
-                    Ok(resp) => resp,
-                    Err(e) => {
-                        warn!("AI call failed during test fix: {}", e);
-                        break;
+                let ai_response = {
+                    let mut last_err = None;
+                    let mut result = None;
+                    for attempt in 0..=AI_API_MAX_RETRIES {
+                        if tokio::time::Instant::now() >= deadline {
+                            break;
+                        }
+                        match ai_client::chat_completion(&self.ai_config(), ai_request.clone()).await {
+                            Ok(resp) => {
+                                result = Some(resp);
+                                break;
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "AI call failed during test fix (attempt {}/{}): {}",
+                                    attempt + 1,
+                                    AI_API_MAX_RETRIES + 1,
+                                    e
+                                );
+                                last_err = Some(e);
+                                if attempt < AI_API_MAX_RETRIES {
+                                    let delay = std::time::Duration::from_millis(
+                                        AI_API_RETRY_BASE_MS * 2u64.pow(attempt),
+                                    );
+                                    tokio::time::sleep(delay).await;
+                                }
+                            }
+                        }
+                    }
+                    match result {
+                        Some(resp) => resp,
+                        None => {
+                            warn!(
+                                "AI call failed after {} attempts: {:?}",
+                                AI_API_MAX_RETRIES + 1,
+                                last_err
+                            );
+                            break;
+                        }
                     }
                 };
 
@@ -1448,6 +1494,35 @@ else:
                 }
 
                 if ai_text == "UNFIXABLE" {
+                    if step_count < MIN_FIX_STEPS {
+                        info!(
+                            "AI said UNFIXABLE at step {} (min {}), pushing back",
+                            step_count, MIN_FIX_STEPS
+                        );
+                        messages.push(ChatMessage {
+                            role: "assistant".into(),
+                            content: Some("UNFIXABLE".into()),
+                            tool_calls: None,
+                            tool_call_id: None,
+                        });
+                        messages.push(ChatMessage {
+                            role: "user".into(),
+                            content: Some(
+                                "Do not give up yet. You must try at least a few materially \
+                                 different approaches before declaring UNFIXABLE. Consider:\n\
+                                 - Reading the failing test to understand what it actually expects\n\
+                                 - Checking imports, type signatures, or function arity\n\
+                                 - Looking at related source files for patterns\n\
+                                 - Adjusting the fix rather than reverting it\n\
+                                 - Checking for version or dependency mismatches\n\n\
+                                 Try a different strategy now."
+                                    .into(),
+                            ),
+                            tool_calls: None,
+                            tool_call_id: None,
+                        });
+                        continue;
+                    }
                     info!("AI determined test failure is unfixable at step {}", step_count);
                     break;
                 }
@@ -1913,7 +1988,7 @@ else:
                         step_name, last_exit_code, step_count
                     );
 
-                    // Ask AI
+                    // Ask AI (with retry on transient failures)
                     let ai_request = ChatCompletionRequest {
                         model: self.cfg.ai.models.fix.clone(),
                         messages: messages.clone(),
@@ -1924,11 +1999,47 @@ else:
                         tool_choice: None,
                     };
 
-                    let ai_response = match ai_client::chat_completion(&self.ai_config(), ai_request).await {
-                        Ok(resp) => resp,
-                        Err(e) => {
-                            warn!("AI call failed for '{}': {}", step_name, e);
-                            break;
+                    let ai_response = {
+                        let mut last_err = None;
+                        let mut result = None;
+                        for attempt in 0..=AI_API_MAX_RETRIES {
+                            if tokio::time::Instant::now() >= deadline {
+                                break;
+                            }
+                            match ai_client::chat_completion(&self.ai_config(), ai_request.clone()).await {
+                                Ok(resp) => {
+                                    result = Some(resp);
+                                    break;
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "AI call failed for '{}' (attempt {}/{}): {}",
+                                        step_name,
+                                        attempt + 1,
+                                        AI_API_MAX_RETRIES + 1,
+                                        e
+                                    );
+                                    last_err = Some(e);
+                                    if attempt < AI_API_MAX_RETRIES {
+                                        let delay = std::time::Duration::from_millis(
+                                            AI_API_RETRY_BASE_MS * 2u64.pow(attempt),
+                                        );
+                                        tokio::time::sleep(delay).await;
+                                    }
+                                }
+                            }
+                        }
+                        match result {
+                            Some(resp) => resp,
+                            None => {
+                                warn!(
+                                    "AI call failed for '{}' after {} attempts: {:?}",
+                                    step_name,
+                                    AI_API_MAX_RETRIES + 1,
+                                    last_err
+                                );
+                                break;
+                            }
                         }
                     };
 
@@ -3438,5 +3549,44 @@ mod tests {
         assert!(!block.is_empty());
         assert!(block.contains("Project notes"));
         assert!(!block.contains("Known project facts"));
+    }
+
+    // -- sandbox fix resilience constants --
+
+    #[test]
+    fn min_fix_steps_requires_multiple_attempts() {
+        // The AI must try at least MIN_FIX_STEPS different approaches before
+        // we accept UNFIXABLE. This prevents single-shot surrender.
+        assert!(
+            MIN_FIX_STEPS >= 2,
+            "MIN_FIX_STEPS must be >= 2 to prevent single-shot surrender"
+        );
+    }
+
+    #[test]
+    fn ai_api_retry_allows_transient_failures() {
+        // At least 1 retry so a single network blip doesn't kill the fix loop.
+        assert!(
+            AI_API_MAX_RETRIES >= 1,
+            "AI_API_MAX_RETRIES must be >= 1 to survive transient failures"
+        );
+    }
+
+    #[test]
+    fn ai_api_retry_delay_is_reasonable() {
+        // Base delay should be between 500ms and 5s — fast enough to not waste
+        // the timeout budget, slow enough to let transient issues clear.
+        assert!(
+            AI_API_RETRY_BASE_MS >= 500 && AI_API_RETRY_BASE_MS <= 5000,
+            "AI_API_RETRY_BASE_MS should be between 500 and 5000ms, got {}",
+            AI_API_RETRY_BASE_MS
+        );
+    }
+
+    #[test]
+    fn default_timeout_matches_config_expectation() {
+        // The constant in manager.rs should match what config.rs uses as default.
+        // Both should be 1800s (30 min).
+        assert_eq!(DEFAULT_SANDBOX_TIMEOUT_SECS, 1800);
     }
 }

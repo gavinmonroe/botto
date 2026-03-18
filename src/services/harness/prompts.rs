@@ -132,15 +132,24 @@ The fix has already been applied. Tests are currently failing. You need to figur
 3. If the fix itself needs adjustment, edit the code (use sed, python, or any tool)
 4. If the environment needs setup first (deps, env vars, configs), do that
 5. When you think tests should pass, request a test run
+6. If tests still fail after a RUN_TESTS, try a DIFFERENT strategy — do not repeat the same approach
 
 You can chain commands with && or write multi-line scripts. Be thorough but efficient.
 If you need to edit a file, use sed, python, or heredoc — whatever works best.
+
+## Persistence rules
+- You MUST try at least 3 materially different approaches before considering UNFIXABLE
+- When tests fail, investigate from a new angle: read the test file, check types/signatures, \
+look at related modules, check for version mismatches, or try an alternative implementation
+- Do NOT give up just because the first or second attempt fails — that is expected behavior
+- Only declare UNFIXABLE after you have genuinely exhausted multiple distinct strategies
 
 ## Response format
 On each turn, respond with EXACTLY one of:
 - A shell command or script to execute
 - `RUN_TESTS` — when you're ready for the test suite to run
-- `UNFIXABLE` — if you've determined the situation cannot be resolved
+- `UNFIXABLE` — ONLY after you have tried multiple different approaches and are certain the \
+situation cannot be resolved
 
 No explanations, no markdown fences, no commentary. Just the command, RUN_TESTS, or UNFIXABLE.";
 
@@ -258,4 +267,116 @@ pub fn next_variant_id(existing_ids: &[String]) -> String {
         .max()
         .unwrap_or(0);
     format!("v{:03}", max_num + 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -- fix prompt persistence rules --
+
+    #[test]
+    fn fix_prompt_discourages_premature_unfixable() {
+        // The fix prompt must explicitly tell the AI not to give up early.
+        // Without this, models tend to declare UNFIXABLE on the first failure.
+        assert!(
+            BASELINE_FIX_PROMPT.contains("UNFIXABLE"),
+            "fix prompt must mention UNFIXABLE so the AI knows the signal"
+        );
+        assert!(
+            BASELINE_FIX_PROMPT.contains("at least"),
+            "fix prompt must require multiple attempts before UNFIXABLE"
+        );
+        assert!(
+            BASELINE_FIX_PROMPT.contains("different"),
+            "fix prompt must encourage trying different strategies"
+        );
+    }
+
+    #[test]
+    fn fix_prompt_contains_persistence_section() {
+        // The "Persistence rules" section is the key behavioral guardrail.
+        assert!(
+            BASELINE_FIX_PROMPT.contains("Persistence rules"),
+            "fix prompt must have a Persistence rules section"
+        );
+    }
+
+    #[test]
+    fn fix_prompt_suggests_investigation_strategies() {
+        // The prompt should give the AI concrete ideas for what to try,
+        // not just tell it to "try harder".
+        let strategies = ["test file", "imports", "version", "alternative"];
+        for strategy in &strategies {
+            assert!(
+                BASELINE_FIX_PROMPT.to_lowercase().contains(strategy),
+                "fix prompt should suggest investigating: {}",
+                strategy
+            );
+        }
+    }
+
+    #[test]
+    fn fix_prompt_retains_required_placeholders() {
+        // Ensure the prompt changes didn't accidentally remove placeholders
+        // that the manager.rs template engine needs.
+        for ph in &[
+            "{context}",
+            "{original}",
+            "{suggestion}",
+            "{test_cmd}",
+            "{repo_context}",
+            "{project_knowledge}",
+        ] {
+            assert!(
+                BASELINE_FIX_PROMPT.contains(ph),
+                "fix prompt missing required placeholder: {}",
+                ph
+            );
+        }
+    }
+
+    #[test]
+    fn fix_prompt_unfixable_is_last_resort() {
+        // UNFIXABLE in the response format section should be qualified,
+        // not presented as an easy out.
+        assert!(
+            BASELINE_FIX_PROMPT.contains("ONLY after"),
+            "UNFIXABLE should be gated with 'ONLY after' language"
+        );
+    }
+
+    // -- baseline variant validation --
+
+    #[test]
+    fn baseline_variant_passes_validation() {
+        let variant = baseline_variant();
+        let errors = validate_variant(&variant);
+        assert!(
+            errors.is_empty(),
+            "baseline variant should pass validation, got errors: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn baseline_variant_has_correct_id() {
+        let variant = baseline_variant();
+        assert_eq!(variant.id, "v000");
+        assert_eq!(variant.generation, 0);
+        assert!(variant.parent_id.is_none());
+    }
+
+    // -- next_variant_id --
+
+    #[test]
+    fn next_variant_id_from_empty() {
+        assert_eq!(next_variant_id(&[]), "v001");
+    }
+
+    #[test]
+    fn next_variant_id_increments() {
+        let ids = vec!["v000".into(), "v001".into(), "v002".into()];
+        assert_eq!(next_variant_id(&ids), "v003");
+    }
 }

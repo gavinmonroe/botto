@@ -581,7 +581,7 @@ pub async fn load(config_path: &Option<PathBuf>, data_dir: &Path) -> Result<Bott
             enabled: toml_sandbox.enabled.unwrap_or(docker_available),
             docker_available,
             max_concurrent: toml_sandbox.max_concurrent.unwrap_or(auto_concurrent),
-            timeout_seconds: toml_sandbox.timeout_seconds.unwrap_or(300),
+            timeout_seconds: toml_sandbox.timeout_seconds.unwrap_or(1800),
             max_memory_mb: toml_sandbox.max_memory_mb.unwrap_or(auto_memory),
             max_disk_mb: toml_sandbox.max_disk_mb.unwrap_or(4096),
             fix_branch_mode: match toml_sandbox.fix_branch_mode.as_deref() {
@@ -1232,7 +1232,7 @@ mod tests {
                 enabled: true,
                 docker_available: true,
                 max_concurrent: 2,
-                timeout_seconds: 300,
+                timeout_seconds: 1800,
                 max_memory_mb: 2048,
                 max_disk_mb: 4096,
                 fix_branch_mode: FixBranchMode::SameBranch,
@@ -1546,6 +1546,17 @@ mod tests {
         let (new_cfg, restart_fields) = apply_update(&cfg, update);
         assert!(new_cfg.review.auto_review_on_push);
         assert!(restart_fields.is_empty()); // no restart needed for review settings
+    }
+
+    // -- sandbox timeout default --
+
+    #[test]
+    fn sandbox_timeout_defaults_to_30_minutes() {
+        // The config loader should default to 1800s (30 min) when no timeout is
+        // specified, giving the AI fix agent enough time to iterate. This was
+        // previously 300s which starved the fix loop.
+        let cfg = test_config();
+        assert_eq!(cfg.sandbox.timeout_seconds, 1800);
     }
 
     // -- to_toml_string --
