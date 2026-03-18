@@ -2,8 +2,10 @@
 .SYNOPSIS
     Botto secure setup for Windows. Run as Administrator.
 .DESCRIPTION
-    Installs Docker Desktop, Caddy, generates API key, configures firewall,
+    Installs Caddy, generates API key, configures firewall,
     and creates all config files needed to run Botto securely.
+    Botto runs as a native binary (cargo build --release).
+    Docker is optional (only needed for sandbox auto-fix).
 #>
 
 # ─── Self-elevate if not admin (must run BEFORE StrictMode) ──────────────────
@@ -33,7 +35,6 @@ $BOTTO_DIR      = "C:\botto"
 $DATA_DIR       = "$BOTTO_DIR\data"
 $CADDY_PORT     = 8443
 $BOTTO_PORT     = 7700
-$needsReboot    = $false
 
 # ─── Banner ──────────────────────────────────────────────────────────────────
 Write-Host ""
@@ -206,7 +207,7 @@ max_cached_reviews = 500
 Write-Utf8NoBom -Path "$DATA_DIR\botto.toml" -Content $bottoToml
 Write-Host "  Wrote $DATA_DIR\botto.toml"
 
-# docker-compose.yml
+# docker-compose.yml (optional — for sandbox auto-fix if Docker is available)
 $dockerCompose = @"
 services:
   botto:
@@ -224,7 +225,7 @@ services:
 "@
 
 Write-Utf8NoBom -Path "$BOTTO_DIR\docker-compose.yml" -Content $dockerCompose
-Write-Host "  Wrote $BOTTO_DIR\docker-compose.yml"
+Write-Host "  Wrote $BOTTO_DIR\docker-compose.yml (optional, for Docker-based sandbox)"
 
 # Caddyfile
 $caddyfile = @"
@@ -289,15 +290,13 @@ if (-not $wingetExists) {
     exit 1
 }
 
-# Docker Desktop
+# Docker Desktop (optional — only needed for sandbox auto-fix)
 $dockerExists = Get-Command docker -ErrorAction SilentlyContinue
 if (-not $dockerExists) {
-    Write-Host "  Installing Docker Desktop..." -ForegroundColor Yellow
-    winget install Docker.DockerDesktop --accept-source-agreements --accept-package-agreements --silent
-    Write-Host "  Docker Desktop installed. A REBOOT may be required for WSL2." -ForegroundColor Yellow
-    $needsReboot = $true
+    Write-Host "  Docker not found. Sandbox auto-fix will be unavailable." -ForegroundColor DarkGray
+    Write-Host "  Install later with: winget install Docker.DockerDesktop" -ForegroundColor DarkGray
 } else {
-    Write-Host "  Docker already installed: $(docker --version)"
+    Write-Host "  Docker available (sandbox auto-fix enabled): $(docker --version)"
 }
 
 # Caddy
@@ -404,9 +403,20 @@ try {
     }
 } catch {}
 
-# Start Botto via Docker Compose
 Set-Location "$BOTTO_DIR"
-docker compose up -d
+
+# Start Botto as a background process
+`$bottoExe = "$BOTTO_DIR\target\release\botto.exe"
+if (-not (Test-Path `$bottoExe)) {
+    Write-Host "ERROR: botto.exe not found at `$bottoExe" -ForegroundColor Red
+    Write-Host "Build it first: cargo build --release" -ForegroundColor Yellow
+    exit 1
+}
+
+`$bottoLog = "$BOTTO_DIR\data\botto.log"
+`$bottoProcess = Start-Process -FilePath `$bottoExe -RedirectStandardOutput `$bottoLog -RedirectStandardError "$BOTTO_DIR\data\botto-error.log" -PassThru -WindowStyle Hidden
+`$bottoProcess.Id | Set-Content "$BOTTO_DIR\.botto-pid"
+Write-Host "Botto started (PID: `$(`$bottoProcess.Id))" -ForegroundColor Green
 
 # Wait for Botto to be ready
 Write-Host "Waiting for Botto to be ready..." -ForegroundColor Yellow
@@ -425,7 +435,8 @@ while (`$retries -lt 30) {
 }
 if (`$retries -ge 30) {
     Write-Host "WARNING: Botto did not become ready within 60 seconds." -ForegroundColor Red
-    Write-Host "Check logs with: docker compose logs -f" -ForegroundColor Yellow
+    Write-Host "Check logs: $BOTTO_DIR\data\botto.log" -ForegroundColor Yellow
+    Write-Host "Check errors: $BOTTO_DIR\data\botto-error.log" -ForegroundColor Yellow
 }
 
 # Start Caddy
@@ -444,6 +455,7 @@ Write-Host "  Team:   https://`${localIP}:${CADDY_PORT}" -ForegroundColor White
 Write-Host "  Admin:  https://`${localIP}:${CADDY_PORT}/admin?key=<api-key>" -ForegroundColor White
 Write-Host "  Otto:   wss://`${localIP}:${CADDY_PORT}/ws" -ForegroundColor White
 Write-Host ""
+Write-Host "  Logs:   $BOTTO_DIR\data\botto.log" -ForegroundColor DarkGray
 Write-Host "  API Key is in: $API_KEY_FILE" -ForegroundColor DarkGray
 Write-Host ""
 "@
@@ -466,15 +478,27 @@ if (Test-Path `$pidFile) {
     }
     Remove-Item `$pidFile -Force
 } else {
-    # Fallback: kill by name
     Get-Process -Name "caddy" -ErrorAction SilentlyContinue | Stop-Process -Force
     Write-Host "  Caddy stopped."
 }
 
 Write-Host "Stopping Botto..." -ForegroundColor Yellow
-Set-Location "$BOTTO_DIR"
-docker compose down
-Write-Host "Botto stopped." -ForegroundColor Green
+`$bottoPidFile = "$BOTTO_DIR\.botto-pid"
+if (Test-Path `$bottoPidFile) {
+    `$pid = Get-Content `$bottoPidFile
+    try {
+        Stop-Process -Id `$pid -Force -ErrorAction SilentlyContinue
+        Write-Host "  Botto stopped (PID: `$pid)"
+    } catch {
+        Write-Host "  Botto process not found (already stopped?)"
+    }
+    Remove-Item `$bottoPidFile -Force
+} else {
+    Get-Process -Name "botto" -ErrorAction SilentlyContinue | Stop-Process -Force
+    Write-Host "  Botto stopped."
+}
+
+Write-Host "All services stopped." -ForegroundColor Green
 "@
 
 Write-Utf8NoBom -Path "$BOTTO_DIR\stop.ps1" -Content $stopScript
@@ -486,10 +510,26 @@ $statusScript = @"
 Write-Host ""
 Write-Host "=== Botto Status ===" -ForegroundColor Cyan
 
-# Docker container
+# Botto process
 Write-Host ""
-Write-Host "Docker:" -ForegroundColor Yellow
-docker compose -f "$BOTTO_DIR\docker-compose.yml" ps 2>&1
+Write-Host "Botto:" -ForegroundColor Yellow
+`$bottoPidFile = "$BOTTO_DIR\.botto-pid"
+if (Test-Path `$bottoPidFile) {
+    `$pid = (Get-Content `$bottoPidFile).Trim()
+    `$proc = Get-Process -Id `$pid -ErrorAction SilentlyContinue
+    if (`$proc) {
+        Write-Host "  Running (PID: `$pid)" -ForegroundColor Green
+    } else {
+        Write-Host "  PID file exists but process is dead (stale)" -ForegroundColor Red
+    }
+} else {
+    `$botto = Get-Process -Name "botto" -ErrorAction SilentlyContinue
+    if (`$botto) {
+        Write-Host "  Running (PID: `$(`$botto.Id)) — no PID file" -ForegroundColor Yellow
+    } else {
+        Write-Host "  Not running" -ForegroundColor Red
+    }
+}
 
 # Caddy process
 Write-Host ""
@@ -531,7 +571,7 @@ Write-Host "  Files created in: $BOTTO_DIR" -ForegroundColor White
 Write-Host ""
 Write-Host "    botto.toml          Config (edit credentials if needed)" -ForegroundColor DarkGray
 Write-Host "    Caddyfile           Reverse proxy config" -ForegroundColor DarkGray
-Write-Host "    docker-compose.yml  Docker config" -ForegroundColor DarkGray
+Write-Host "    docker-compose.yml  Docker config (optional, for sandbox)" -ForegroundColor DarkGray
 Write-Host "    .api-key            Your team API key" -ForegroundColor DarkGray
 Write-Host "    start.ps1           Start Botto + Caddy" -ForegroundColor DarkGray
 Write-Host "    stop.ps1            Stop everything" -ForegroundColor DarkGray
@@ -543,16 +583,12 @@ Write-Host ""
 Write-Host "  IMPORTANT: Save this key now. It's also stored in $API_KEY_FILE" -ForegroundColor Red
 Write-Host ""
 
-if ($needsReboot) {
-    Write-Host "  NOTE: Docker Desktop was just installed." -ForegroundColor Red
-    Write-Host "  You may need to REBOOT for WSL2, then run:" -ForegroundColor Red
-} else {
-    Write-Host "  Next steps:" -ForegroundColor Yellow
-}
+Write-Host ""
+Write-Host "  Next steps:" -ForegroundColor Yellow
 
 Write-Host ""
-Write-Host "    1. Copy your Botto source/binary into $BOTTO_DIR" -ForegroundColor White
-Write-Host "       (or build with: cargo build --release)" -ForegroundColor DarkGray
+Write-Host "    1. Build Botto from source:" -ForegroundColor White
+Write-Host "       cd $BOTTO_DIR && cargo build --release" -ForegroundColor Cyan
 Write-Host ""
 Write-Host "    2. Start everything:" -ForegroundColor White
 Write-Host "       powershell -ExecutionPolicy Bypass -File $BOTTO_DIR\start.ps1" -ForegroundColor Cyan
@@ -560,6 +596,8 @@ Write-Host ""
 Write-Host "    3. Tell your team to connect Otto to:" -ForegroundColor White
 Write-Host "       Server:  wss://${localIP}:${CADDY_PORT}/ws" -ForegroundColor Cyan
 Write-Host "       API Key: (the key shown above)" -ForegroundColor Cyan
+Write-Host ""
+Write-Host "    For remote teams, run cloudflare-tunnel-setup.ps1 next." -ForegroundColor Yellow
 Write-Host ""
 
 if ($installTailscale -eq "y" -or $installTailscale -eq "Y") {
