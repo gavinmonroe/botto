@@ -237,7 +237,7 @@ $caddyfile = @"
         path /ws
     }
     handle @websocket {
-        reverse_proxy localhost:${BOTTO_PORT}
+        reverse_proxy 127.0.0.1:${BOTTO_PORT}
     }
 
     # ── GitLab webhooks: authenticated by webhook_secret, not API key ──
@@ -245,7 +245,7 @@ $caddyfile = @"
         path /api/webhooks/*
     }
     handle @webhooks {
-        reverse_proxy localhost:${BOTTO_PORT}
+        reverse_proxy 127.0.0.1:${BOTTO_PORT}
     }
 
     # ── Health checks from localhost only ──
@@ -254,7 +254,7 @@ $caddyfile = @"
         path /health /ready
     }
     handle @local_health {
-        reverse_proxy localhost:${BOTTO_PORT}
+        reverse_proxy 127.0.0.1:${BOTTO_PORT}
     }
 
     # ── Reject anything else without a valid API key ──
@@ -269,7 +269,7 @@ $caddyfile = @"
 
     # ── Forward authorized traffic to Botto (fallback) ──
     handle {
-        reverse_proxy localhost:${BOTTO_PORT}
+        reverse_proxy 127.0.0.1:${BOTTO_PORT}
     }
 }
 "@
@@ -423,7 +423,7 @@ Write-Host "Waiting for Botto to be ready..." -ForegroundColor Yellow
 `$retries = 0
 while (`$retries -lt 30) {
     try {
-        `$response = Invoke-WebRequest -Uri "http://localhost:${BOTTO_PORT}/health" -UseBasicParsing -TimeoutSec 2
+        `$response = Invoke-WebRequest -Uri "http://127.0.0.1:${BOTTO_PORT}/health" -UseBasicParsing -TimeoutSec 2
         if (`$response.StatusCode -eq 200) {
             Write-Host "Botto is ready." -ForegroundColor Green
             break

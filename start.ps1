@@ -24,7 +24,7 @@ if (-not (Test-Path $bottoExe)) {
 }
 
 $bottoLog = "C:\botto\data\botto.log"
-$bottoProcess = Start-Process -FilePath $bottoExe -RedirectStandardOutput $bottoLog -RedirectStandardError "C:\botto\data\botto-error.log" -PassThru -WindowStyle Hidden
+$bottoProcess = Start-Process -FilePath $bottoExe -WorkingDirectory "C:\botto" -RedirectStandardOutput $bottoLog -RedirectStandardError "C:\botto\data\botto-error.log" -PassThru -WindowStyle Hidden
 $bottoProcess.Id | Set-Content "C:\botto\.botto-pid"
 Write-Host "Botto started (PID: $($bottoProcess.Id))" -ForegroundColor Green
 
@@ -33,7 +33,7 @@ Write-Host "Waiting for Botto to be ready..." -ForegroundColor Yellow
 $retries = 0
 while ($retries -lt 30) {
     try {
-        $response = Invoke-WebRequest -Uri "http://localhost:7700/health" -UseBasicParsing -TimeoutSec 2
+        $response = Invoke-WebRequest -Uri "http://127.0.0.1:7700/health" -UseBasicParsing -TimeoutSec 2
         if ($response.StatusCode -eq 200) {
             Write-Host "Botto is ready." -ForegroundColor Green
             break
