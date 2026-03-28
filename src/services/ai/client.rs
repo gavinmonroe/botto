@@ -175,10 +175,15 @@ pub struct Model {
 // ---------------------------------------------------------------------------
 
 fn build_client() -> Client {
-    Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
-        .build()
-        .expect("failed to build HTTP client")
+    static CLIENT: std::sync::OnceLock<Client> = std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            Client::builder()
+                .timeout(std::time::Duration::from_secs(120))
+                .build()
+                .expect("failed to build HTTP client")
+        })
+        .clone()
 }
 
 /// Non-streaming chat completion. Returns the full response.

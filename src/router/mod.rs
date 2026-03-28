@@ -25,6 +25,7 @@ use tracing::{info, warn};
 // ---------------------------------------------------------------------------
 
 pub async fn handle_request(state: &AppState, payload: &Value) -> Value {
+    let start = std::time::Instant::now();
     let msg_type = payload
         .get("type")
         .and_then(|v| v.as_str())
@@ -40,7 +41,7 @@ pub async fn handle_request(state: &AppState, payload: &Value) -> Value {
         .filter(|v| v.is_object())
         .unwrap_or(payload);
 
-    match msg_type {
+    let result = match msg_type {
         "GET_SETTINGS" => handlers::get_settings(state).await,
         "TEST_GITLAB_CONNECTION" => handlers::test_gitlab_connection(state, effective_payload).await,
         "FETCH_PROJECT" => handlers::fetch_project(state, effective_payload).await,
@@ -68,6 +69,22 @@ pub async fn handle_request(state: &AppState, payload: &Value) -> Value {
         "GET_CLUSTER" => handlers::get_cluster(state, effective_payload).await,
         "GET_SERVER_CONFIG" => handlers::get_server_config(state).await,
         "UPDATE_SERVER_CONFIG" => handlers::update_server_config(state, effective_payload).await,
+        "GET_SERVER_STATUS" => handlers::get_server_status(state).await,
+        "GET_PRESENCE" => handlers::get_presence(state, effective_payload).await,
+        "BATCH_PRESENCE" => handlers::batch_presence(state, effective_payload).await,
+        "GET_ACTIVE_REVIEWS" => handlers::get_active_reviews(state).await,
+        "GET_CONNECTED_USERS" => handlers::get_connected_users(state).await,
+        "GET_SANDBOX_JOBS" => handlers::get_sandbox_jobs(state, effective_payload).await,
+        "GET_REVIEW_HISTORY" => handlers::get_review_history(state, effective_payload).await,
+        "GET_FILE_INDEX_STATUS" => handlers::get_file_index_status(state, effective_payload).await,
+        "INVALIDATE_REVIEW_CACHE" => handlers::invalidate_review_cache(state, effective_payload).await,
+        "PING" => handlers::ping().await,
+        "GET_REVIEWER_PREFS" => handlers::get_reviewer_prefs(state, effective_payload).await,
+        "GET_LATEST_CACHED_REVIEW" => handlers::get_latest_cached_review(state, effective_payload).await,
+        "GET_WARM_POOL_STATUS" => handlers::get_warm_pool_status(state).await,
+        "GET_EVENTS" => handlers::get_events(state, effective_payload).await,
+        "GET_WORKFLOW_RUNS" => handlers::get_workflow_runs(state, effective_payload).await,
+        "GET_WORKFLOWS" => handlers::get_workflows(state, effective_payload).await,
         _ => {
             warn!("unknown request type: {}", msg_type);
             serde_json::json!({
@@ -75,7 +92,14 @@ pub async fn handle_request(state: &AppState, payload: &Value) -> Value {
                 "error": format!("unknown request type: {}", msg_type)
             })
         }
+    };
+
+    let elapsed = start.elapsed();
+    if elapsed.as_millis() > 500 {
+        info!("request {} took {:.1}ms", msg_type, elapsed.as_secs_f64() * 1000.0);
     }
+
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -101,14 +125,18 @@ pub async fn handle_stream(
             stream_id: stream_id.to_string(),
             chunk,
         };
-        let _ = tx.send(serde_json::to_string(&msg).unwrap());
+        if let Ok(s) = serde_json::to_string(&msg) {
+            let _ = tx.send(s);
+        }
     };
 
     let send_end = || {
         let msg = WsOutbound::StreamEnd {
             stream_id: stream_id.to_string(),
         };
-        let _ = tx.send(serde_json::to_string(&msg).unwrap());
+        if let Ok(s) = serde_json::to_string(&msg) {
+            let _ = tx.send(s);
+        }
     };
 
     match stream_type {
@@ -174,7 +202,9 @@ pub async fn handle_viewing_mr(
                 review,
                 file_diff_hashes: file_hashes,
             };
-            let _ = tx.send(serde_json::to_string(&msg).unwrap());
+            if let Ok(s) = serde_json::to_string(&msg) {
+                let _ = tx.send(s);
+            }
         }
     }
 
@@ -203,7 +233,9 @@ pub async fn handle_viewing_mr(
                 mr_iid: mr.mr_iid,
                 actions: actions_json,
             };
-            let _ = tx.send(serde_json::to_string(&msg).unwrap());
+            if let Ok(s) = serde_json::to_string(&msg) {
+                let _ = tx.send(s);
+            }
         }
     }
 
@@ -216,7 +248,7 @@ pub async fn handle_viewing_mr(
             mr_iid: Some(mr.mr_iid),
             payload: Some(serde_json::json!({ "user_id": user_id, "viewer_count": viewers.len() })),
         };
-        state.broadcast_to_mr_except(mr, &serde_json::to_string(&msg).unwrap(), conn_id);
+        state.broadcast_to_mr_except(mr, &serde_json::to_string(&msg).unwrap_or_default(), conn_id);
     }
 
     // Send presence snapshot — all other viewers' file positions.
@@ -226,14 +258,16 @@ pub async fn handle_viewing_mr(
         let msg = crate::api::ws::WsOutbound::PresenceSnapshot {
             viewers: presence,
         };
-        let _ = tx.send(serde_json::to_string(&msg).unwrap());
+        if let Ok(s) = serde_json::to_string(&msg) {
+            let _ = tx.send(s);
+        }
     }
 
     // Proactively push conflict radar and cluster data on MR join.
     // Spawned as a background task so the join response isn't blocked by the
-    // GitLab API call to resolve project_id. Data arrives shortly after join,
-    // same pattern as CACHED_REVIEW. If the file index is empty (no webhooks
-    // received yet), the client-side GET_CONFLICTS/GET_CLUSTER handles it.
+    // GitLab API calls. Data arrives shortly after join, same pattern as
+    // CACHED_REVIEW. The file index is lazily populated on first access —
+    // if no webhook has ever fired, we fetch from GitLab on-demand.
     {
         let state = state.clone();
         let mr = mr.clone();
@@ -256,6 +290,23 @@ pub async fn handle_viewing_mr(
                 None => return, // Can't resolve — client will use GET_CONFLICTS/GET_CLUSTER
             };
 
+            // Ensure the file index is populated for this MR and the project.
+            // This is the self-healing path: if Botto restarted, webhooks aren't
+            // configured, or the MR predates Botto, we fetch from GitLab now.
+            let mut project_freshly_populated = false;
+            if let Err(e) = crate::services::file_index::ensure_populated(
+                state.pool(), &gl_cfg, project_id, mr.mr_iid,
+            ).await {
+                tracing::warn!("file index ensure_populated failed for !{}: {}", mr.mr_iid, e);
+            }
+            if let Ok(count) = crate::services::file_index::ensure_project_populated(
+                state.pool(), &gl_cfg, project_id,
+            ).await {
+                if count > 0 {
+                    project_freshly_populated = true;
+                }
+            }
+
             // Push conflict report
             if cfg.conflict.enabled {
                 if let Ok(report) = crate::services::conflict::detector::detect_conflicts(
@@ -277,8 +328,26 @@ pub async fn handle_viewing_mr(
                 }
             }
 
-            // Push cluster data
+            // Push cluster data — run detection first if the index was just populated
             if cfg.cluster.enabled {
+                if project_freshly_populated {
+                    let ticket_strategy =
+                        crate::services::cluster::strategies::ticket::TicketClusterStrategy;
+                    let file_strategy =
+                        crate::services::cluster::strategies::file_overlap::FileOverlapStrategy {
+                            jaccard_threshold: cfg.cluster.file_overlap_threshold,
+                            max_cluster_size: cfg.cluster.max_cluster_size,
+                        };
+                    let strategies: Vec<&dyn crate::services::cluster::strategies::ClusterStrategy> =
+                        vec![&ticket_strategy, &file_strategy];
+
+                    if let Err(e) = crate::services::cluster::detector::detect_clusters(
+                        state.pool(), &gl_cfg, project_id, mr.mr_iid, &strategies,
+                    ).await {
+                        tracing::warn!("on-demand cluster detection failed for !{}: {}", mr.mr_iid, e);
+                    }
+                }
+
                 if let Ok(rows) = db::queries::get_clusters_for_mr(
                     state.pool(),
                     project_id,
@@ -376,7 +445,7 @@ pub async fn handle_comment_action(
             action: action.to_string(),
             edited_body: edited_body.map(|s| s.to_string()),
         };
-        state.broadcast_to_mr_except(&mr, &serde_json::to_string(&msg).unwrap(), conn_id);
+        state.broadcast_to_mr_except(&mr, &serde_json::to_string(&msg).unwrap_or_default(), conn_id);
     }
 
     // Publish event
@@ -424,7 +493,7 @@ pub async fn handle_fix_request(
             error: Some("sandbox is not enabled on this server".into()),
             fix_mr_url: None,
         };
-        let _ = tx.send(serde_json::to_string(&msg).unwrap());
+        let _ = tx.send(serde_json::to_string(&msg).unwrap_or_default());
         return;
     }
 
@@ -446,7 +515,7 @@ pub async fn handle_fix_request(
         status: "pending".into(),
         detail: "sandbox job queued".into(),
     };
-    let _ = tx.send(serde_json::to_string(&msg).unwrap());
+    let _ = tx.send(serde_json::to_string(&msg).unwrap_or_default());
 
     let mr_ref = MrRef {
         project_path: project_path.to_string(),
@@ -642,7 +711,7 @@ pub async fn handle_fix_request(
             };
             // Broadcast to all MR viewers (includes the requester).
             // Don't also send via tx — that would double-deliver to the requester.
-            let complete_msg = serde_json::to_string(&msg).unwrap();
+            let complete_msg = serde_json::to_string(&msg).unwrap_or_default();
             state.broadcast_to_mr(&mr_ref, &complete_msg);
         }
         None => {
@@ -653,7 +722,7 @@ pub async fn handle_fix_request(
                 error: Some("failed to initialize sandbox (Docker not available?)".into()),
                 fix_mr_url: None,
             };
-            let _ = tx.send(serde_json::to_string(&msg).unwrap());
+            let _ = tx.send(serde_json::to_string(&msg).unwrap_or_default());
         }
     }
 }

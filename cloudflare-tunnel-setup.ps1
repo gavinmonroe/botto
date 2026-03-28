@@ -31,7 +31,6 @@ function Write-Utf8NoBom {
 
 # ─── Config ──────────────────────────────────────────────────────────────────
 $BOTTO_DIR  = "C:\botto"
-$CADDY_PORT = 8443
 $TUNNEL_DIR = "$BOTTO_DIR\tunnel"
 
 # ─── Verify prerequisites ───────────────────────────────────────────────────
@@ -110,7 +109,7 @@ if ($mode -eq "1") {
 
 Write-Host ""
 Write-Host "Starting Cloudflare Quick Tunnel..." -ForegroundColor Green
-Write-Host "  Pointing to https://localhost:${CADDY_PORT}" -ForegroundColor DarkGray
+Write-Host "  Pointing to http://127.0.0.1:7700" -ForegroundColor DarkGray
 Write-Host ""
 Write-Host "  The tunnel URL will appear below (look for the .trycloudflare.com line)." -ForegroundColor Yellow
 Write-Host "  Share that URL + the API key with your team." -ForegroundColor Yellow
@@ -123,7 +122,7 @@ Write-Host "  Press Ctrl+C to stop the tunnel." -ForegroundColor DarkGray
 Write-Host "============================================" -ForegroundColor Cyan
 Write-Host ""
 
-cloudflared tunnel --url https://localhost:${CADDY_PORT} --no-tls-verify
+cloudflared tunnel --url http://127.0.0.1:7700
 "@
 
     Write-Utf8NoBom -Path "$TUNNEL_DIR\start-tunnel.ps1" -Content $startTunnel
@@ -202,9 +201,7 @@ credentials-file: $env:USERPROFILE\.cloudflared\${tunnelId}.json
 
 ingress:
   - hostname: ${hostname}
-    service: https://localhost:${CADDY_PORT}
-    originRequest:
-      noTLSVerify: true
+    service: http://127.0.0.1:7700
   - service: http_status:404
 "@
 

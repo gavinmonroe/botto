@@ -238,6 +238,21 @@ impl WarmPool {
     pub fn count(&self) -> usize {
         self.containers.len()
     }
+
+    /// List warm container info for status reporting.
+    pub fn list_status(&self) -> Vec<(String, String, u64, u64)> {
+        let now = tokio::time::Instant::now();
+        self.containers
+            .iter()
+            .map(|entry| {
+                let key = entry.key().clone();
+                let image = entry.value().image.clone();
+                let age_secs = now.duration_since(entry.value().created_at).as_secs();
+                let idle_secs = now.duration_since(entry.value().last_used).as_secs();
+                (key, image, age_secs, idle_secs)
+            })
+            .collect()
+    }
 }
 
 /// Telemetry collector for harness runs. Zero-cost when None.
@@ -628,7 +643,7 @@ impl SandboxManager {
         let should_keep_warm = self.warm_pool.is_some() && !self.harness_mode;
 
         if should_keep_warm && result.success {
-            let pool = self.warm_pool.as_ref().unwrap();
+            let pool = self.warm_pool.as_ref().expect("warm_pool checked via should_keep_warm");
 
             // Register bot push SHA so webhook doesn't evict us
             if let Some(ref sha) = result.commit_sha {
@@ -652,7 +667,7 @@ impl SandboxManager {
             // Fix failed — evict warm container if it was a warm hit,
             // or destroy the cold container. Don't keep broken state.
             if is_warm {
-                let pool = self.warm_pool.as_ref().unwrap();
+                let pool = self.warm_pool.as_ref().expect("warm_pool checked via should_keep_warm");
                 pool.remove(&mr_key);
                 info!("sandbox fix: evicted failed warm container for {}", mr_key);
             } else {
@@ -737,7 +752,7 @@ impl SandboxManager {
         let knowledge_block = if self.cfg.sandbox.knowledge_cache && !self.harness_mode {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_default()
                 .as_secs() as i64;
 
             match crate::db::queries::get_project_knowledge(&self.pool, &req.project_path, base_image).await {
@@ -841,7 +856,7 @@ impl SandboxManager {
         if self.cfg.sandbox.recipe_cache && !self.harness_mode {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_default()
                 .as_secs() as i64;
 
             if let Ok(Some((commands_json, _steps, created_at, use_count))) =

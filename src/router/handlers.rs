@@ -51,6 +51,14 @@ fn extract_u64(payload: &Value, key: &str) -> Option<u64> {
         .or_else(|| payload.get(&to_camel(key)).and_then(|v| v.as_u64()))
 }
 
+/// Validate a project_path looks reasonable (non-empty, contains a slash, no control chars).
+fn validate_project_path(path: &str) -> bool {
+    !path.is_empty()
+        && path.contains('/')
+        && path.len() <= 500
+        && path.chars().all(|c| !c.is_control())
+}
+
 /// Convert snake_case to camelCase: "project_path" → "projectPath"
 fn to_camel(snake: &str) -> String {
     let mut result = String::new();
@@ -79,6 +87,11 @@ pub async fn get_settings(state: &AppState) -> Value {
         "shared_triage_available": true,
         "gitlab_url": cfg.gitlab.url,
         "ai_configured": !cfg.ai.base_url.is_empty(),
+        "conflict_radar_enabled": cfg.conflict.enabled,
+        "cluster_enabled": cfg.cluster.enabled,
+        "auto_review_on_push": cfg.review.auto_review_on_push,
+        "warm_containers": cfg.sandbox.warm_containers,
+        "version": env!("CARGO_PKG_VERSION"),
     }))
 }
 
@@ -106,7 +119,8 @@ pub async fn test_gitlab_connection(state: &AppState, _payload: &Value) -> Value
 
 pub async fn fetch_project(state: &AppState, payload: &Value) -> Value {
     let project_path = match extract_str(payload, "project_path") {
-        Some(p) => p,
+        Some(p) if validate_project_path(p) => p,
+        Some(_) => return err("invalid project_path format"),
         None => return err("missing project_path"),
     };
     let cfg = state.config();
@@ -579,8 +593,8 @@ pub async fn stream_review(
                     stream_id: stream_id.to_string(),
                     chunk: json!({ "type": "STREAM_TASK_ERROR", "payload": { "task": "init", "error": format!("invalid mrContext: {}", e) } }),
                 };
-                let _ = tx.send(serde_json::to_string(&msg).unwrap());
-                let _ = tx.send(serde_json::to_string(&WsOutbound::StreamEnd { stream_id: stream_id.to_string() }).unwrap());
+                let _ = tx.send(serde_json::to_string(&msg).unwrap_or_default());
+                let _ = tx.send(serde_json::to_string(&WsOutbound::StreamEnd { stream_id: stream_id.to_string() }).unwrap_or_default());
                 return;
             }
         },
@@ -589,8 +603,8 @@ pub async fn stream_review(
                 stream_id: stream_id.to_string(),
                 chunk: json!({ "type": "STREAM_TASK_ERROR", "payload": { "task": "init", "error": "missing mrContext" } }),
             };
-            let _ = tx.send(serde_json::to_string(&msg).unwrap());
-            let _ = tx.send(serde_json::to_string(&WsOutbound::StreamEnd { stream_id: stream_id.to_string() }).unwrap());
+            let _ = tx.send(serde_json::to_string(&msg).unwrap_or_default());
+            let _ = tx.send(serde_json::to_string(&WsOutbound::StreamEnd { stream_id: stream_id.to_string() }).unwrap_or_default());
             return;
         }
     };
@@ -644,7 +658,7 @@ pub async fn stream_review(
                 stream_id: stream_id.to_string(),
                 chunk: chunk.clone(),
             };
-            let _ = tx.send(serde_json::to_string(&msg).unwrap());
+            let _ = tx.send(serde_json::to_string(&msg).unwrap_or_default());
         }
 
         // 2. If already complete, we're done
@@ -653,7 +667,7 @@ pub async fn stream_review(
                 serde_json::to_string(&WsOutbound::StreamEnd {
                     stream_id: stream_id.to_string(),
                 })
-                .unwrap(),
+                .unwrap_or_default(),
             );
             return;
         }
@@ -673,7 +687,7 @@ pub async fn stream_review(
                                 stream_id: stream_id_owned.clone(),
                                 chunk: c,
                             };
-                            let _ = tx_clone.send(serde_json::to_string(&msg).unwrap());
+                            let _ = tx_clone.send(serde_json::to_string(&msg).unwrap_or_default());
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                             tracing::warn!("late-join lagged by {} chunks", n);
@@ -693,13 +707,17 @@ pub async fn stream_review(
             serde_json::to_string(&WsOutbound::StreamEnd {
                 stream_id: stream_id.to_string(),
             })
-            .unwrap(),
+            .unwrap_or_default(),
         );
         return;
     }
 
     // --- No in-flight review: we already inserted via entry() above ---
-    let in_flight = state.in_flight().get(&mr_key).unwrap().clone();
+    // Safe to unwrap: we just inserted in the Vacant arm above and no code
+    // path removes it before this point. Use expect for clarity.
+    let in_flight = state.in_flight().get(&mr_key)
+        .expect("in-flight entry was just inserted")
+        .clone();
 
     // Acquire review concurrency permit (limits how many MR reviews run at once).
     // Late-joiners (above) skip this — they piggyback on the existing review.
@@ -709,7 +727,7 @@ pub async fn stream_review(
             let _ = tx.send(serde_json::to_string(&WsOutbound::StreamChunk {
                 stream_id: stream_id.to_string(),
                 chunk: json!({ "type": "STREAM_PROGRESS", "payload": { "message": "waiting for review slot..." } }),
-            }).unwrap());
+            }).unwrap_or_default());
         }
         sem.acquire_owned().await.expect("review semaphore closed")
     };
@@ -754,7 +772,7 @@ pub async fn stream_review(
                 stream_id: stream_id_owned.clone(),
                 chunk,
             };
-            let _ = tx_clone.send(serde_json::to_string(&msg).unwrap());
+            let _ = tx_clone.send(serde_json::to_string(&msg).unwrap_or_default());
 
             // NOTE: We do NOT broadcast to other MR viewers here.
             // Other Ottos that request the same review will late-join via
@@ -801,7 +819,7 @@ pub async fn stream_review(
         serde_json::to_string(&WsOutbound::StreamEnd {
             stream_id: stream_id.to_string(),
         })
-        .unwrap(),
+        .unwrap_or_default(),
     );
 }
 
@@ -820,7 +838,7 @@ pub async fn stream_chat(
             stream_id: stream_id.to_string(),
             chunk,
         };
-        let _ = tx.send(serde_json::to_string(&msg).unwrap());
+        let _ = tx.send(serde_json::to_string(&msg).unwrap_or_default());
     };
 
     // Check AI is configured
@@ -829,7 +847,7 @@ pub async fn stream_chat(
             "type": "STREAM_CHAT_ERROR",
             "payload": { "error": "AI provider not configured on this Botto server" },
         }));
-        let _ = tx.send(serde_json::to_string(&WsOutbound::StreamEnd { stream_id: stream_id.to_string() }).unwrap());
+        let _ = tx.send(serde_json::to_string(&WsOutbound::StreamEnd { stream_id: stream_id.to_string() }).unwrap_or_default());
         return;
     }
 
@@ -911,7 +929,7 @@ pub async fn stream_chat(
                 stream_id: stream_id_owned.clone(),
                 chunk: json!({ "type": "STREAM_CHAT_DELTA", "payload": { "content": delta } }),
             };
-            let _ = tx_clone.send(serde_json::to_string(&msg).unwrap());
+            let _ = tx_clone.send(serde_json::to_string(&msg).unwrap_or_default());
         }
     });
 
@@ -934,7 +952,7 @@ pub async fn stream_chat(
         }
     }
 
-    let _ = tx.send(serde_json::to_string(&WsOutbound::StreamEnd { stream_id: stream_id.to_string() }).unwrap());
+    let _ = tx.send(serde_json::to_string(&WsOutbound::StreamEnd { stream_id: stream_id.to_string() }).unwrap_or_default());
 }
 
 pub async fn stream_inquiry(
@@ -952,7 +970,7 @@ pub async fn stream_inquiry(
             stream_id: stream_id.to_string(),
             chunk,
         };
-        let _ = tx.send(serde_json::to_string(&msg).unwrap());
+        let _ = tx.send(serde_json::to_string(&msg).unwrap_or_default());
     };
 
     // Check AI is configured
@@ -961,7 +979,7 @@ pub async fn stream_inquiry(
             "type": "STREAM_INQUIRY_ERROR",
             "payload": { "error": "AI provider not configured on this Botto server" },
         }));
-        let _ = tx.send(serde_json::to_string(&WsOutbound::StreamEnd { stream_id: stream_id.to_string() }).unwrap());
+        let _ = tx.send(serde_json::to_string(&WsOutbound::StreamEnd { stream_id: stream_id.to_string() }).unwrap_or_default());
         return;
     }
 
@@ -1047,7 +1065,7 @@ pub async fn stream_inquiry(
                 stream_id: stream_id_owned.clone(),
                 chunk: json!({ "type": "STREAM_INQUIRY_DELTA", "payload": { "content": delta } }),
             };
-            let _ = tx_clone.send(serde_json::to_string(&msg).unwrap());
+            let _ = tx_clone.send(serde_json::to_string(&msg).unwrap_or_default());
         }
     });
 
@@ -1070,7 +1088,7 @@ pub async fn stream_inquiry(
         }
     }
 
-    let _ = tx.send(serde_json::to_string(&WsOutbound::StreamEnd { stream_id: stream_id.to_string() }).unwrap());
+    let _ = tx.send(serde_json::to_string(&WsOutbound::StreamEnd { stream_id: stream_id.to_string() }).unwrap_or_default());
 }
 
 // ---------------------------------------------------------------------------
@@ -1191,6 +1209,21 @@ pub async fn get_conflicts(state: &AppState, payload: &Value) -> Value {
         }
     };
 
+    // Ensure the file index is populated for this MR and other open MRs in
+    // the project. Without this, conflict detection returns empty results when
+    // no webhook has fired (cold start, no webhook configured, Botto restart).
+    if let Err(e) = crate::services::file_index::ensure_populated(
+        state.pool(), &gl_cfg, project_id, mr_iid,
+    ).await {
+        tracing::warn!("file index ensure_populated failed for !{}: {}", mr_iid, e);
+    }
+    // Populate other open MRs so there's something to conflict against.
+    if let Err(e) = crate::services::file_index::ensure_project_populated(
+        state.pool(), &gl_cfg, project_id,
+    ).await {
+        tracing::warn!("file index ensure_project_populated failed for project {}: {}", project_id, e);
+    }
+
     match crate::services::conflict::detector::detect_conflicts(
         state.pool(),
         &gl_cfg,
@@ -1234,6 +1267,49 @@ pub async fn get_cluster(state: &AppState, payload: &Value) -> Value {
             }
         }
     };
+
+    let gl_cfg = crate::services::gitlab::client::GitLabConfig {
+        base_url: cfg.gitlab.url.clone(),
+        token: cfg.gitlab.bot_token.clone(),
+    };
+
+    // Ensure the file index is populated for this MR and the project.
+    // If any MRs were freshly populated, run cluster detection so we have
+    // results to return (clusters are only created by detect_clusters, not
+    // by file index population alone).
+    let mut needs_detection = false;
+    if let Ok(true) = crate::services::file_index::ensure_populated(
+        state.pool(), &gl_cfg, project_id, mr_iid,
+    ).await {
+        needs_detection = true;
+    }
+    if let Ok(count) = crate::services::file_index::ensure_project_populated(
+        state.pool(), &gl_cfg, project_id,
+    ).await {
+        if count > 0 {
+            needs_detection = true;
+        }
+    }
+
+    // Run cluster detection if we just populated the index — otherwise
+    // there are no cluster rows to query.
+    if needs_detection {
+        let ticket_strategy =
+            crate::services::cluster::strategies::ticket::TicketClusterStrategy;
+        let file_strategy =
+            crate::services::cluster::strategies::file_overlap::FileOverlapStrategy {
+                jaccard_threshold: cfg.cluster.file_overlap_threshold,
+                max_cluster_size: cfg.cluster.max_cluster_size,
+            };
+        let strategies: Vec<&dyn crate::services::cluster::strategies::ClusterStrategy> =
+            vec![&ticket_strategy, &file_strategy];
+
+        if let Err(e) = crate::services::cluster::detector::detect_clusters(
+            state.pool(), &gl_cfg, project_id, mr_iid, &strategies,
+        ).await {
+            tracing::warn!("on-demand cluster detection failed for !{}: {}", mr_iid, e);
+        }
+    }
 
     match db::queries::get_clusters_for_mr(state.pool(), project_id, mr_iid as i64).await {
         Ok(rows) => {
@@ -1323,6 +1399,462 @@ pub async fn update_server_config(state: &AppState, payload: &Value) -> Value {
         "restart_fields": restart_fields,
         "config": serde_json::to_value(&response).unwrap_or_default(),
     }))
+}
+
+// ---------------------------------------------------------------------------
+// Server status (lightweight — no admin auth required)
+// ---------------------------------------------------------------------------
+
+pub async fn get_server_status(state: &AppState) -> Value {
+    let connected = state.connections().len();
+    let in_flight = state.in_flight().len();
+    let warm = state.warm_pool().map(|p| p.count()).unwrap_or(0);
+    let cfg = state.config();
+
+    ok(json!({
+        "connected_ottos": connected,
+        "in_flight_reviews": in_flight,
+        "sandbox_enabled": cfg.sandbox.enabled,
+        "warm_containers": warm,
+        "ai_configured": !cfg.ai.base_url.is_empty(),
+        "conflict_radar": cfg.conflict.enabled,
+        "cluster_enabled": cfg.cluster.enabled,
+        "version": env!("CARGO_PKG_VERSION"),
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Presence (on-demand query)
+// ---------------------------------------------------------------------------
+
+pub async fn get_presence(state: &AppState, payload: &Value) -> Value {
+    let project_path = match extract_str(payload, "project_path") {
+        Some(p) => p,
+        None => return err("missing project_path"),
+    };
+    let mr_iid = match extract_u64(payload, "mr_iid") {
+        Some(i) => i,
+        None => return err("missing mr_iid"),
+    };
+
+    let mr = crate::types::state::MrRef {
+        project_path: project_path.to_string(),
+        mr_iid,
+    };
+
+    let presence = state.get_mr_presence(&mr, None);
+    let viewer_count = state.viewers_of(&mr).len();
+
+    ok(json!({
+        "project_path": project_path,
+        "mr_iid": mr_iid,
+        "viewer_count": viewer_count,
+        "viewers": presence,
+    }))
+}
+
+pub async fn batch_presence(state: &AppState, payload: &Value) -> Value {
+    let project_path = match extract_str(payload, "project_path") {
+        Some(p) => p,
+        None => return err("missing project_path"),
+    };
+    let mr_iids = match payload.get("mr_iids").and_then(|v| v.as_array()) {
+        Some(arr) => arr.iter().filter_map(|v| v.as_u64()).collect::<Vec<_>>(),
+        None => return err("missing mr_iids array"),
+    };
+
+    // Cap to 50 MRs per request
+    let mr_iids = if mr_iids.len() > 50 { &mr_iids[..50] } else { &mr_iids };
+
+    let results: Vec<Value> = mr_iids
+        .iter()
+        .map(|&iid| {
+            let mr = crate::types::state::MrRef {
+                project_path: project_path.to_string(),
+                mr_iid: iid,
+            };
+            let count = state.viewers_of(&mr).len();
+            json!({ "mr_iid": iid, "viewer_count": count })
+        })
+        .collect();
+
+    ok(json!({ "project_path": project_path, "mrs": results }))
+}
+
+// ---------------------------------------------------------------------------
+// Active reviews
+// ---------------------------------------------------------------------------
+
+pub async fn get_active_reviews(state: &AppState) -> Value {
+    let in_flight = state.in_flight();
+    let reviews: Vec<Value> = in_flight
+        .iter()
+        .map(|entry| {
+            let key = entry.key().clone();
+            let parts: Vec<&str> = key.splitn(2, ':').collect();
+            let (project_path, mr_iid) = if parts.len() == 2 {
+                (parts[0].to_string(), parts[1].parse::<u64>().unwrap_or(0))
+            } else {
+                (key.clone(), 0)
+            };
+            json!({
+                "key": key,
+                "project_path": project_path,
+                "mr_iid": mr_iid,
+                "complete": entry.value().is_complete(),
+            })
+        })
+        .collect();
+
+    ok(json!({
+        "count": reviews.len(),
+        "reviews": reviews,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Connected users
+// ---------------------------------------------------------------------------
+
+pub async fn get_connected_users(state: &AppState) -> Value {
+    let connections = state.connections();
+    let users: Vec<Value> = connections
+        .iter()
+        .filter_map(|entry| {
+            let conn = entry.value();
+            let user_id = conn.user_id.as_ref()?;
+            Some(json!({
+                "user_id": user_id,
+                "display_name": conn.display_name,
+                "avatar_url": conn.avatar_url,
+                "viewing_mr": conn.viewing_mr.as_ref().map(|mr| json!({
+                    "project_path": mr.project_path,
+                    "mr_iid": mr.mr_iid,
+                })),
+            }))
+        })
+        .collect();
+
+    ok(json!({
+        "count": users.len(),
+        "users": users,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Sandbox jobs list (per MR)
+// ---------------------------------------------------------------------------
+
+pub async fn get_sandbox_jobs(state: &AppState, payload: &Value) -> Value {
+    let project_path = match extract_str(payload, "project_path") {
+        Some(p) => p,
+        None => return err("missing project_path"),
+    };
+    let mr_iid = match extract_i64(payload, "mr_iid") {
+        Some(i) => i,
+        None => return err("missing mr_iid"),
+    };
+
+    match db::queries::get_sandbox_jobs_for_mr(state.pool(), project_path, mr_iid).await {
+        Ok(rows) => {
+            let jobs: Vec<Value> = rows
+                .into_iter()
+                .map(|(id, status, comment_id, strategy, commit_sha, error, created_at, updated_at)| {
+                    json!({
+                        "id": id,
+                        "status": status,
+                        "comment_id": comment_id,
+                        "strategy": strategy,
+                        "commit_sha": commit_sha,
+                        "error": error,
+                        "created_at": created_at,
+                        "updated_at": updated_at,
+                    })
+                })
+                .collect();
+            ok(json!({ "jobs": jobs }))
+        }
+        Err(e) => err(&format!("failed to query sandbox jobs: {}", e)),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Review history
+// ---------------------------------------------------------------------------
+
+pub async fn get_review_history(state: &AppState, payload: &Value) -> Value {
+    let project_path = match extract_str(payload, "project_path") {
+        Some(p) => p,
+        None => return err("missing project_path"),
+    };
+
+    match db::queries::list_cached_reviews(state.pool(), project_path).await {
+        Ok(rows) => {
+            let reviews: Vec<Value> = rows
+                .into_iter()
+                .map(|(mr_iid, diff_hash, created_at, expires_at)| {
+                    json!({
+                        "mr_iid": mr_iid,
+                        "diff_hash": diff_hash,
+                        "created_at": created_at,
+                        "expires_at": expires_at,
+                    })
+                })
+                .collect();
+            ok(json!({ "reviews": reviews }))
+        }
+        Err(e) => err(&format!("failed to query review history: {}", e)),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// File index status
+// ---------------------------------------------------------------------------
+
+pub async fn get_file_index_status(state: &AppState, payload: &Value) -> Value {
+    let project_path = match extract_str(payload, "project_path") {
+        Some(p) => p,
+        None => return err("missing project_path"),
+    };
+
+    // Resolve project_id from project_path
+    let project_id = match state.resolve_project_id(project_path).await {
+        Some(id) => id,
+        None => return err("failed to resolve project"),
+    };
+
+    match db::queries::get_file_index_stats(state.pool(), project_id).await {
+        Ok((mr_count, file_count)) => ok(json!({
+            "project_path": project_path,
+            "project_id": project_id,
+            "indexed_mrs": mr_count,
+            "indexed_files": file_count,
+        })),
+        Err(e) => err(&format!("failed to query file index: {}", e)),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cache invalidation
+// ---------------------------------------------------------------------------
+
+pub async fn invalidate_review_cache(state: &AppState, payload: &Value) -> Value {
+    let project_path = match extract_str(payload, "project_path") {
+        Some(p) => p,
+        None => return err("missing project_path"),
+    };
+    let mr_iid = match extract_i64(payload, "mr_iid") {
+        Some(i) => i,
+        None => return err("missing mr_iid"),
+    };
+
+    match db::queries::invalidate_mr_review_cache(state.pool(), project_path, mr_iid).await {
+        Ok(deleted) => ok(json!({
+            "project_path": project_path,
+            "mr_iid": mr_iid,
+            "deleted": deleted,
+        })),
+        Err(e) => err(&format!("failed to invalidate cache: {}", e)),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Ping
+// ---------------------------------------------------------------------------
+
+pub async fn ping() -> Value {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    ok(json!({ "ts": now }))
+}
+
+// ---------------------------------------------------------------------------
+// Reviewer preferences
+// ---------------------------------------------------------------------------
+
+pub async fn get_reviewer_prefs(state: &AppState, payload: &Value) -> Value {
+    let project_path = match extract_str(payload, "project_path") {
+        Some(p) => p,
+        None => return err("missing project_path"),
+    };
+
+    match db::queries::get_reviewer_prefs(state.pool(), project_path).await {
+        Ok(Some((text, updated_at))) => ok(json!({
+            "project_path": project_path,
+            "prefs": text,
+            "updated_at": updated_at,
+        })),
+        Ok(None) => ok(json!({
+            "project_path": project_path,
+            "prefs": null,
+            "updated_at": null,
+        })),
+        Err(e) => err(&format!("failed to get reviewer prefs: {}", e)),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Latest cached review (without requiring diff_hash)
+// ---------------------------------------------------------------------------
+
+pub async fn get_latest_cached_review(state: &AppState, payload: &Value) -> Value {
+    let project_path = match extract_str(payload, "project_path") {
+        Some(p) => p,
+        None => return err("missing project_path"),
+    };
+    let mr_iid = match extract_i64(payload, "mr_iid") {
+        Some(i) => i,
+        None => return err("missing mr_iid"),
+    };
+
+    match db::queries::get_latest_cached_review(state.pool(), project_path, mr_iid).await {
+        Ok(Some(row)) => {
+            let data: Vec<u8> = row.0;
+            let file_hashes: String = row.1;
+            let diff_hash: String = row.2;
+            let review_json = crate::router::decompress_or_raw(&data);
+            match serde_json::from_slice::<Value>(&review_json) {
+                Ok(review) => ok(json!({
+                    "review": review,
+                    "diff_hash": diff_hash,
+                    "file_diff_hashes": file_hashes,
+                })),
+                Err(e) => err(&format!("corrupt cached review: {}", e)),
+            }
+        }
+        Ok(None) => ok(Value::Null),
+        Err(e) => err(&format!("cache read error: {}", e)),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Warm pool status
+// ---------------------------------------------------------------------------
+
+pub async fn get_warm_pool_status(state: &AppState) -> Value {
+    match state.warm_pool() {
+        Some(pool) => {
+            let containers: Vec<Value> = pool.list_status()
+                .into_iter()
+                .map(|(mr_key, image, age_secs, idle_secs)| {
+                    json!({
+                        "mr_key": mr_key,
+                        "image": image,
+                        "age_secs": age_secs,
+                        "idle_secs": idle_secs,
+                    })
+                })
+                .collect();
+            ok(json!({
+                "enabled": true,
+                "count": containers.len(),
+                "containers": containers,
+            }))
+        }
+        None => ok(json!({
+            "enabled": false,
+            "count": 0,
+            "containers": [],
+        })),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Events
+// ---------------------------------------------------------------------------
+
+pub async fn get_events(state: &AppState, payload: &Value) -> Value {
+    let project_path = match extract_str(payload, "project_path") {
+        Some(p) => p,
+        None => return err("missing project_path"),
+    };
+    let mr_iid = extract_i64(payload, "mr_iid");
+    let limit = extract_i64(payload, "limit").unwrap_or(50).min(200);
+
+    match db::queries::get_recent_events(state.pool(), project_path, mr_iid, limit).await {
+        Ok(rows) => {
+            let events: Vec<Value> = rows
+                .into_iter()
+                .map(|(id, event_type, user_id, payload_bytes, created_at)| {
+                    let payload_json = payload_bytes
+                        .and_then(|b| serde_json::from_slice::<Value>(&b).ok());
+                    json!({
+                        "id": id,
+                        "event_type": event_type,
+                        "user_id": user_id,
+                        "payload": payload_json,
+                        "created_at": created_at,
+                    })
+                })
+                .collect();
+            ok(json!({ "events": events }))
+        }
+        Err(e) => err(&format!("failed to query events: {}", e)),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Workflow runs
+// ---------------------------------------------------------------------------
+
+pub async fn get_workflow_runs(state: &AppState, payload: &Value) -> Value {
+    let limit = extract_i64(payload, "limit").unwrap_or(20).min(100);
+
+    match db::queries::list_workflow_runs(state.pool(), limit).await {
+        Ok(rows) => {
+            let runs: Vec<Value> = rows
+                .into_iter()
+                .map(|(id, workflow_id, trigger_type, trigger_data, status, step_states, verification, started_at, completed_at)| {
+                    json!({
+                        "id": id,
+                        "workflow_id": workflow_id,
+                        "trigger_type": trigger_type,
+                        "trigger_data": trigger_data.and_then(|d| serde_json::from_str::<Value>(&d).ok()),
+                        "status": status,
+                        "step_states": serde_json::from_str::<Value>(&step_states).unwrap_or_default(),
+                        "final_verification": verification.and_then(|v| serde_json::from_str::<Value>(&v).ok()),
+                        "started_at": started_at,
+                        "completed_at": completed_at,
+                    })
+                })
+                .collect();
+            ok(json!({ "runs": runs }))
+        }
+        Err(e) => err(&format!("failed to query workflow runs: {}", e)),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Workflows list
+// ---------------------------------------------------------------------------
+
+pub async fn get_workflows(state: &AppState, payload: &Value) -> Value {
+    let enabled_only = payload.get("enabled_only").and_then(|v| v.as_bool()).unwrap_or(true);
+
+    match db::queries::list_workflows(state.pool(), enabled_only).await {
+        Ok(rows) => {
+            let workflows: Vec<Value> = rows
+                .into_iter()
+                .map(|(id, name, description, project_id, definition, enabled, created_by, created_at, updated_at)| {
+                    json!({
+                        "id": id,
+                        "name": name,
+                        "description": description,
+                        "project_id": project_id,
+                        "definition": serde_json::from_str::<Value>(&definition).unwrap_or_default(),
+                        "enabled": enabled,
+                        "created_by": created_by,
+                        "created_at": created_at,
+                        "updated_at": updated_at,
+                    })
+                })
+                .collect();
+            ok(json!({ "workflows": workflows }))
+        }
+        Err(e) => err(&format!("failed to query workflows: {}", e)),
+    }
 }
 
 /// Decompress gzip data to a string. Returns None on failure.

@@ -60,11 +60,17 @@ Write-Host "============================================" -ForegroundColor Cyan
 Write-Host "  Botto is running securely" -ForegroundColor Cyan
 Write-Host "============================================" -ForegroundColor Cyan
 Write-Host ""
-Write-Host "  Local:  https://localhost:8443" -ForegroundColor White
-Write-Host "  Team:   https://${localIP}:8443" -ForegroundColor White
-Write-Host "  Admin:  https://${localIP}:8443/admin?key=<api-key>" -ForegroundColor White
-Write-Host "  Otto:   wss://${localIP}:8443/ws" -ForegroundColor White
+Write-Host "  Local:       https://localhost:8443" -ForegroundColor White
+Write-Host "  Team:        https://${localIP}:8443" -ForegroundColor White
 Write-Host ""
-Write-Host "  Logs:   C:\botto\data\botto.log" -ForegroundColor DarkGray
-Write-Host "  API Key is in: C:\botto\.api-key" -ForegroundColor DarkGray
+Write-Host "  Admin:       https://${localIP}:8443/admin?key=<api-key>" -ForegroundColor White
+Write-Host "  Workflows:   https://${localIP}:8443/admin/workflows?key=<api-key>" -ForegroundColor White
+Write-Host "  Directives:  https://${localIP}:8443/admin/directives?key=<api-key>" -ForegroundColor White
+Write-Host ""
+Write-Host "  Otto WS:     wss://${localIP}:8443/ws" -ForegroundColor White
+Write-Host "  GitLab Hook: https://${localIP}:8443/api/webhooks/gitlab" -ForegroundColor White
+Write-Host "  Slack Events:https://${localIP}:8443/api/webhooks/slack/events" -ForegroundColor White
+Write-Host ""
+Write-Host "  Logs:        C:\botto\data\botto.log" -ForegroundColor DarkGray
+Write-Host "  API Key:     C:\botto\.api-key" -ForegroundColor DarkGray
 Write-Host ""

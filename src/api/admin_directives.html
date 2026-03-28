@@ -1,0 +1,382 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Botto — Directives</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#0d1117;--surface:#161b22;--surface2:#21262d;
+  --border:#30363d;--text:#c9d1d9;--text2:#8b949e;
+  --primary:#58a6ff;--danger:#f78166;--success:#3fb950;--warning:#d29922;
+  --input-bg:#0d1117;--radius:6px;--font:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;
+}
+@media(prefers-color-scheme:light){
+  :root{
+    --bg:#f6f8fa;--surface:#ffffff;--surface2:#f0f2f5;
+    --border:#d0d7de;--text:#1f2328;--text2:#656d76;
+    --primary:#0969da;--danger:#cf222e;--success:#1a7f37;--warning:#9a6700;
+    --input-bg:#ffffff;
+  }
+}
+body{font-family:var(--font);font-size:14px;color:var(--text);background:var(--bg);line-height:1.5}
+a{color:var(--primary);text-decoration:none}
+a:hover{text-decoration:underline}
+
+.wrap{max-width:960px;margin:0 auto;padding:24px 16px 64px}
+.top{display:flex;align-items:center;justify-content:space-between;margin-bottom:24px;padding-bottom:16px;border-bottom:1px solid var(--border)}
+.top h1{font-size:18px;font-weight:600}
+.top-links{display:flex;gap:16px;font-size:13px}
+
+.section{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);margin-bottom:12px;overflow:hidden}
+.section-header{padding:10px 12px;font-size:13px;font-weight:600;border-bottom:1px solid var(--border);background:var(--surface2);display:flex;align-items:center;justify-content:space-between}
+
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{text-align:left;padding:8px 12px;font-weight:600;font-size:12px;color:var(--text2);border-bottom:1px solid var(--border);background:var(--surface2)}
+td{padding:8px 12px;border-bottom:1px solid var(--border)}
+tr:last-child td{border-bottom:none}
+tr:hover{background:var(--surface2)}
+
+.status{display:inline-block;padding:1px 8px;border-radius:10px;font-size:11px;font-weight:600}
+.status-active,.status-running{background:rgba(56,139,253,0.15);color:var(--primary)}
+.status-completed,.status-done{background:rgba(63,185,80,0.15);color:var(--success)}
+.status-failed,.status-error{background:rgba(248,81,73,0.15);color:var(--danger)}
+.status-waiting_for_human{background:rgba(210,153,34,0.15);color:var(--warning)}
+.status-paused{background:rgba(210,153,34,0.15);color:var(--warning)}
+.status-retired,.status-cancelled{background:rgba(139,148,158,0.15);color:var(--text2)}
+.status-pending,.status-created,.status-triaged{background:rgba(139,148,158,0.15);color:var(--text2)}
+.status-in_progress{background:rgba(56,139,253,0.15);color:var(--primary)}
+.status-skipped{background:rgba(139,148,158,0.15);color:var(--text2)}
+
+.btn{font-family:var(--font);font-size:12px;font-weight:500;padding:4px 12px;border-radius:var(--radius);cursor:pointer;border:1px solid var(--border);background:var(--surface);color:var(--text)}
+.btn:hover{background:var(--surface2)}
+.btn-primary{background:var(--primary);color:#fff;border-color:var(--primary)}
+.btn-primary:hover{opacity:.9}
+.btn-danger{background:var(--danger);color:#fff;border-color:var(--danger)}
+.btn-sm{padding:2px 8px;font-size:11px}
+
+.empty{padding:24px;text-align:center;color:var(--text2);font-size:13px}
+
+.create-form{display:flex;gap:8px;padding:12px;align-items:flex-start}
+.create-form textarea{flex:1;font-family:var(--font);font-size:13px;padding:6px 8px;background:var(--input-bg);color:var(--text);border:1px solid var(--border);border-radius:4px;resize:vertical;min-height:36px}
+.create-form textarea:focus{border-color:var(--primary);outline:none}
+
+.expanded-row{background:var(--surface2)}
+.expanded-detail{padding:12px;border-bottom:1px solid var(--border)}
+.expanded-detail h4{font-size:13px;font-weight:600;margin-bottom:8px}
+
+.controls-row{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-bottom:10px}
+.controls-row label{font-size:12px;color:var(--text2)}
+.priority-slider{width:100px;vertical-align:middle}
+
+.escalation-card{background:var(--surface);border:1px solid var(--warning);border-radius:var(--radius);padding:14px;margin-bottom:12px}
+.escalation-card h3{font-size:14px;font-weight:600;margin-bottom:6px;color:var(--warning)}
+.escalation-card .meta{font-size:12px;color:var(--text2);margin-bottom:8px}
+.escalation-card .reason{margin-bottom:8px;font-size:13px}
+.respond-form{display:flex;gap:8px;align-items:flex-start}
+.respond-form textarea{flex:1;font-family:var(--font);font-size:13px;padding:6px 8px;background:var(--input-bg);color:var(--text);border:1px solid var(--border);border-radius:4px;resize:vertical;min-height:36px}
+.respond-form textarea:focus{border-color:var(--primary);outline:none}
+
+.toast{position:fixed;bottom:20px;right:20px;padding:8px 14px;border-radius:var(--radius);font-size:13px;color:#fff;opacity:0;transition:opacity .2s;pointer-events:none;z-index:100}
+.toast.show{opacity:1}
+.toast-ok{background:var(--success)}.toast-err{background:var(--danger)}
+
+.mono{font-family:monospace;font-size:12px}
+.truncate{max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="top">
+    <h1>Botto Directives</h1>
+    <div class="top-links">
+      <a href="/admin">Settings</a>
+      <a href="/admin/workflows">Workflows</a>
+      <a href="/admin/directives">Directives</a>
+    </div>
+  </div>
+
+  <!-- Create Directive -->
+  <div class="section">
+    <div class="section-header">Create Directive</div>
+    <div class="create-form">
+      <textarea id="create-input" placeholder="Describe what this directive should do..." rows="2"></textarea>
+      <button class="btn btn-primary" onclick="createDirective()">Create</button>
+    </div>
+  </div>
+
+  <!-- Active Directives -->
+  <div class="section">
+    <div class="section-header">Active Directives <span id="directive-count" style="font-weight:400;color:var(--text2);margin-left:8px"></span></div>
+    <div id="directives-content"><div class="empty">Loading...</div></div>
+  </div>
+
+  <!-- Escalations -->
+  <div class="section" id="escalations-section" style="display:none">
+    <div class="section-header" style="color:var(--warning)">Waiting for Human</div>
+    <div id="escalations-content"></div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const KEY = new URLSearchParams(location.search).get('key') || '';
+const headers = {'Content-Type':'application/json'};
+if (KEY) headers['Authorization'] = 'Bearer ' + KEY;
+
+let expandedId = null;
+
+function toast(msg, ok) {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.className = 'toast show ' + (ok ? 'toast-ok' : 'toast-err');
+  setTimeout(() => el.className = 'toast', 3000);
+}
+
+function esc(s) { const d = document.createElement('div'); d.textContent = s || ''; return d.innerHTML; }
+
+function fmtTime(epoch) {
+  if (!epoch) return '-';
+  const d = new Date(epoch * 1000);
+  return d.toLocaleString();
+}
+
+function statusHtml(status) {
+  return '<span class="status status-' + esc(status) + '">' + esc(status) + '</span>';
+}
+
+function truncate(s, len) {
+  if (!s) return '';
+  return s.length > len ? s.slice(0, len) + '...' : s;
+}
+
+// ---------------------------------------------------------------------------
+// Data loading
+// ---------------------------------------------------------------------------
+
+async function apiFetch(url) {
+  const r = await fetch(url, {headers});
+  if (r.status === 401) { toast('Unauthorized', false); return null; }
+  if (r.status === 404) return null;
+  const data = await r.json();
+  return data;
+}
+
+async function apiCall(url, method, body) {
+  const opts = {method, headers};
+  if (body !== undefined) opts.body = JSON.stringify(body);
+  const r = await fetch(url, opts);
+  if (r.status === 401) { toast('Unauthorized', false); return null; }
+  return await r.json();
+}
+
+async function loadDirectives() {
+  const data = await apiFetch('/api/directives');
+  if (!data) return;
+  const directives = data.directives || data || [];
+  const list = Array.isArray(directives) ? directives : [];
+
+  document.getElementById('directive-count').textContent = list.length ? '(' + list.length + ')' : '';
+
+  const el = document.getElementById('directives-content');
+  if (list.length === 0) {
+    el.innerHTML = '<div class="empty">No directives yet. Create one above.</div>';
+    return;
+  }
+
+  // Separate escalations
+  const escalated = list.filter(d => d.status === 'waiting_for_human');
+  renderEscalations(escalated);
+
+  let html = '<table><tr><th>Name</th><th>Intent</th><th>Status</th><th>Priority</th><th>Poll Interval</th><th>Last Poll</th><th>Sessions</th></tr>';
+  for (const d of list) {
+    const isExpanded = expandedId === d.id;
+    const intent = truncate(d.intent || d.description || '', 50);
+    const sessions = d.active_sessions != null ? d.active_sessions : (d.activeSessions != null ? d.activeSessions : '-');
+    const pollInterval = d.poll_interval || d.pollInterval || '-';
+    const lastPoll = fmtTime(d.last_poll || d.lastPoll);
+    const priority = d.priority != null ? d.priority : '-';
+
+    html += '<tr style="cursor:pointer" class="' + (isExpanded ? 'expanded-row' : '') + '" onclick="toggleExpand(\'' + esc(d.id) + '\')">' +
+      '<td><strong>' + esc(d.name || d.id.slice(0, 12)) + '</strong></td>' +
+      '<td class="truncate">' + esc(intent) + '</td>' +
+      '<td>' + statusHtml(d.status) + '</td>' +
+      '<td>' + esc(String(priority)) + '</td>' +
+      '<td>' + esc(String(pollInterval)) + '</td>' +
+      '<td>' + lastPoll + '</td>' +
+      '<td>' + esc(String(sessions)) + '</td>' +
+      '</tr>';
+
+    if (isExpanded) {
+      html += '<tr><td colspan="7" style="padding:0"><div class="expanded-detail" id="detail-' + esc(d.id) + '">' +
+        '<div class="controls-row">' +
+        (d.status !== 'retired' ?
+          '<button class="btn btn-sm" onclick="event.stopPropagation();togglePause(\'' + esc(d.id) + '\',\'' + esc(d.status) + '\')">' +
+          (d.status === 'paused' ? 'Resume' : 'Pause') + '</button>' : '') +
+        ' <label>Priority: <input type="range" class="priority-slider" min="0" max="10" value="' + (d.priority || 5) + '" ' +
+        'onchange="event.stopPropagation();updatePriority(\'' + esc(d.id) + '\', this.value)" ' +
+        'onclick="event.stopPropagation()"></label>' +
+        ' <span id="pri-val-' + esc(d.id) + '" style="font-size:12px;min-width:16px">' + (d.priority || 5) + '</span>' +
+        (d.status !== 'retired' ?
+          ' <button class="btn btn-sm btn-danger" onclick="event.stopPropagation();retireDirective(\'' + esc(d.id) + '\')">Retire</button>' : '') +
+        '</div>' +
+        '<h4>Work Items</h4>' +
+        '<div id="items-' + esc(d.id) + '"><div class="empty">Loading work items...</div></div>' +
+        '</div></td></tr>';
+    }
+  }
+  html += '</table>';
+  el.innerHTML = html;
+
+  if (expandedId) {
+    loadWorkItems(expandedId);
+  }
+}
+
+function renderEscalations(escalated) {
+  const section = document.getElementById('escalations-section');
+  const el = document.getElementById('escalations-content');
+  if (escalated.length === 0) {
+    section.style.display = 'none';
+    return;
+  }
+  section.style.display = '';
+
+  let html = '';
+  for (const d of escalated) {
+    const esc_msg = d.escalation || {};
+    const message = esc_msg.message || esc_msg.reason || d.escalation_message || 'Waiting for human input';
+
+    html += '<div class="escalation-card">' +
+      '<h3>' + esc(d.name || d.id.slice(0, 12)) + ' — needs attention</h3>' +
+      '<div class="meta">Directive ' + esc(d.id.slice(0, 8)) + '</div>' +
+      '<div class="reason">' + esc(message) + '</div>' +
+      '<div class="respond-form">' +
+      '<textarea id="esc-resp-' + esc(d.id) + '" placeholder="Type your response..." rows="2"></textarea>' +
+      '<button class="btn btn-primary" onclick="respondToEscalation(\'' + esc(d.id) + '\')">Respond</button>' +
+      '</div>' +
+      '</div>';
+  }
+  el.innerHTML = html;
+}
+
+async function loadWorkItems(directiveId) {
+  const el = document.getElementById('items-' + directiveId);
+  if (!el) return;
+
+  const data = await apiFetch('/api/directives/' + directiveId + '/items');
+  if (!data) { el.innerHTML = '<div class="empty">Failed to load work items.</div>'; return; }
+
+  const items = data.items || data || [];
+  const list = Array.isArray(items) ? items : [];
+
+  if (list.length === 0) {
+    el.innerHTML = '<div class="empty">No work items yet.</div>';
+    return;
+  }
+
+  let html = '<table><tr><th>External ID</th><th>Title</th><th>Status</th><th>Triage Reason</th><th>Session</th></tr>';
+  for (const item of list) {
+    const extId = item.external_id || item.externalId || '-';
+    const title = item.title || '-';
+    const status = item.status || '-';
+    const triageReason = item.triage_reason || item.triageReason || '-';
+    const sessionId = item.session_id || item.sessionId || '';
+    const sessionLink = sessionId
+      ? '<a href="/admin/workflows?key=' + encodeURIComponent(KEY) + '#session-' + esc(sessionId) + '" onclick="event.stopPropagation()">' + esc(sessionId.slice(0, 8)) + '</a>'
+      : '-';
+
+    html += '<tr>' +
+      '<td class="mono">' + esc(extId) + '</td>' +
+      '<td>' + esc(truncate(title, 60)) + '</td>' +
+      '<td>' + statusHtml(status) + '</td>' +
+      '<td>' + esc(truncate(triageReason, 60)) + '</td>' +
+      '<td>' + sessionLink + '</td>' +
+      '</tr>';
+  }
+  html += '</table>';
+  el.innerHTML = html;
+}
+
+// ---------------------------------------------------------------------------
+// Actions
+// ---------------------------------------------------------------------------
+
+function toggleExpand(id) {
+  expandedId = expandedId === id ? null : id;
+  loadDirectives();
+}
+
+async function createDirective() {
+  const input = document.getElementById('create-input');
+  const description = input.value.trim();
+  if (!description) { toast('Please enter a description', false); return; }
+
+  const data = await apiCall('/api/directives', 'POST', {description});
+  if (!data) return;
+  if (data.error) { toast(data.error, false); return; }
+  toast('Directive created', true);
+  input.value = '';
+  loadDirectives();
+}
+
+async function togglePause(id, currentStatus) {
+  const newStatus = currentStatus === 'paused' ? 'active' : 'paused';
+  const data = await apiCall('/api/directives/' + id, 'PUT', {status: newStatus});
+  if (!data) return;
+  if (data.error) { toast(data.error, false); return; }
+  toast('Directive ' + newStatus, true);
+  loadDirectives();
+}
+
+async function updatePriority(id, value) {
+  const label = document.getElementById('pri-val-' + id);
+  if (label) label.textContent = value;
+  const data = await apiCall('/api/directives/' + id, 'PUT', {priority: parseInt(value)});
+  if (!data) return;
+  if (data.error) { toast(data.error, false); return; }
+  toast('Priority updated', true);
+}
+
+async function retireDirective(id) {
+  if (!confirm('Retire this directive? This cannot be undone.')) return;
+  const r = await fetch('/api/directives/' + id, {method: 'DELETE', headers});
+  if (r.status === 401) { toast('Unauthorized', false); return; }
+  const data = await r.json();
+  if (data.error) { toast(data.error, false); return; }
+  toast('Directive retired', true);
+  expandedId = null;
+  loadDirectives();
+}
+
+async function respondToEscalation(id) {
+  const textarea = document.getElementById('esc-resp-' + id);
+  const content = textarea ? textarea.value.trim() : '';
+  if (!content) { toast('Please type a response', false); return; }
+
+  const data = await apiCall('/api/directives/' + id, 'PUT', {
+    status: 'active',
+    human_response: content
+  });
+  if (!data) return;
+  if (data.error) { toast(data.error, false); return; }
+  toast('Response sent, directive resuming', true);
+  textarea.value = '';
+  loadDirectives();
+}
+
+// ---------------------------------------------------------------------------
+// Polling
+// ---------------------------------------------------------------------------
+
+async function refreshAll() {
+  await loadDirectives();
+}
+
+refreshAll();
+setInterval(refreshAll, 10000);
+</script>
+</body>
+</html>

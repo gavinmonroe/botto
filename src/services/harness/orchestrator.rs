@@ -218,7 +218,7 @@ pub async fn run(
         // Find the winner
         let winner_id = variant_scores
             .iter()
-            .max_by(|a, b| a.mean_score.partial_cmp(&b.mean_score).unwrap())
+            .max_by(|a, b| a.mean_score.partial_cmp(&b.mean_score).unwrap_or(std::cmp::Ordering::Equal))
             .expect("at least one variant")
             .variant_id
             .clone();

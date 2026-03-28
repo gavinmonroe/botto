@@ -1,0 +1,529 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Botto — Workflows</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#0d1117;--surface:#161b22;--surface2:#21262d;
+  --border:#30363d;--text:#c9d1d9;--text2:#8b949e;
+  --primary:#58a6ff;--danger:#f78166;--success:#3fb950;--warning:#d29922;
+  --input-bg:#0d1117;--radius:6px;--font:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;
+}
+@media(prefers-color-scheme:light){
+  :root{
+    --bg:#f6f8fa;--surface:#ffffff;--surface2:#f0f2f5;
+    --border:#d0d7de;--text:#1f2328;--text2:#656d76;
+    --primary:#0969da;--danger:#cf222e;--success:#1a7f37;--warning:#9a6700;
+    --input-bg:#ffffff;
+  }
+}
+body{font-family:var(--font);font-size:14px;color:var(--text);background:var(--bg);line-height:1.5}
+a{color:var(--primary);text-decoration:none}
+a:hover{text-decoration:underline}
+
+.wrap{max-width:960px;margin:0 auto;padding:24px 16px 64px}
+.top{display:flex;align-items:center;justify-content:space-between;margin-bottom:24px;padding-bottom:16px;border-bottom:1px solid var(--border)}
+.top h1{font-size:18px;font-weight:600}
+.top-links{display:flex;gap:16px;font-size:13px}
+
+.tabs{display:flex;gap:0;margin-bottom:20px;border-bottom:2px solid var(--border)}
+.tab{padding:8px 16px;font-size:13px;font-weight:500;cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-2px;color:var(--text2);background:none;border-top:none;border-left:none;border-right:none;font-family:var(--font)}
+.tab:hover{color:var(--text)}
+.tab.active{color:var(--primary);border-bottom-color:var(--primary)}
+.tab .badge{display:inline-block;min-width:18px;padding:0 6px;margin-left:6px;font-size:11px;font-weight:600;line-height:18px;text-align:center;border-radius:10px;background:var(--surface2);color:var(--text2)}
+.tab .badge.alert{background:var(--danger);color:#fff}
+
+.panel{display:none}
+.panel.active{display:block}
+
+.section{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);margin-bottom:12px;overflow:hidden}
+
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{text-align:left;padding:8px 12px;font-weight:600;font-size:12px;color:var(--text2);border-bottom:1px solid var(--border);background:var(--surface2)}
+td{padding:8px 12px;border-bottom:1px solid var(--border)}
+tr:last-child td{border-bottom:none}
+tr:hover{background:var(--surface2)}
+
+.status{display:inline-block;padding:1px 8px;border-radius:10px;font-size:11px;font-weight:600}
+.status-executing,.status-running,.status-planning{background:rgba(56,139,253,0.15);color:var(--primary)}
+.status-completed{background:rgba(63,185,80,0.15);color:var(--success)}
+.status-failed{background:rgba(248,81,73,0.15);color:var(--danger)}
+.status-waiting_for_human{background:rgba(210,153,34,0.15);color:var(--warning)}
+.status-created,.status-evaluating,.status-adapting,.status-pending{background:rgba(139,148,158,0.15);color:var(--text2)}
+.status-cancelled{background:rgba(139,148,158,0.15);color:var(--text2)}
+
+.btn{font-family:var(--font);font-size:12px;font-weight:500;padding:4px 12px;border-radius:var(--radius);cursor:pointer;border:1px solid var(--border);background:var(--surface);color:var(--text)}
+.btn:hover{background:var(--surface2)}
+.btn-primary{background:var(--primary);color:#fff;border-color:var(--primary)}
+.btn-primary:hover{opacity:.9}
+.btn-danger{background:var(--danger);color:#fff;border-color:var(--danger)}
+.btn-sm{padding:2px 8px;font-size:11px}
+
+.empty{padding:24px;text-align:center;color:var(--text2);font-size:13px}
+
+.escalation-card{background:var(--surface);border:1px solid var(--warning);border-radius:var(--radius);padding:14px;margin-bottom:12px}
+.escalation-card h3{font-size:14px;font-weight:600;margin-bottom:6px;color:var(--warning)}
+.escalation-card .meta{font-size:12px;color:var(--text2);margin-bottom:8px}
+.escalation-card .reason{margin-bottom:8px;font-size:13px}
+.escalation-card .need{margin-bottom:10px;font-size:13px;font-style:italic;color:var(--text2)}
+.escalation-card .options{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px}
+.escalation-card .opt-btn{padding:4px 12px;border-radius:var(--radius);border:1px solid var(--border);background:var(--surface2);cursor:pointer;font-size:12px;font-family:var(--font);color:var(--text)}
+.escalation-card .opt-btn:hover{border-color:var(--primary)}
+.escalation-card .opt-btn.selected{border-color:var(--primary);background:rgba(56,139,253,0.15)}
+.respond-form{display:flex;gap:8px;align-items:flex-start}
+.respond-form textarea{flex:1;font-family:var(--font);font-size:13px;padding:6px 8px;background:var(--input-bg);color:var(--text);border:1px solid var(--border);border-radius:4px;resize:vertical;min-height:36px}
+.respond-form textarea:focus{border-color:var(--primary);outline:none}
+
+.detail-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:50}
+.detail-overlay.show{display:flex;align-items:center;justify-content:center}
+.detail-panel{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);width:90%;max-width:700px;max-height:80vh;overflow-y:auto;padding:20px}
+.detail-panel h2{font-size:16px;margin-bottom:12px;display:flex;align-items:center;justify-content:space-between}
+.detail-panel .close-btn{cursor:pointer;font-size:18px;color:var(--text2);background:none;border:none}
+.detail-panel .close-btn:hover{color:var(--text)}
+
+.msg-thread{max-height:300px;overflow-y:auto;border:1px solid var(--border);border-radius:var(--radius);padding:8px;margin-top:8px}
+.msg{padding:6px 10px;margin-bottom:6px;border-radius:var(--radius);font-size:13px;white-space:pre-wrap;word-break:break-word}
+.msg-agent{background:var(--surface2);border-left:3px solid var(--primary)}
+.msg-human{background:rgba(63,185,80,0.08);border-left:3px solid var(--success)}
+.msg-meta{font-size:11px;color:var(--text2);margin-bottom:2px}
+
+.toggle-switch{position:relative;display:inline-block;width:36px;height:20px}
+.toggle-switch input{opacity:0;width:0;height:0}
+.toggle-switch .slider{position:absolute;cursor:pointer;inset:0;background:var(--surface2);border:1px solid var(--border);border-radius:10px;transition:.2s}
+.toggle-switch .slider::before{content:"";position:absolute;height:14px;width:14px;left:2px;bottom:2px;background:var(--text2);border-radius:50%;transition:.2s}
+.toggle-switch input:checked+.slider{background:var(--success);border-color:var(--success)}
+.toggle-switch input:checked+.slider::before{transform:translateX(16px);background:#fff}
+
+.toast{position:fixed;bottom:20px;right:20px;padding:8px 14px;border-radius:var(--radius);font-size:13px;color:#fff;opacity:0;transition:opacity .2s;pointer-events:none;z-index:100}
+.toast.show{opacity:1}
+.toast-ok{background:var(--success)}.toast-err{background:var(--danger)}
+
+.mono{font-family:monospace;font-size:12px}
+.truncate{max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="top">
+    <h1>Botto Workflows</h1>
+    <div class="top-links">
+      <a href="/admin">Settings</a>
+      <a href="/admin/workflows">Workflows</a>
+    </div>
+  </div>
+
+  <div class="tabs">
+    <button class="tab active" onclick="switchTab('active')" id="tab-active">Active Sessions <span class="badge" id="badge-active">0</span></button>
+    <button class="tab" onclick="switchTab('waiting')" id="tab-waiting">Waiting for Human <span class="badge" id="badge-waiting">0</span></button>
+    <button class="tab" onclick="switchTab('recent')" id="tab-recent">Recent Runs</button>
+    <button class="tab" onclick="switchTab('definitions')" id="tab-definitions">Definitions</button>
+  </div>
+
+  <!-- Active Sessions -->
+  <div class="panel active" id="panel-active">
+    <div class="section">
+      <div id="active-content"><div class="empty">Loading...</div></div>
+    </div>
+  </div>
+
+  <!-- Waiting for Human -->
+  <div class="panel" id="panel-waiting">
+    <div id="waiting-content"><div class="empty">Loading...</div></div>
+  </div>
+
+  <!-- Recent Runs -->
+  <div class="panel" id="panel-recent">
+    <div class="section">
+      <div id="recent-content"><div class="empty">Loading...</div></div>
+    </div>
+  </div>
+
+  <!-- Workflow Definitions -->
+  <div class="panel" id="panel-definitions">
+    <div class="section">
+      <div id="definitions-content"><div class="empty">Loading...</div></div>
+    </div>
+  </div>
+</div>
+
+<!-- Detail overlay -->
+<div class="detail-overlay" id="detail-overlay" onclick="if(event.target===this)closeDetail()">
+  <div class="detail-panel" id="detail-panel"></div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const KEY = new URLSearchParams(location.search).get('key') || '';
+const headers = {'Content-Type':'application/json'};
+if (KEY) headers['Authorization'] = 'Bearer ' + KEY;
+
+function toast(msg, ok) {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.className = 'toast show ' + (ok ? 'toast-ok' : 'toast-err');
+  setTimeout(() => el.className = 'toast', 3000);
+}
+
+function esc(s) { const d = document.createElement('div'); d.textContent = s || ''; return d.innerHTML; }
+
+function fmtTime(epoch) {
+  if (!epoch) return '-';
+  const d = new Date(epoch * 1000);
+  return d.toLocaleString();
+}
+
+function fmtDuration(startEpoch, endEpoch) {
+  const end = endEpoch || Math.floor(Date.now() / 1000);
+  const secs = end - startEpoch;
+  if (secs < 60) return secs + 's';
+  if (secs < 3600) return Math.floor(secs / 60) + 'm ' + (secs % 60) + 's';
+  return Math.floor(secs / 3600) + 'h ' + Math.floor((secs % 3600) / 60) + 'm';
+}
+
+function statusHtml(status) {
+  return '<span class="status status-' + esc(status) + '">' + esc(status) + '</span>';
+}
+
+// ---------------------------------------------------------------------------
+// Tab switching
+// ---------------------------------------------------------------------------
+let currentTab = 'active';
+function switchTab(tab) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+  document.getElementById('tab-' + tab).classList.add('active');
+  document.getElementById('panel-' + tab).classList.add('active');
+  currentTab = tab;
+}
+
+// ---------------------------------------------------------------------------
+// Data loading
+// ---------------------------------------------------------------------------
+let workflowNames = {};
+
+async function apiFetch(url) {
+  const r = await fetch(url, {headers});
+  if (r.status === 401) { toast('Unauthorized', false); return null; }
+  const data = await r.json();
+  if (!data.ok) { toast(data.error || 'API error', false); return null; }
+  return data;
+}
+
+async function loadDefinitions() {
+  const data = await apiFetch('/api/workflows?all=true');
+  if (!data) return;
+  const workflows = data.workflows || [];
+
+  // Cache names for display elsewhere
+  workflows.forEach(w => { workflowNames[w.id] = w.name; });
+
+  const el = document.getElementById('definitions-content');
+  if (workflows.length === 0) {
+    el.innerHTML = '<div class="empty">No workflows defined yet.</div>';
+    return;
+  }
+
+  let html = '<table><tr><th>Name</th><th>Mode</th><th>Steps</th><th>Triggers</th><th>Enabled</th><th></th></tr>';
+  for (const w of workflows) {
+    const mode = w.mode || 'autonomous';
+    const stepCount = (w.steps || []).length;
+    const triggers = (w.triggers || []).map(t => t.type).join(', ') || '-';
+    const checked = w.enabled ? 'checked' : '';
+    html += '<tr>' +
+      '<td><strong>' + esc(w.name) + '</strong><br><span style="font-size:11px;color:var(--text2)">' + esc(w.description).slice(0, 80) + '</span></td>' +
+      '<td>' + esc(mode) + '</td>' +
+      '<td>' + stepCount + '</td>' +
+      '<td>' + esc(triggers) + '</td>' +
+      '<td><label class="toggle-switch"><input type="checkbox" ' + checked + ' onchange="toggleWorkflow(\'' + esc(w.id) + '\', this.checked)"><span class="slider"></span></label></td>' +
+      '<td><button class="btn btn-sm" onclick="triggerWorkflow(\'' + esc(w.id) + '\')">Trigger</button></td>' +
+      '</tr>';
+  }
+  html += '</table>';
+  el.innerHTML = html;
+}
+
+async function loadActiveSessions() {
+  const data = await apiFetch('/api/workflows/sessions/active');
+  if (!data) return;
+  const sessions = data.sessions || [];
+
+  document.getElementById('badge-active').textContent = sessions.length;
+
+  const el = document.getElementById('active-content');
+  if (sessions.length === 0) {
+    el.innerHTML = '<div class="empty">No active sessions.</div>';
+    return;
+  }
+
+  let html = '<table><tr><th>Session</th><th>Workflow</th><th>Status</th><th>Current Step</th><th>Started</th><th>Duration</th></tr>';
+  for (const s of sessions) {
+    const name = workflowNames[s.workflowId] || s.workflowId.slice(0, 8);
+    const step = s.currentStepId || '-';
+    html += '<tr style="cursor:pointer" onclick="showSessionDetail(\'' + esc(s.id) + '\')">' +
+      '<td class="mono">' + esc(s.id.slice(0, 8)) + '</td>' +
+      '<td>' + esc(name) + '</td>' +
+      '<td>' + statusHtml(s.status) + '</td>' +
+      '<td class="mono truncate">' + esc(step) + '</td>' +
+      '<td>' + fmtTime(s.startedAt) + '</td>' +
+      '<td>' + fmtDuration(s.startedAt, s.completedAt) + '</td>' +
+      '</tr>';
+  }
+  html += '</table>';
+  el.innerHTML = html;
+}
+
+async function loadWaitingSessions() {
+  const data = await apiFetch('/api/workflows/sessions/waiting');
+  if (!data) return;
+  const sessions = data.sessions || [];
+
+  const badge = document.getElementById('badge-waiting');
+  badge.textContent = sessions.length;
+  badge.className = sessions.length > 0 ? 'badge alert' : 'badge';
+
+  const el = document.getElementById('waiting-content');
+  if (sessions.length === 0) {
+    el.innerHTML = '<div class="empty">No sessions waiting for human input.</div>';
+    return;
+  }
+
+  let html = '';
+  for (const s of sessions) {
+    const name = workflowNames[s.workflowId] || s.workflowId.slice(0, 8);
+    const esc_msg = s.escalation || {};
+    const reason = esc_msg.reason || 'No reason provided';
+    const need = esc_msg.whatINeed || esc_msg.what_i_need || '';
+    const options = esc_msg.options || [];
+    const severity = esc_msg.severity || 'info';
+
+    html += '<div class="escalation-card" id="esc-' + esc(s.id) + '">' +
+      '<h3>' + esc(name) + ' — needs attention</h3>' +
+      '<div class="meta">Session ' + esc(s.id.slice(0, 8)) + ' | Severity: ' + esc(severity) + ' | Step: ' + esc(s.currentStepId || '-') + ' | Waiting since ' + fmtTime(s.updatedAt) + '</div>' +
+      '<div class="reason">' + esc(reason) + '</div>';
+
+    if (need) {
+      html += '<div class="need">' + esc(need) + '</div>';
+    }
+
+    if (options.length > 0) {
+      html += '<div class="options" id="opts-' + esc(s.id) + '">';
+      for (const opt of options) {
+        const title = opt.description ? ' title="' + esc(opt.description) + '"' : '';
+        html += '<button class="opt-btn" data-option="' + esc(opt.id) + '"' + title + ' onclick="selectOption(\'' + esc(s.id) + '\', this)">' + esc(opt.label) + '</button>';
+      }
+      html += '</div>';
+    }
+
+    html += '<div class="respond-form">' +
+      '<textarea id="resp-text-' + esc(s.id) + '" placeholder="Type your response..." rows="2"></textarea>' +
+      '<button class="btn btn-primary" onclick="respondToSession(\'' + esc(s.id) + '\')">Respond</button>' +
+      '</div>' +
+      '</div>';
+  }
+  el.innerHTML = html;
+}
+
+async function loadRecentSessions() {
+  const data = await apiFetch('/api/workflows/sessions/recent?limit=30');
+  if (!data) return;
+  const sessions = data.sessions || [];
+
+  const el = document.getElementById('recent-content');
+  if (sessions.length === 0) {
+    el.innerHTML = '<div class="empty">No completed sessions yet.</div>';
+    return;
+  }
+
+  let html = '<table><tr><th>Session</th><th>Workflow</th><th>Status</th><th>Started</th><th>Duration</th><th>Steps</th></tr>';
+  for (const s of sessions) {
+    const name = workflowNames[s.workflowId] || s.workflowId.slice(0, 8);
+    const stepCount = Object.keys(s.stepOutputs || {}).length;
+    const planSteps = s.plan ? s.plan.steps.length : 0;
+    html += '<tr style="cursor:pointer" onclick="showSessionDetail(\'' + esc(s.id) + '\')">' +
+      '<td class="mono">' + esc(s.id.slice(0, 8)) + '</td>' +
+      '<td>' + esc(name) + '</td>' +
+      '<td>' + statusHtml(s.status) + '</td>' +
+      '<td>' + fmtTime(s.startedAt) + '</td>' +
+      '<td>' + fmtDuration(s.startedAt, s.completedAt) + '</td>' +
+      '<td>' + stepCount + '/' + planSteps + '</td>' +
+      '</tr>';
+  }
+  html += '</table>';
+  el.innerHTML = html;
+}
+
+// ---------------------------------------------------------------------------
+// Actions
+// ---------------------------------------------------------------------------
+
+function selectOption(sessionId, btn) {
+  const container = document.getElementById('opts-' + sessionId);
+  if (!container) return;
+  container.querySelectorAll('.opt-btn').forEach(b => b.classList.remove('selected'));
+  btn.classList.add('selected');
+}
+
+async function respondToSession(sessionId) {
+  const textarea = document.getElementById('resp-text-' + sessionId);
+  const content = textarea ? textarea.value.trim() : '';
+  if (!content) { toast('Please type a response', false); return; }
+
+  const optContainer = document.getElementById('opts-' + sessionId);
+  let option = null;
+  if (optContainer) {
+    const selected = optContainer.querySelector('.opt-btn.selected');
+    if (selected) option = selected.getAttribute('data-option');
+  }
+
+  const body = {content};
+  if (option) body.option = option;
+
+  try {
+    const r = await fetch('/api/workflows/sessions/' + sessionId + '/respond', {
+      method: 'POST', headers, body: JSON.stringify(body)
+    });
+    const data = await r.json();
+    if (!data.ok) { toast(data.error || 'Failed to respond', false); return; }
+    toast('Response sent, session resuming', true);
+    textarea.value = '';
+    setTimeout(refreshAll, 1000);
+  } catch (e) {
+    toast('Error: ' + e.message, false);
+  }
+}
+
+async function toggleWorkflow(id, enabled) {
+  const endpoint = enabled ? 'enable' : 'disable';
+  try {
+    const r = await fetch('/api/workflows/' + id + '/' + endpoint, {
+      method: 'POST', headers
+    });
+    const data = await r.json();
+    if (!data.ok) { toast(data.error || 'Failed', false); loadDefinitions(); return; }
+    toast('Workflow ' + endpoint + 'd', true);
+  } catch (e) {
+    toast('Error: ' + e.message, false);
+    loadDefinitions();
+  }
+}
+
+async function triggerWorkflow(id) {
+  try {
+    const r = await fetch('/api/workflows/' + id + '/trigger', {
+      method: 'POST', headers
+    });
+    const data = await r.json();
+    if (!data.ok) { toast(data.error || 'Failed to trigger', false); return; }
+    toast('Workflow triggered (run ' + (data.run_id || '').slice(0, 8) + ')', true);
+    setTimeout(refreshAll, 1500);
+  } catch (e) {
+    toast('Error: ' + e.message, false);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Session detail overlay
+// ---------------------------------------------------------------------------
+
+async function showSessionDetail(sessionId) {
+  const panel = document.getElementById('detail-panel');
+  panel.innerHTML = '<div class="empty">Loading...</div>';
+  document.getElementById('detail-overlay').classList.add('show');
+
+  const [sessionData, msgData] = await Promise.all([
+    apiFetch('/api/workflows/sessions/' + sessionId),
+    apiFetch('/api/workflows/sessions/' + sessionId + '/messages')
+  ]);
+
+  if (!sessionData) { closeDetail(); return; }
+  const s = sessionData.session;
+  const messages = msgData ? (msgData.messages || []) : [];
+  const name = workflowNames[s.workflowId] || s.workflowId;
+
+  let html = '<h2>' + esc(name) + ' <button class="close-btn" onclick="closeDetail()">&times;</button></h2>';
+  html += '<table style="margin-bottom:12px">' +
+    '<tr><td style="width:120px;color:var(--text2)">Session ID</td><td class="mono">' + esc(s.id) + '</td></tr>' +
+    '<tr><td style="color:var(--text2)">Status</td><td>' + statusHtml(s.status) + '</td></tr>' +
+    '<tr><td style="color:var(--text2)">Trigger</td><td>' + esc(s.triggerType) + '</td></tr>' +
+    '<tr><td style="color:var(--text2)">Started</td><td>' + fmtTime(s.startedAt) + '</td></tr>' +
+    '<tr><td style="color:var(--text2)">Duration</td><td>' + fmtDuration(s.startedAt, s.completedAt) + '</td></tr>' +
+    '<tr><td style="color:var(--text2)">Current Step</td><td class="mono">' + esc(s.currentStepId || '-') + '</td></tr>' +
+    '<tr><td style="color:var(--text2)">Retries</td><td>' + s.retryCount + '/' + s.maxRetries + '</td></tr>' +
+    '</table>';
+
+  // Plan steps
+  if (s.plan && s.plan.steps && s.plan.steps.length > 0) {
+    html += '<h3 style="font-size:13px;margin-bottom:6px">Plan Steps</h3>';
+    html += '<table style="margin-bottom:12px"><tr><th>Step</th><th>Agent</th><th>Description</th><th>Output</th></tr>';
+    for (const step of s.plan.steps) {
+      const hasOutput = s.stepOutputs && s.stepOutputs[step.id];
+      const outputBadge = hasOutput
+        ? '<span class="status status-completed">done</span>'
+        : (step.id === s.currentStepId ? '<span class="status status-executing">running</span>' : '<span class="status status-pending">pending</span>');
+      html += '<tr><td class="mono">' + esc(step.id) + '</td><td>' + esc(step.agentType) + '</td><td>' + esc(step.description) + '</td><td>' + outputBadge + '</td></tr>';
+    }
+    html += '</table>';
+  }
+
+  // Evaluator feedback
+  if (s.evaluatorFeedback) {
+    const ef = s.evaluatorFeedback;
+    html += '<h3 style="font-size:13px;margin-bottom:6px">Evaluator</h3>';
+    html += '<div style="padding:8px;background:var(--surface2);border-radius:var(--radius);margin-bottom:12px;font-size:13px">' +
+      (ef.passed ? '<span style="color:var(--success)">Passed</span>' : '<span style="color:var(--danger)">Failed</span>') +
+      ' (score: ' + ef.score.toFixed(2) + '/' + ef.threshold.toFixed(2) + ')<br>' +
+      esc(ef.feedback) +
+      (ef.suggestion ? '<br><em>' + esc(ef.suggestion) + '</em>' : '') +
+      '</div>';
+  }
+
+  // Conversation thread
+  html += '<h3 style="font-size:13px;margin-bottom:6px">Conversation (' + messages.length + ' messages)</h3>';
+  if (messages.length === 0) {
+    html += '<div style="padding:8px;color:var(--text2);font-size:13px">No messages yet.</div>';
+  } else {
+    html += '<div class="msg-thread">';
+    for (const m of messages) {
+      const isAgent = m.direction === 'agent_to_human';
+      const cls = isAgent ? 'msg-agent' : 'msg-human';
+      const label = isAgent ? 'Agent' : 'Human';
+      html += '<div class="msg ' + cls + '">' +
+        '<div class="msg-meta">' + label + ' - ' + fmtTime(m.createdAt) + '</div>' +
+        esc(m.content) +
+        '</div>';
+    }
+    html += '</div>';
+  }
+
+  panel.innerHTML = html;
+}
+
+function closeDetail() {
+  document.getElementById('detail-overlay').classList.remove('show');
+}
+
+// Close on Escape
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeDetail(); });
+
+// ---------------------------------------------------------------------------
+// Polling
+// ---------------------------------------------------------------------------
+
+async function refreshAll() {
+  await loadDefinitions();
+  await Promise.all([
+    loadActiveSessions(),
+    loadWaitingSessions(),
+    loadRecentSessions()
+  ]);
+}
+
+refreshAll();
+setInterval(refreshAll, 10000);
+</script>
+</body>
+</html>

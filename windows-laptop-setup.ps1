@@ -545,7 +545,7 @@ if (`$caddy) {
 Write-Host ""
 Write-Host "Health:" -ForegroundColor Yellow
 try {
-    `$r = Invoke-WebRequest -Uri "http://localhost:${BOTTO_PORT}/health" -UseBasicParsing -TimeoutSec 3
+    `$r = Invoke-WebRequest -Uri "http://127.0.0.1:${BOTTO_PORT}/health" -UseBasicParsing -TimeoutSec 3
     Write-Host "  Botto direct:  OK (`$(`$r.StatusCode))" -ForegroundColor Green
 } catch {
     Write-Host "  Botto direct:  UNREACHABLE" -ForegroundColor Red

@@ -5,3 +5,5 @@
 *.db-shm
 botto.toml
 .env
+.env.*
+.claude/

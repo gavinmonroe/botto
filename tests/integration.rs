@@ -74,6 +74,9 @@ fn test_config(port: u16) -> BottoConfig {
             judge_model: "claude-opus-4-6".into(),
         },
         data_dir: PathBuf::from("/tmp"),
+        workflows: botto::config::WorkflowConfig::default(),
+        mentor: botto::config::MentorConfig::default(),
+        channels: botto::config::ChannelConfig::default(),
     }
 }
 
@@ -1084,4 +1087,571 @@ async fn test_reviewer_prefs_empty_for_unknown_project() {
 
     let result = db::queries::get_reviewer_prefs(&pool, "unknown/project").await.unwrap();
     assert!(result.is_none());
+}
+
+// ---------------------------------------------------------------------------
+// Enhanced /ready endpoint
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_ready_endpoint_returns_component_status() {
+    let port = free_port().await;
+    let cfg = test_config(port);
+    let pool = db::init(std::path::Path::new(":memory:")).await.unwrap();
+    let state = AppState::new(cfg, pool);
+
+    let state_clone = state.clone();
+    let server_handle = tokio::spawn(async move {
+        server::run(state_clone).await.unwrap();
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let resp = reqwest::get(format!("http://127.0.0.1:{}/ready", port))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["status"], "ready");
+    assert_eq!(body["database"], "ok");
+    // AI and GitLab are not configured in test config
+    assert_eq!(body["ai"], "not_configured");
+    assert_eq!(body["gitlab"], "not_configured");
+    assert_eq!(body["queue"], "not_started");
+    assert_eq!(body["sandbox"]["status"], "disabled");
+    assert_eq!(body["sandbox"]["warm_containers"], 0);
+    assert_eq!(body["connected_ottos"], 0);
+    assert_eq!(body["in_flight_reviews"], 0);
+
+    server_handle.abort();
+}
+
+// ---------------------------------------------------------------------------
+// Digest date helpers (unit-level tests via the module's public API)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_digest_returns_valid_structure() {
+    // Test that GET_TEAM_DIGEST returns a proper error when GitLab is not configured
+    // (we can't test full digest without a real GitLab, but we can verify the handler works)
+    let port = free_port().await;
+    let cfg = test_config(port);
+    let pool = db::init(std::path::Path::new(":memory:")).await.unwrap();
+    let state = AppState::new(cfg, pool);
+
+    let state_clone = state.clone();
+    let server_handle = tokio::spawn(async move {
+        server::run(state_clone).await.unwrap();
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let mut ws = connect_and_auth(port, "alice").await;
+
+    // Request digest — will fail because GitLab bot_token is empty, but handler should respond gracefully
+    let resp = send_request(&mut ws, "d1", json!({
+        "type": "GET_TEAM_DIGEST",
+        "project_path": "team/repo",
+        "period": "daily",
+    })).await;
+
+    // Should get an error response (not a panic or timeout)
+    assert_eq!(resp["ok"], false);
+    assert!(resp["error"].as_str().unwrap().contains("failed"));
+
+    // Test invalid period
+    let resp = send_request(&mut ws, "d2", json!({
+        "type": "GET_TEAM_DIGEST",
+        "project_path": "team/repo",
+        "period": "monthly",
+    })).await;
+    assert_eq!(resp["ok"], false);
+    assert!(resp["error"].as_str().unwrap().contains("invalid period"));
+
+    ws.close(None).await.ok();
+    server_handle.abort();
+}
+
+// ---------------------------------------------------------------------------
+// Conflict and cluster handlers return gracefully when disabled
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_conflicts_disabled_returns_empty() {
+    let port = free_port().await;
+    let mut cfg = test_config(port);
+    cfg.conflict.enabled = false; // Explicitly disable
+    let pool = db::init(std::path::Path::new(":memory:")).await.unwrap();
+    let state = AppState::new(cfg, pool);
+
+    let state_clone = state.clone();
+    let server_handle = tokio::spawn(async move {
+        server::run(state_clone).await.unwrap();
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let mut ws = connect_and_auth(port, "alice").await;
+
+    let resp = send_request(&mut ws, "c1", json!({
+        "type": "GET_CONFLICTS",
+        "mr_iid": 42,
+        "project_path": "team/repo",
+    })).await;
+
+    assert_eq!(resp["ok"], true);
+    let conflicts = resp["data"]["conflicts"].as_array().unwrap();
+    assert_eq!(conflicts.len(), 0);
+
+    ws.close(None).await.ok();
+    server_handle.abort();
+}
+
+// ---------------------------------------------------------------------------
+// Discovery endpoint returns enhanced capabilities
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_discovery_endpoint_capabilities() {
+    let port = free_port().await;
+    let cfg = test_config(port);
+    let pool = db::init(std::path::Path::new(":memory:")).await.unwrap();
+    let state = AppState::new(cfg, pool);
+
+    let state_clone = state.clone();
+    let server_handle = tokio::spawn(async move {
+        server::run(state_clone).await.unwrap();
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let resp = reqwest::get(format!("http://127.0.0.1:{}/.well-known/botto", port))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["name"], "botto");
+    assert!(body["version"].as_str().is_some());
+    assert!(body["ws"].as_str().is_some());
+
+    // Check enhanced capabilities
+    let caps = &body["capabilities"];
+    assert_eq!(caps["shared_triage"], true);
+    assert_eq!(caps["review_queue"], true);
+    assert_eq!(caps["team_digest"], true);
+    // AI not configured in test → chat and verification should be false
+    assert_eq!(caps["chat"], false);
+    assert_eq!(caps["verification"], false);
+    // Conflict radar defaults to enabled
+    assert_eq!(caps["conflict_radar"], true);
+    assert_eq!(caps["cross_mr_clusters"], true);
+
+    server_handle.abort();
+}
+
+// ---------------------------------------------------------------------------
+// GET_SERVER_STATUS via WebSocket
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_get_server_status() {
+    let port = free_port().await;
+    let cfg = test_config(port);
+    let pool = db::init(std::path::Path::new(":memory:")).await.unwrap();
+    let state = AppState::new(cfg, pool);
+
+    let state_clone = state.clone();
+    let server_handle = tokio::spawn(async move {
+        server::run(state_clone).await.unwrap();
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let mut ws = connect_and_auth(port, "alice").await;
+
+    let resp = send_request(&mut ws, "s1", json!({
+        "type": "GET_SERVER_STATUS",
+    })).await;
+
+    assert_eq!(resp["ok"], true);
+    let data = &resp["data"];
+    assert!(data["connected_ottos"].as_u64().is_some());
+    assert_eq!(data["in_flight_reviews"], 0);
+    assert_eq!(data["sandbox_enabled"], false);
+    assert_eq!(data["ai_configured"], false);
+    assert!(data["version"].as_str().is_some());
+
+    ws.close(None).await.ok();
+    server_handle.abort();
+}
+
+// ---------------------------------------------------------------------------
+// New handler tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_ping_handler() {
+    let port = free_port().await;
+    let cfg = test_config(port);
+    let pool = db::init(std::path::Path::new(":memory:")).await.unwrap();
+    let state = AppState::new(cfg, pool);
+
+    let state_clone = state.clone();
+    let server_handle = tokio::spawn(async move {
+        server::run(state_clone).await.unwrap();
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let mut ws = connect_and_auth(port, "alice").await;
+
+    let resp = send_request(&mut ws, "p1", json!({ "type": "PING" })).await;
+    assert_eq!(resp["ok"], true);
+    assert!(resp["data"]["ts"].as_u64().is_some());
+
+    ws.close(None).await.ok();
+    server_handle.abort();
+}
+
+#[tokio::test]
+async fn test_get_active_reviews_empty() {
+    let port = free_port().await;
+    let cfg = test_config(port);
+    let pool = db::init(std::path::Path::new(":memory:")).await.unwrap();
+    let state = AppState::new(cfg, pool);
+
+    let state_clone = state.clone();
+    let server_handle = tokio::spawn(async move {
+        server::run(state_clone).await.unwrap();
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let mut ws = connect_and_auth(port, "alice").await;
+
+    let resp = send_request(&mut ws, "r1", json!({ "type": "GET_ACTIVE_REVIEWS" })).await;
+    assert_eq!(resp["ok"], true);
+    assert_eq!(resp["data"]["count"], 0);
+
+    ws.close(None).await.ok();
+    server_handle.abort();
+}
+
+#[tokio::test]
+async fn test_get_connected_users() {
+    let port = free_port().await;
+    let cfg = test_config(port);
+    let pool = db::init(std::path::Path::new(":memory:")).await.unwrap();
+    let state = AppState::new(cfg, pool);
+
+    let state_clone = state.clone();
+    let server_handle = tokio::spawn(async move {
+        server::run(state_clone).await.unwrap();
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let mut ws = connect_and_auth(port, "alice").await;
+
+    let resp = send_request(&mut ws, "u1", json!({ "type": "GET_CONNECTED_USERS" })).await;
+    assert_eq!(resp["ok"], true);
+    assert!(resp["data"]["count"].as_u64().unwrap() >= 1);
+    let users = resp["data"]["users"].as_array().unwrap();
+    assert!(users.iter().any(|u| u["user_id"] == "alice"));
+
+    ws.close(None).await.ok();
+    server_handle.abort();
+}
+
+#[tokio::test]
+async fn test_get_presence_empty_mr() {
+    let port = free_port().await;
+    let cfg = test_config(port);
+    let pool = db::init(std::path::Path::new(":memory:")).await.unwrap();
+    let state = AppState::new(cfg, pool);
+
+    let state_clone = state.clone();
+    let server_handle = tokio::spawn(async move {
+        server::run(state_clone).await.unwrap();
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let mut ws = connect_and_auth(port, "alice").await;
+
+    let resp = send_request(&mut ws, "pr1", json!({
+        "type": "GET_PRESENCE",
+        "project_path": "team/repo",
+        "mr_iid": 99,
+    })).await;
+    assert_eq!(resp["ok"], true);
+    assert_eq!(resp["data"]["viewer_count"], 0);
+
+    ws.close(None).await.ok();
+    server_handle.abort();
+}
+
+#[tokio::test]
+async fn test_invalidate_review_cache() {
+    let port = free_port().await;
+    let cfg = test_config(port);
+    let pool = db::init(std::path::Path::new(":memory:")).await.unwrap();
+    let state = AppState::new(cfg, pool);
+
+    let state_clone = state.clone();
+    let server_handle = tokio::spawn(async move {
+        server::run(state_clone).await.unwrap();
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let mut ws = connect_and_auth(port, "alice").await;
+
+    let resp = send_request(&mut ws, "ic1", json!({
+        "type": "INVALIDATE_REVIEW_CACHE",
+        "project_path": "team/repo",
+        "mr_iid": 42,
+    })).await;
+    assert_eq!(resp["ok"], true);
+    assert_eq!(resp["data"]["deleted"], 0);
+
+    ws.close(None).await.ok();
+    server_handle.abort();
+}
+
+#[tokio::test]
+async fn test_get_reviewer_prefs_empty() {
+    let port = free_port().await;
+    let cfg = test_config(port);
+    let pool = db::init(std::path::Path::new(":memory:")).await.unwrap();
+    let state = AppState::new(cfg, pool);
+
+    let state_clone = state.clone();
+    let server_handle = tokio::spawn(async move {
+        server::run(state_clone).await.unwrap();
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let mut ws = connect_and_auth(port, "alice").await;
+
+    let resp = send_request(&mut ws, "rp1", json!({
+        "type": "GET_REVIEWER_PREFS",
+        "project_path": "team/repo",
+    })).await;
+    assert_eq!(resp["ok"], true);
+    assert!(resp["data"]["prefs"].is_null());
+
+    ws.close(None).await.ok();
+    server_handle.abort();
+}
+
+#[tokio::test]
+async fn test_get_events_empty() {
+    let port = free_port().await;
+    let cfg = test_config(port);
+    let pool = db::init(std::path::Path::new(":memory:")).await.unwrap();
+    let state = AppState::new(cfg, pool);
+
+    let state_clone = state.clone();
+    let server_handle = tokio::spawn(async move {
+        server::run(state_clone).await.unwrap();
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let mut ws = connect_and_auth(port, "alice").await;
+
+    let resp = send_request(&mut ws, "e1", json!({
+        "type": "GET_EVENTS",
+        "project_path": "team/repo",
+    })).await;
+    assert_eq!(resp["ok"], true);
+    assert_eq!(resp["data"]["events"].as_array().unwrap().len(), 0);
+
+    ws.close(None).await.ok();
+    server_handle.abort();
+}
+
+#[tokio::test]
+async fn test_get_sandbox_jobs_empty() {
+    let port = free_port().await;
+    let cfg = test_config(port);
+    let pool = db::init(std::path::Path::new(":memory:")).await.unwrap();
+    let state = AppState::new(cfg, pool);
+
+    let state_clone = state.clone();
+    let server_handle = tokio::spawn(async move {
+        server::run(state_clone).await.unwrap();
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let mut ws = connect_and_auth(port, "alice").await;
+
+    let resp = send_request(&mut ws, "sj1", json!({
+        "type": "GET_SANDBOX_JOBS",
+        "project_path": "team/repo",
+        "mr_iid": 42,
+    })).await;
+    assert_eq!(resp["ok"], true);
+    assert_eq!(resp["data"]["jobs"].as_array().unwrap().len(), 0);
+
+    ws.close(None).await.ok();
+    server_handle.abort();
+}
+
+#[tokio::test]
+async fn test_get_review_history_empty() {
+    let port = free_port().await;
+    let cfg = test_config(port);
+    let pool = db::init(std::path::Path::new(":memory:")).await.unwrap();
+    let state = AppState::new(cfg, pool);
+
+    let state_clone = state.clone();
+    let server_handle = tokio::spawn(async move {
+        server::run(state_clone).await.unwrap();
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let mut ws = connect_and_auth(port, "alice").await;
+
+    let resp = send_request(&mut ws, "rh1", json!({
+        "type": "GET_REVIEW_HISTORY",
+        "project_path": "team/repo",
+    })).await;
+    assert_eq!(resp["ok"], true);
+    assert_eq!(resp["data"]["reviews"].as_array().unwrap().len(), 0);
+
+    ws.close(None).await.ok();
+    server_handle.abort();
+}
+
+#[tokio::test]
+async fn test_get_warm_pool_status_disabled() {
+    let port = free_port().await;
+    let cfg = test_config(port);
+    let pool = db::init(std::path::Path::new(":memory:")).await.unwrap();
+    let state = AppState::new(cfg, pool);
+
+    let state_clone = state.clone();
+    let server_handle = tokio::spawn(async move {
+        server::run(state_clone).await.unwrap();
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let mut ws = connect_and_auth(port, "alice").await;
+
+    let resp = send_request(&mut ws, "wp1", json!({ "type": "GET_WARM_POOL_STATUS" })).await;
+    assert_eq!(resp["ok"], true);
+    assert_eq!(resp["data"]["enabled"], false);
+    assert_eq!(resp["data"]["count"], 0);
+
+    ws.close(None).await.ok();
+    server_handle.abort();
+}
+
+// ---------------------------------------------------------------------------
+// Cache round-trip: save a review, then retrieve via GET_LATEST_CACHED_REVIEW
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_cache_round_trip() {
+    let port = free_port().await;
+    let cfg = test_config(port);
+    let pool = db::init(std::path::Path::new(":memory:")).await.unwrap();
+
+    // Directly insert a cached review into the DB
+    let review_data = serde_json::to_vec(&json!({
+        "summary": { "title": "Test review" },
+        "file_reviews": [],
+    })).unwrap();
+    db::queries::save_cached_review(
+        &pool, "team/repo", 42, "abc123", &review_data, "file1:hash1,file2:hash2", 7,
+    ).await.unwrap();
+
+    let state = AppState::new(cfg, pool);
+
+    let state_clone = state.clone();
+    let server_handle = tokio::spawn(async move {
+        server::run(state_clone).await.unwrap();
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let mut ws = connect_and_auth(port, "alice").await;
+
+    // Retrieve via GET_LATEST_CACHED_REVIEW (no diff_hash needed)
+    let resp = send_request(&mut ws, "cr1", json!({
+        "type": "GET_LATEST_CACHED_REVIEW",
+        "project_path": "team/repo",
+        "mr_iid": 42,
+    })).await;
+    assert_eq!(resp["ok"], true);
+    assert_eq!(resp["data"]["diff_hash"], "abc123");
+    assert_eq!(resp["data"]["review"]["summary"]["title"], "Test review");
+    assert_eq!(resp["data"]["file_diff_hashes"], "file1:hash1,file2:hash2");
+
+    // Retrieve via GET_CACHED_REVIEW (with diff_hash)
+    let resp = send_request(&mut ws, "cr2", json!({
+        "type": "GET_CACHED_REVIEW",
+        "project_path": "team/repo",
+        "mr_iid": 42,
+        "diff_hash": "abc123",
+    })).await;
+    assert_eq!(resp["ok"], true);
+    assert_eq!(resp["data"]["review"]["summary"]["title"], "Test review");
+
+    // Verify it shows in review history
+    let resp = send_request(&mut ws, "cr3", json!({
+        "type": "GET_REVIEW_HISTORY",
+        "project_path": "team/repo",
+    })).await;
+    assert_eq!(resp["ok"], true);
+    let reviews = resp["data"]["reviews"].as_array().unwrap();
+    assert_eq!(reviews.len(), 1);
+    assert_eq!(reviews[0]["mr_iid"], 42);
+
+    // Invalidate and verify it's gone
+    let resp = send_request(&mut ws, "cr4", json!({
+        "type": "INVALIDATE_REVIEW_CACHE",
+        "project_path": "team/repo",
+        "mr_iid": 42,
+    })).await;
+    assert_eq!(resp["ok"], true);
+    assert_eq!(resp["data"]["deleted"], 1);
+
+    // Verify it's gone
+    let resp = send_request(&mut ws, "cr5", json!({
+        "type": "GET_LATEST_CACHED_REVIEW",
+        "project_path": "team/repo",
+        "mr_iid": 42,
+    })).await;
+    assert_eq!(resp["ok"], true);
+    assert!(resp["data"].is_null());
+
+    ws.close(None).await.ok();
+    server_handle.abort();
+}
+
+// ---------------------------------------------------------------------------
+// GET_CLUSTER when clusters are disabled
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_clusters_disabled_returns_empty() {
+    let port = free_port().await;
+    let mut cfg = test_config(port);
+    cfg.cluster.enabled = false;
+    let pool = db::init(std::path::Path::new(":memory:")).await.unwrap();
+    let state = AppState::new(cfg, pool);
+
+    let state_clone = state.clone();
+    let server_handle = tokio::spawn(async move {
+        server::run(state_clone).await.unwrap();
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let mut ws = connect_and_auth(port, "alice").await;
+
+    let resp = send_request(&mut ws, "cl1", json!({
+        "type": "GET_CLUSTER",
+        "mr_iid": 42,
+        "project_path": "team/repo",
+    })).await;
+
+    assert_eq!(resp["ok"], true);
+    let clusters = resp["data"]["clusters"].as_array().unwrap();
+    assert_eq!(clusters.len(), 0);
+
+    ws.close(None).await.ok();
+    server_handle.abort();
 }

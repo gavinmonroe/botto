@@ -52,6 +52,7 @@ pub async fn handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> imp
 
 async fn handle_connection(socket: WebSocket, state: AppState) {
     let conn_id = uuid::Uuid::new_v4().to_string();
+    let connected_at = tokio::time::Instant::now();
     let (ws_sink, mut ws_stream) = socket.split();
     let ws_sink = Arc::new(Mutex::new(ws_sink));
 
@@ -245,7 +246,7 @@ async fn handle_connection(socket: WebSocket, state: AppState) {
                 avatar_url: entry.avatar_url.clone(),
                 files: vec![],
             };
-            state.broadcast_to_mr_except(mr, &serde_json::to_string(&msg).unwrap(), &conn_id);
+            state.broadcast_to_mr_except(mr, &serde_json::to_string(&msg).unwrap_or_default(), &conn_id);
         }
     }
 
@@ -253,7 +254,7 @@ async fn handle_connection(socket: WebSocket, state: AppState) {
     state.remove_connection(&conn_id);
     let _ = crate::db::queries::remove_connection(state.pool(), &conn_id).await;
 
-    info!("ws disconnected: {} user={}", conn_id, user_id);
+    info!("ws disconnected: {} user={} duration={:.0}s", conn_id, user_id, connected_at.elapsed().as_secs_f64());
 }
 
 // ---------------------------------------------------------------------------
@@ -383,13 +384,20 @@ async fn handle_message(
                     avatar_url,
                     files: vec![],
                 };
-                state.broadcast_to_mr_except(mr, &serde_json::to_string(&msg).unwrap(), conn_id);
+                state.broadcast_to_mr_except(mr, &serde_json::to_string(&msg).unwrap_or_default(), conn_id);
             }
             let _ =
                 crate::db::queries::update_viewing_mr(state.pool(), conn_id, None).await;
         }
 
         WsInbound::ViewingFiles { files } => {
+            // Cap file list to prevent abuse
+            let files = if files.len() > 100 {
+                files[..100].to_vec()
+            } else {
+                files
+            };
+
             // Rate limit: ignore if last update was less than 2s ago
             let now = tokio::time::Instant::now();
             let should_process = if let Some(conn) = state.connections().get(conn_id) {
@@ -427,7 +435,7 @@ async fn handle_message(
                     avatar_url,
                     files,
                 };
-                state.broadcast_to_mr_except(mr, &serde_json::to_string(&msg).unwrap(), conn_id);
+                state.broadcast_to_mr_except(mr, &serde_json::to_string(&msg).unwrap_or_default(), conn_id);
             }
         }
 
@@ -497,6 +505,17 @@ async fn handle_message(
             category,
             severity,
         } => {
+            // Validate action is a known value
+            if !matches!(action.as_str(), "accepted" | "dismissed" | "edited" | "resolved") {
+                warn!("COMMENT_ACTION rejected: unknown action '{}' from {}", action, conn_id);
+                return;
+            }
+            // Validate field sizes
+            if project_path.len() > 500 || comment_id.len() > 200 {
+                warn!("COMMENT_ACTION rejected: field too large from {}", conn_id);
+                return;
+            }
+
             let state = state.clone();
             let conn_id = conn_id.to_string();
             let user_id = user_id.to_string();
@@ -533,6 +552,18 @@ async fn handle_message(
             end_line,
             gitlab_note_id,
         } => {
+            // Validate field sizes to prevent abuse
+            const MAX_CODE_LEN: usize = 512_000; // 512KB per code field
+            const MAX_PATH_LEN: usize = 1_000;
+            if suggestion.len() > MAX_CODE_LEN
+                || original_code.len() > MAX_CODE_LEN
+                || file_path.len() > MAX_PATH_LEN
+                || project_path.len() > MAX_PATH_LEN
+            {
+                warn!("REQUEST_FIX rejected: field too large from {}", conn_id);
+                return;
+            }
+
             let state = state.clone();
             let conn_id = conn_id.to_string();
             let user_id = user_id.to_string();
@@ -572,7 +603,13 @@ async fn send_json<T: Serialize>(
     sink: &Arc<Mutex<SplitSink<WebSocket, Message>>>,
     msg: &T,
 ) -> Result<(), axum::Error> {
-    let text = serde_json::to_string(msg).unwrap();
+    let text = match serde_json::to_string(msg) {
+        Ok(t) => t,
+        Err(e) => {
+            warn!("failed to serialize WS message: {}", e);
+            return Ok(()); // Drop the message rather than panic
+        }
+    };
     send_text(sink, &text).await
 }
 
@@ -811,6 +848,16 @@ pub enum WsOutbound {
     ClusterUpdated {
         project_id: i64,
         cluster: serde_json::Value,
+    },
+
+    /// Workflow run progress: step started, completed, or failed.
+    #[serde(rename = "WORKFLOW_PROGRESS")]
+    WorkflowProgress {
+        workflow_id: String,
+        run_id: String,
+        step_id: Option<String>,
+        status: String,
+        detail: Option<serde_json::Value>,
     },
 }
 

@@ -42,5 +42,7 @@ where
         }
     }
 
-    Err(last_err.unwrap())
+    // Unreachable: the loop always returns on the final attempt (attempt == max_retries).
+    // But if max_retries is somehow bypassed, return the last error safely.
+    Err(last_err.expect("retry loop completed without any attempt"))
 }

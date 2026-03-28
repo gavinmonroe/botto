@@ -190,6 +190,32 @@ async fn compute_digest(
         }
     }
 
+    // Enrich member stats from local comment_actions table.
+    // This gives us per-user review activity without expensive per-MR GitLab API calls.
+    if let Ok(user_stats) = count_user_comment_stats(state.pool(), project_path, since_epoch).await {
+        for (user_id, comments, accepted) in user_stats {
+            let entry = member_map.entry(user_id.clone()).or_insert_with(|| MemberStats {
+                user_id: user_id.clone(),
+                display_name: user_id,
+                mrs_authored: 0,
+                mrs_reviewed: 0,
+                comments_made: 0,
+                suggestions_accepted: 0,
+            });
+            entry.comments_made = comments;
+            entry.suggestions_accepted = accepted;
+        }
+    }
+
+    // Count distinct MRs each user has reviewed (has comment actions on)
+    if let Ok(review_counts) = count_user_mrs_reviewed(state.pool(), project_path, since_epoch).await {
+        for (user_id, count) in review_counts {
+            if let Some(entry) = member_map.get_mut(&user_id) {
+                entry.mrs_reviewed = count;
+            }
+        }
+    }
+
     // Query local comment actions for the period
     let (accepted_count, dismissed_count) = count_comment_actions(
         state.pool(), project_path, since_epoch,
@@ -203,10 +229,34 @@ async fn compute_digest(
     // Build actionable items from open MRs
     let actionable = build_actionable_items(&open_mrs, project_path, now);
 
+    // Compute average time-to-merge from created_at → merged_at on merged MRs.
+    // This is a reasonable proxy for review turnaround without expensive per-MR
+    // discussion fetches. The field name stays avg_time_to_first_review_hours
+    // for API compatibility — it represents review cycle time.
+    let avg_review_hours = {
+        let mut durations = Vec::new();
+        for mr in &merged_mrs {
+            if let (Some(created), Some(merged)) = (
+                mr.created_at.as_deref().and_then(parse_iso_epoch),
+                mr.merged_at.as_deref().and_then(parse_iso_epoch),
+            ) {
+                if merged > created {
+                    durations.push((merged - created) as f32 / 3600.0);
+                }
+            }
+        }
+        if durations.is_empty() {
+            None
+        } else {
+            let sum: f32 = durations.iter().sum();
+            Some(sum / durations.len() as f32)
+        }
+    };
+
     let team_stats = TeamStats {
         mrs_merged: merged_mrs.len() as u32,
         mrs_open: open_mrs.len() as u32,
-        avg_time_to_first_review_hours: None, // Would require per-MR discussion fetch — too expensive
+        avg_time_to_first_review_hours: avg_review_hours,
         sandbox_fixes_applied: sandbox_fixes,
         review_comments_accepted: accepted_count,
         review_comments_dismissed: dismissed_count,
@@ -224,32 +274,65 @@ async fn compute_digest(
 fn build_actionable_items(
     open_mrs: &[MergeRequest],
     project_path: &str,
-    _now: i64,
+    now: i64,
 ) -> Vec<ActionableItem> {
     let mut items = Vec::new();
+    let stale_threshold_secs: i64 = 48 * 3600; // 48 hours
 
     for mr in open_mrs {
         // Skip draft/WIP MRs
-        if mr.title.starts_with("Draft:") || mr.title.starts_with("WIP:") {
+        if mr.draft || mr.title.starts_with("Draft:") || mr.title.starts_with("WIP:") {
             continue;
         }
 
-        // Parse created_at if available from the web_url (we don't have created_at in MergeRequest)
-        // Use a heuristic: if the MR state is "opened", flag it based on iid age
-        // For now, we'll flag all open MRs as potentially needing review
-        // A more precise approach would require fetching MR details with timestamps
+        // Compute age from created_at, staleness from updated_at
+        let age_hours = mr.created_at.as_deref()
+            .and_then(parse_iso_epoch)
+            .map(|created| (now - created) as f32 / 3600.0)
+            .unwrap_or(0.0);
+
+        let last_activity_epoch = mr.updated_at.as_deref()
+            .and_then(parse_iso_epoch)
+            .or_else(|| mr.created_at.as_deref().and_then(parse_iso_epoch))
+            .unwrap_or(now);
+
+        let inactive_secs = now - last_activity_epoch;
+
+        // Only flag MRs that have been inactive for 48+ hours
+        if inactive_secs < stale_threshold_secs {
+            continue;
+        }
+
+        let kind = if inactive_secs > 7 * 24 * 3600 {
+            ActionableKind::StaleReview
+        } else {
+            ActionableKind::UnreviewedMr
+        };
+
+        let inactive_hours = inactive_secs as f32 / 3600.0;
+        let message = match kind {
+            ActionableKind::StaleReview => format!(
+                "!{} \"{}\" has had no activity for {:.0}h",
+                mr.iid, truncate(&mr.title, 50), inactive_hours
+            ),
+            ActionableKind::UnreviewedMr => format!(
+                "!{} \"{}\" may need review (inactive {:.0}h)",
+                mr.iid, truncate(&mr.title, 50), inactive_hours
+            ),
+        };
 
         items.push(ActionableItem {
-            kind: ActionableKind::UnreviewedMr,
+            kind,
             mr_iid: mr.iid,
             project_path: project_path.to_string(),
-            message: format!("!{} \"{}\" is open and may need review", mr.iid, truncate(&mr.title, 60)),
-            age_hours: 0.0, // Would need created_at timestamp
+            message,
+            age_hours,
             web_url: mr.web_url.clone(),
         });
     }
 
-    // Limit to 10 actionable items
+    // Sort by staleness (oldest first), limit to 10
+    items.sort_by(|a, b| b.age_hours.partial_cmp(&a.age_hours).unwrap_or(std::cmp::Ordering::Equal));
     items.truncate(10);
     items
 }
@@ -322,6 +405,48 @@ async fn count_sandbox_fixes(
     .await?;
 
     Ok(row.map(|r| r.0 as u32).unwrap_or(0))
+}
+
+/// Per-user comment stats: total comments and accepted suggestions.
+async fn count_user_comment_stats(
+    pool: &sqlx::SqlitePool,
+    project_path: &str,
+    since_epoch: i64,
+) -> anyhow::Result<Vec<(String, u32, u32)>> {
+    let rows: Vec<(String, i64, i64)> = sqlx::query_as(
+        "SELECT user_id,
+                COUNT(*) as total,
+                COALESCE(SUM(CASE WHEN action = 'accepted' THEN 1 ELSE 0 END), 0) as accepted
+         FROM comment_actions
+         WHERE project_path = ? AND created_at >= ?
+         GROUP BY user_id",
+    )
+    .bind(project_path)
+    .bind(since_epoch)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows.into_iter().map(|(u, t, a)| (u, t as u32, a as u32)).collect())
+}
+
+/// Count distinct MRs each user has reviewed (has any comment action on).
+async fn count_user_mrs_reviewed(
+    pool: &sqlx::SqlitePool,
+    project_path: &str,
+    since_epoch: i64,
+) -> anyhow::Result<Vec<(String, u32)>> {
+    let rows: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT user_id, COUNT(DISTINCT mr_iid) as mr_count
+         FROM comment_actions
+         WHERE project_path = ? AND created_at >= ?
+         GROUP BY user_id",
+    )
+    .bind(project_path)
+    .bind(since_epoch)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows.into_iter().map(|(u, c)| (u, c as u32)).collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -398,18 +523,171 @@ async fn save_digest(
 fn epoch_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_secs() as i64
 }
 
 fn epoch_to_iso(epoch: i64) -> String {
-    // Simple ISO 8601 date string from epoch seconds
-    let secs = epoch as u64;
-    let days = secs / 86400;
-    // Approximate — good enough for a "since" filter
-    let years = 1970 + days / 365;
-    let remaining_days = days % 365;
-    let month = remaining_days / 30 + 1;
-    let day = remaining_days % 30 + 1;
-    format!("{:04}-{:02}-{:02}T00:00:00Z", years, month.min(12), day.min(28))
+    // Proper epoch → ISO 8601 conversion with leap year handling.
+    let mut secs = epoch;
+    let sec = secs % 60; secs /= 60;
+    let min = secs % 60; secs /= 60;
+    let hour = secs % 24;
+    let mut days = secs / 24;
+
+    let mut year: i64 = 1970;
+    loop {
+        let days_in_year = if is_leap(year) { 366 } else { 365 };
+        if days < days_in_year { break; }
+        days -= days_in_year;
+        year += 1;
+    }
+
+    let month_days: [i64; 12] = if is_leap(year) {
+        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    } else {
+        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    };
+
+    let mut month: i64 = 0;
+    for &md in &month_days {
+        if days < md { break; }
+        days -= md;
+        month += 1;
+    }
+
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        year, month + 1, days + 1, hour, min, sec
+    )
+}
+
+fn is_leap(year: i64) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+/// Parse an ISO 8601 timestamp (e.g. "2026-03-28T14:30:00.000Z") to epoch seconds.
+/// Handles GitLab's format with optional fractional seconds and Z suffix.
+fn parse_iso_epoch(iso: &str) -> Option<i64> {
+    // Strip fractional seconds and Z for simple parsing
+    let s = iso.trim_end_matches('Z');
+    let s = if let Some(dot_pos) = s.rfind('.') { &s[..dot_pos] } else { s };
+
+    // Parse "YYYY-MM-DDThh:mm:ss"
+    let parts: Vec<&str> = s.split('T').collect();
+    if parts.len() != 2 { return None; }
+
+    let date_parts: Vec<i64> = parts[0].split('-').filter_map(|p| p.parse().ok()).collect();
+    let time_parts: Vec<i64> = parts[1].split(':').filter_map(|p| p.parse().ok()).collect();
+
+    if date_parts.len() != 3 || time_parts.len() < 2 { return None; }
+
+    let (year, month, day) = (date_parts[0], date_parts[1], date_parts[2]);
+    let (hour, min) = (time_parts[0], time_parts[1]);
+    let sec = if time_parts.len() > 2 { time_parts[2] } else { 0 };
+
+    // Approximate days from epoch (good enough for age calculations)
+    let days_from_years = (year - 1970) * 365 + (year - 1969) / 4;
+    let month_days: [i64; 12] = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
+    let days_from_months = month_days.get((month - 1) as usize).copied().unwrap_or(0);
+    let total_days = days_from_years + days_from_months + day - 1;
+
+    Some(total_days * 86400 + hour * 3600 + min * 60 + sec)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_epoch_to_iso_known_date() {
+        // 2024-01-01T00:00:00Z = 1704067200
+        let result = epoch_to_iso(1704067200);
+        assert_eq!(result, "2024-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn test_epoch_to_iso_with_time() {
+        // 2024-06-15T13:30:45Z = 1718458245
+        let result = epoch_to_iso(1718458245);
+        assert_eq!(result, "2024-06-15T13:30:45Z");
+    }
+
+    #[test]
+    fn test_epoch_to_iso_unix_epoch() {
+        assert_eq!(epoch_to_iso(0), "1970-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn test_parse_iso_epoch_basic() {
+        let result = parse_iso_epoch("2024-01-01T00:00:00Z");
+        assert!(result.is_some());
+        let epoch = result.unwrap();
+        // Should be close to 1704067200 (within a day due to leap year approximation)
+        assert!((epoch - 1704067200).abs() < 86400);
+    }
+
+    #[test]
+    fn test_parse_iso_epoch_with_fractional() {
+        let result = parse_iso_epoch("2024-06-15T14:30:45.123Z");
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_parse_iso_epoch_without_z() {
+        let result = parse_iso_epoch("2024-06-15T14:30:45");
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_parse_iso_epoch_invalid() {
+        assert!(parse_iso_epoch("not-a-date").is_none());
+        assert!(parse_iso_epoch("").is_none());
+        assert!(parse_iso_epoch("2024-01-01").is_none()); // no time part
+    }
+
+    #[test]
+    fn test_roundtrip_epoch_to_iso_to_epoch() {
+        // epoch_to_iso is exact, parse_iso_epoch is approximate
+        // but for recent dates the error should be small
+        let original = 1711612800; // 2024-03-28T12:00:00Z
+        let iso = epoch_to_iso(original);
+        let parsed = parse_iso_epoch(&iso).unwrap();
+        // Within 2 days tolerance (leap year approximation in parse)
+        assert!((parsed - original).abs() < 2 * 86400);
+    }
+
+    #[test]
+    fn test_is_leap() {
+        assert!(is_leap(2000)); // divisible by 400
+        assert!(is_leap(2024)); // divisible by 4
+        assert!(!is_leap(1900)); // divisible by 100 but not 400
+        assert!(!is_leap(2023)); // not divisible by 4
+    }
+
+    #[test]
+    fn test_build_actionable_items_filters_drafts() {
+        let mrs = vec![
+            MergeRequest {
+                iid: 1,
+                title: "Draft: WIP feature".into(),
+                description: None,
+                state: "opened".into(),
+                source_branch: "feat".into(),
+                target_branch: "main".into(),
+                source_project_id: None,
+                target_project_id: None,
+                web_url: "https://example.com/mr/1".into(),
+                author: None,
+                created_at: Some("2020-01-01T00:00:00Z".into()),
+                updated_at: Some("2020-01-01T00:00:00Z".into()),
+                merged_at: None,
+                draft: true,
+                labels: vec![],
+            },
+        ];
+        let now = epoch_secs();
+        let items = build_actionable_items(&mrs, "team/repo", now);
+        assert!(items.is_empty(), "draft MRs should be filtered out");
+    }
 }

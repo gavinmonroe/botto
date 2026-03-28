@@ -12,7 +12,6 @@ use botto::types;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
-use std::sync::Arc;
 use tracing::info;
 
 #[derive(Parser)]
@@ -136,7 +135,27 @@ async fn run_server(cfg: config::BottoConfig, data_dir: &PathBuf) -> anyhow::Res
         loop {
             interval.tick().await;
             match db::queries::purge_expired_reviews(&pool_for_cleanup).await {
-                Ok(n) if n > 0 => info!("purged {} expired cache entries", n),
+                Ok(n) if n > 0 => info!("purged {} expired review cache entries", n),
+                _ => {}
+            }
+            match db::queries::purge_expired_clusters(&pool_for_cleanup).await {
+                Ok(n) if n > 0 => info!("purged {} expired cluster entries", n),
+                _ => {}
+            }
+            match db::queries::purge_expired_digests(&pool_for_cleanup).await {
+                Ok(n) if n > 0 => info!("purged {} expired digest entries", n),
+                _ => {}
+            }
+            match db::queries::purge_old_events(&pool_for_cleanup).await {
+                Ok(n) if n > 0 => info!("purged {} old event entries", n),
+                _ => {}
+            }
+            match db::queries::purge_old_sandbox_jobs(&pool_for_cleanup).await {
+                Ok(n) if n > 0 => info!("purged {} old sandbox job entries", n),
+                _ => {}
+            }
+            match db::queries::purge_expired_repo_configs(&pool_for_cleanup).await {
+                Ok(n) if n > 0 => info!("purged {} expired repo config entries", n),
                 _ => {}
             }
         }
@@ -164,6 +183,219 @@ async fn run_server(cfg: config::BottoConfig, data_dir: &PathBuf) -> anyhow::Res
         None
     };
 
+    // Workflow scheduler + event matcher — background tasks for cron and event triggers.
+    let mut workflow_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    if cfg.workflows.enabled {
+        let agent_config = services::workflow::factory::AgentFactoryConfig {
+            gitlab: Some(services::gitlab::client::GitLabConfig {
+                base_url: cfg.gitlab.url.clone(),
+                token: cfg.gitlab.bot_token.clone(),
+            }),
+            ai: Some(services::ai::client::AiClientConfig {
+                base_url: cfg.ai.base_url.clone(),
+                api_key: cfg.ai.api_key.clone(),
+            }),
+            ai_default_model: cfg.ai.models.workflow_orchestrate.clone(),
+            sandbox_max_memory_mb: cfg.sandbox.max_memory_mb,
+            pool: pool.clone(),
+            botto_config: Some(cfg.clone()),
+            event_bus: Some(state.event_bus().clone()),
+        };
+
+        let cron_handle = services::workflow::scheduler::spawn_cron_scheduler(
+            pool.clone(),
+            "global".into(),
+            agent_config.clone(),
+            cfg.workflows.default_step_timeout_secs,
+            state.workflow_semaphore().clone(),
+            state.event_bus().clone(),
+            queue_shutdown.clone(),
+        );
+        workflow_handles.push(cron_handle);
+        info!("workflow cron scheduler started");
+
+        let event_handle = services::workflow::scheduler::spawn_event_matcher(
+            pool.clone(),
+            state.event_bus(),
+            "global".into(),
+            agent_config.clone(),
+            cfg.workflows.default_step_timeout_secs,
+            state.workflow_semaphore().clone(),
+            queue_shutdown.clone(),
+        );
+        workflow_handles.push(event_handle);
+        info!("workflow event matcher started");
+
+        // Crash recovery: resume any non-terminal sessions from a previous run.
+        {
+            let pool_for_recovery = pool.clone();
+            let recovery_agent_config = agent_config.clone();
+            let recovery_event_bus = state.event_bus().clone();
+            let recovery_ai_model = cfg.ai.models.workflow_orchestrate.clone();
+            let recovery_ai_config = services::ai::client::AiClientConfig {
+                base_url: cfg.ai.base_url.clone(),
+                api_key: cfg.ai.api_key.clone(),
+            };
+
+            match services::workflow::crud::load_resumable_sessions(&pool_for_recovery).await {
+                Ok(sessions) if !sessions.is_empty() => {
+                    info!(count = sessions.len(), "resuming workflow sessions from previous run");
+                    for mut session in sessions {
+                        let p = pool_for_recovery.clone();
+                        let ac = recovery_agent_config.clone();
+                        let eb = recovery_event_bus.clone();
+                        let ai_cfg = recovery_ai_config.clone();
+                        let ai_model = recovery_ai_model.clone();
+                        let mentor = services::mentor::client::MentorClient::new(p.clone(), "global".into());
+
+                        let sm_config = services::workflow::session::SessionManagerConfig {
+                            ai_model,
+                            ..Default::default()
+                        };
+                        let manager = services::workflow::session::SessionManager::new(
+                            p.clone(), ai_cfg, ac, mentor, eb, sm_config,
+                        );
+
+                        let wf_name = services::workflow::crud::get_workflow(&p, &session.workflow_id.to_string())
+                            .await
+                            .ok()
+                            .flatten()
+                            .map(|w| w.name)
+                            .unwrap_or_else(|| "unknown".into());
+
+                        tokio::spawn(async move {
+                            if let Err(e) = manager.drive(&mut session, &wf_name).await {
+                                tracing::warn!(
+                                    session_id = %session.id,
+                                    error = %e,
+                                    "failed to resume session"
+                                );
+                            }
+                        });
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to load resumable sessions");
+                }
+            }
+        }
+
+        // Directive loop — background polling for standing-order directives.
+        {
+            let directive_ai_config = services::ai::client::AiClientConfig {
+                base_url: cfg.ai.base_url.clone(),
+                api_key: cfg.ai.api_key.clone(),
+            };
+            let directive_mentor = services::mentor::client::MentorClient::new(pool.clone(), "global".into());
+            let directive_config = services::directive::runner::DirectiveRunnerConfig {
+                ai_config: directive_ai_config,
+                ai_model: cfg.ai.models.workflow_orchestrate.clone(),
+                agent_config: agent_config.clone(),
+                check_interval_secs: 30,
+                escalate_after_empty_polls: 6,
+                failure_rate_warn_threshold: 0.5,
+            };
+
+            let directive_handle = services::directive::runner::spawn_directive_loop(
+                pool.clone(),
+                directive_config,
+                directive_mentor,
+                state.event_bus().clone(),
+                queue_shutdown.clone(),
+            );
+            workflow_handles.push(directive_handle);
+            info!("directive loop started");
+
+            let completion_handle = services::directive::runner::spawn_completion_listener(
+                pool.clone(),
+                state.event_bus().clone(),
+                queue_shutdown.clone(),
+            );
+            workflow_handles.push(completion_handle);
+            info!("directive completion listener started");
+        }
+    }
+
+    // Mentor pruner — background task that decays confidence and removes stale entries.
+    let mut mentor_handle: Option<tokio::task::JoinHandle<()>> = None;
+    if cfg.mentor.enabled {
+        // Sync linked repo sets from config into SQLite on startup.
+        if let Err(e) = services::mentor::linker::sync_linked_repos(&pool, &cfg.mentor.linked_repos).await {
+            tracing::warn!(error = %e, "failed to sync mentor repo links on startup");
+        }
+
+        let pruner_config = services::mentor::pruner::PrunerConfig {
+            prune_below_confidence: cfg.mentor.prune_below_confidence,
+            interval_secs: cfg.mentor.prune_interval_secs,
+            ..Default::default()
+        };
+        let mentor_client = services::mentor::client::MentorClient::new(pool.clone(), "global".into());
+        mentor_handle = Some(services::mentor::pruner::spawn(
+            mentor_client,
+            pruner_config,
+            queue_shutdown.clone(),
+        ));
+        info!("mentor pruner started");
+    }
+
+    // Channel adapter — message bus, router, and output listeners.
+    let mut channel_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    if cfg.channels.enabled {
+        if let Some(bus) = state.message_bus().cloned() {
+            // Spawn the inbound message router
+            let router_handle = services::channels::router::spawn_router(
+                pool.clone(),
+                bus.clone(),
+                cfg.channels.clone(),
+                cfg.clone(),
+                state.event_bus().clone(),
+                state.queue_manager().cloned(),
+                queue_shutdown.clone(),
+            );
+            channel_handles.push(router_handle);
+            info!("channel router started");
+
+            // Spawn the EventBus → MessageBus bridge (delivers session results to channels)
+            let bridge_handle = services::channels::bridge::spawn_event_bridge(
+                pool.clone(),
+                state.event_bus().clone(),
+                bus.clone(),
+                queue_shutdown.clone(),
+            );
+            channel_handles.push(bridge_handle);
+            info!("event bridge started");
+
+            // Spawn GitLab output listener (if GitLab channel + output enabled)
+            if cfg.channels.gitlab.enabled && cfg.channels.output.gitlab_comments {
+                let gl_cfg = services::gitlab::client::GitLabConfig {
+                    base_url: cfg.gitlab.url.clone(),
+                    token: cfg.gitlab.bot_token.clone(),
+                };
+                let gl_handle = services::channels::gitlab_output::spawn_gitlab_output_listener(
+                    pool.clone(),
+                    bus.clone(),
+                    gl_cfg,
+                    queue_shutdown.clone(),
+                );
+                channel_handles.push(gl_handle);
+                info!("GitLab output listener started");
+            }
+
+            // Spawn Slack output listener (if Slack channel + output enabled)
+            if cfg.channels.slack.enabled && cfg.channels.output.slack_messages {
+                let sl_handle = services::channels::slack_output::spawn_slack_output_listener(
+                    pool.clone(),
+                    bus.clone(),
+                    cfg.channels.slack.clone(),
+                    queue_shutdown.clone(),
+                );
+                channel_handles.push(sl_handle);
+                info!("Slack output listener started");
+            }
+        }
+    }
+
     // Start HTTP + WebSocket server (blocks until shutdown)
     let result = server::run(state.clone()).await;
 
@@ -171,6 +403,15 @@ async fn run_server(cfg: config::BottoConfig, data_dir: &PathBuf) -> anyhow::Res
     queue_shutdown.cancel();
     cleanup_handle.abort();
     if let Some(h) = reaper_handle {
+        h.abort();
+    }
+    for h in workflow_handles {
+        h.abort();
+    }
+    if let Some(h) = mentor_handle {
+        h.abort();
+    }
+    for h in channel_handles {
         h.abort();
     }
     let _ = queue_handle.await;

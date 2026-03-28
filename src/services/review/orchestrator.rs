@@ -222,7 +222,6 @@ pub async fn execute_review(
     let mut collected_edge_cases: Vec<EdgeCase> = Vec::new();
     let mut collected_related_files: Vec<RelatedFile> = Vec::new();
     let mut collected_file_activity: Option<FileActivityData> = None;
-    let mut collected_verification: Option<VerificationData> = None;
 
     // Carry forward unchanged file reviews from cache
     if let Some(prev) = prev_review {
@@ -750,14 +749,14 @@ pub async fn execute_review(
     // Build verification data
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_secs() as i64;
 
     let has_verification = collected_adversarial.is_some()
         || collected_contracts.is_some()
         || collected_behavioral_delta.is_some();
 
-    collected_verification = if has_verification {
+    let collected_verification = if has_verification {
         Some(VerificationData {
             status: VerificationDataStatus::Complete,
             error: None,

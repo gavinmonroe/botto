@@ -80,6 +80,30 @@ pub async fn page(
     Html(include_str!("admin_page.html")).into_response()
 }
 
+/// Serve the embedded directives dashboard page.
+pub async fn directives_page(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AdminQuery>,
+) -> impl IntoResponse {
+    if let Err(e) = check_auth(&state, &headers, &query) {
+        return e.into_response();
+    }
+    Html(include_str!("admin_directives.html")).into_response()
+}
+
+/// Serve the embedded workflow dashboard page.
+pub async fn workflows_page(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AdminQuery>,
+) -> impl IntoResponse {
+    if let Err(e) = check_auth(&state, &headers, &query) {
+        return e.into_response();
+    }
+    Html(include_str!("admin_workflows.html")).into_response()
+}
+
 /// Return the current config with secrets redacted.
 pub async fn get_config(
     State(state): State<AppState>,
@@ -165,6 +189,9 @@ pub async fn get_status(
 
     let cfg = state.config();
 
+    // Gather cache statistics
+    let cache_stats = gather_cache_stats(state.pool()).await;
+
     Json(serde_json::json!({
         "connections": {
             "total": total_connections,
@@ -183,6 +210,7 @@ pub async fn get_status(
             "warm_containers": cfg.sandbox.warm_containers,
             "warm_active": state.warm_pool().map(|p| p.count()).unwrap_or(0),
         },
+        "cache": cache_stats,
         "version": env!("CARGO_PKG_VERSION"),
     })).into_response()
 }
@@ -205,7 +233,7 @@ pub async fn list_repo_configs(
         Ok(rows) => {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_default()
                 .as_secs() as i64;
             let configs: Vec<serde_json::Value> = rows
                 .into_iter()
@@ -242,4 +270,40 @@ pub async fn delete_repo_config(
 
     crate::services::repo_config::invalidate(state.pool(), &project_path).await;
     Json(serde_json::json!({ "invalidated": true, "project_path": project_path })).into_response()
+}
+
+/// Gather cache statistics from the database for the admin status endpoint.
+async fn gather_cache_stats(pool: &sqlx::SqlitePool) -> serde_json::Value {
+    let review_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM review_cache")
+        .fetch_one(pool)
+        .await
+        .unwrap_or(0);
+
+    let cluster_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM mr_clusters")
+        .fetch_one(pool)
+        .await
+        .unwrap_or(0);
+
+    let digest_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM digests")
+        .fetch_one(pool)
+        .await
+        .unwrap_or(0);
+
+    let sandbox_job_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sandbox_jobs")
+        .fetch_one(pool)
+        .await
+        .unwrap_or(0);
+
+    let file_index_count: i64 = sqlx::query_scalar("SELECT COUNT(DISTINCT project_id || ':' || mr_iid) FROM mr_changed_files")
+        .fetch_one(pool)
+        .await
+        .unwrap_or(0);
+
+    serde_json::json!({
+        "review_cache_entries": review_count,
+        "cluster_entries": cluster_count,
+        "digest_entries": digest_count,
+        "sandbox_jobs_total": sandbox_job_count,
+        "file_index_mrs": file_index_count,
+    })
 }

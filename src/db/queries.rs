@@ -167,6 +167,22 @@ pub async fn purge_expired_reviews(pool: &SqlitePool) -> Result<u64> {
     Ok(result.rows_affected())
 }
 
+/// Delete all cached reviews for a specific MR.
+pub async fn invalidate_mr_review_cache(
+    pool: &SqlitePool,
+    project_path: &str,
+    mr_iid: i64,
+) -> Result<u64> {
+    let result = sqlx::query(
+        "DELETE FROM review_cache WHERE project_path = ? AND mr_iid = ?",
+    )
+    .bind(project_path)
+    .bind(mr_iid)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
 // ---------------------------------------------------------------------------
 // Comment actions
 // ---------------------------------------------------------------------------
@@ -357,6 +373,63 @@ pub async fn get_sandbox_job(
     .fetch_optional(pool)
     .await?;
     Ok(row)
+}
+
+/// List cached reviews for a project, ordered by most recent first.
+/// Returns metadata only (not the full review blob).
+pub async fn list_cached_reviews(
+    pool: &SqlitePool,
+    project_path: &str,
+) -> Result<Vec<(i64, String, i64, i64)>> {
+    let now = epoch_secs();
+    let rows: Vec<(i64, String, i64, i64)> = sqlx::query_as(
+        "SELECT mr_iid, diff_hash, created_at, expires_at
+         FROM review_cache
+         WHERE project_path = ? AND expires_at > ?
+         ORDER BY created_at DESC
+         LIMIT 50",
+    )
+    .bind(project_path)
+    .bind(now)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+/// Count indexed MRs and files for a project in the file index.
+pub async fn get_file_index_stats(
+    pool: &SqlitePool,
+    project_id: i64,
+) -> Result<(i64, i64)> {
+    let row: Option<(i64, i64)> = sqlx::query_as(
+        "SELECT COUNT(DISTINCT mr_iid), COUNT(*)
+         FROM mr_changed_files
+         WHERE project_id = ?",
+    )
+    .bind(project_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.unwrap_or((0, 0)))
+}
+
+/// List sandbox jobs for a specific MR, ordered by most recent first.
+pub async fn get_sandbox_jobs_for_mr(
+    pool: &SqlitePool,
+    project_path: &str,
+    mr_iid: i64,
+) -> Result<Vec<(String, String, Option<String>, String, Option<String>, Option<String>, i64, i64)>> {
+    let rows = sqlx::query_as(
+        "SELECT id, status, comment_id, strategy, commit_sha, error, created_at, updated_at
+         FROM sandbox_jobs
+         WHERE project_path = ? AND mr_iid = ?
+         ORDER BY created_at DESC
+         LIMIT 50",
+    )
+    .bind(project_path)
+    .bind(mr_iid)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
 }
 
 // ---------------------------------------------------------------------------
@@ -1093,6 +1166,88 @@ pub async fn purge_expired_clusters(pool: &SqlitePool) -> Result<u64> {
         .execute(pool)
         .await?;
     Ok(result.rows_affected())
+}
+
+/// Purge expired digest entries across all projects.
+pub async fn purge_expired_digests(pool: &SqlitePool) -> Result<u64> {
+    let now = epoch_secs();
+    let result = sqlx::query("DELETE FROM digests WHERE expires_at <= ?")
+        .bind(now)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
+}
+
+/// Purge old events (older than 30 days) to prevent unbounded growth.
+pub async fn purge_old_events(pool: &SqlitePool) -> Result<u64> {
+    let cutoff = epoch_secs() - (30 * 86400); // 30 days
+    let result = sqlx::query("DELETE FROM events WHERE created_at < ?")
+        .bind(cutoff)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
+}
+
+/// Purge old completed/errored sandbox jobs (older than 30 days).
+pub async fn purge_old_sandbox_jobs(pool: &SqlitePool) -> Result<u64> {
+    let cutoff = epoch_secs() - (30 * 86400); // 30 days
+    let result = sqlx::query(
+        "DELETE FROM sandbox_jobs WHERE status IN ('complete', 'error', 'failed') AND created_at < ?",
+    )
+    .bind(cutoff)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+/// Purge expired repo configs.
+pub async fn purge_expired_repo_configs(pool: &SqlitePool) -> Result<u64> {
+    let now = epoch_secs();
+    let result = sqlx::query("DELETE FROM repo_configs WHERE expires_at <= ?")
+        .bind(now)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
+}
+
+/// List recent workflow runs, ordered by most recent first.
+pub async fn list_workflow_runs(
+    pool: &SqlitePool,
+    limit: i64,
+) -> Result<Vec<(String, String, String, Option<String>, String, String, Option<String>, i64, Option<i64>)>> {
+    let rows = sqlx::query_as(
+        "SELECT id, workflow_id, trigger_type, trigger_data, status, step_states, final_verification, started_at, completed_at
+         FROM workflow_runs
+         ORDER BY started_at DESC
+         LIMIT ?",
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+/// List all workflows (optionally filtered by enabled status).
+pub async fn list_workflows(
+    pool: &SqlitePool,
+    enabled_only: bool,
+) -> Result<Vec<(String, String, String, Option<i64>, String, bool, Option<String>, i64, i64)>> {
+    let rows = if enabled_only {
+        sqlx::query_as(
+            "SELECT id, name, description, project_id, definition, enabled, created_by, created_at, updated_at
+             FROM workflows WHERE enabled = 1 ORDER BY name",
+        )
+        .fetch_all(pool)
+        .await?
+    } else {
+        sqlx::query_as(
+            "SELECT id, name, description, project_id, definition, enabled, created_by, created_at, updated_at
+             FROM workflows ORDER BY name",
+        )
+        .fetch_all(pool)
+        .await?
+    };
+    Ok(rows)
 }
 
 // ---------------------------------------------------------------------------

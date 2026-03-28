@@ -21,6 +21,11 @@ pub async fn well_known(State(state): State<AppState>) -> Json<Value> {
             "shared_triage": true,
             "review_queue": true,
             "webhooks": cfg.gitlab.webhook_secret.is_some(),
+            "conflict_radar": cfg.conflict.enabled,
+            "cross_mr_clusters": cfg.cluster.enabled,
+            "team_digest": true,
+            "chat": !cfg.ai.base_url.is_empty(),
+            "verification": !cfg.ai.base_url.is_empty(),
         }
     }))
 }

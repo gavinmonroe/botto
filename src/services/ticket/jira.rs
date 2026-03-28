@@ -47,10 +47,15 @@ pub struct TicketInfo {
 }
 
 fn build_client() -> Client {
-    Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .expect("failed to build HTTP client")
+    static CLIENT: std::sync::OnceLock<Client> = std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            Client::builder()
+                .timeout(std::time::Duration::from_secs(15))
+                .build()
+                .expect("failed to build HTTP client")
+        })
+        .clone()
 }
 
 fn auth_header(cfg: &JiraConfig) -> String {

@@ -1,5 +1,3 @@
-version: "3.8"
-
 services:
   botto:
     build: .
@@ -15,12 +13,15 @@ services:
       - BOTTO_AI_KEY=${BOTTO_AI_KEY}
       - BOTTO_AI_URL=${BOTTO_AI_URL}
       - BOTTO_WEBHOOK_SECRET=${BOTTO_WEBHOOK_SECRET:-}
+      - BOTTO_SLACK_BOT_TOKEN=${BOTTO_SLACK_BOT_TOKEN:-}
+      - BOTTO_SLACK_SIGNING_SECRET=${BOTTO_SLACK_SIGNING_SECRET:-}
       - RUST_LOG=botto=info,tower_http=info
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:7700/health"]
+      test: ["CMD-SHELL", "curl -sf http://localhost:7700/health || exit 1"]
       interval: 30s
       timeout: 5s
+      start_period: 10s
       retries: 3
 
 volumes:

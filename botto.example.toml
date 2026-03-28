@@ -8,6 +8,8 @@
 [server]
 host = "0.0.0.0"
 port = 7700
+# max_concurrent_reviews = 3   # max MR reviews running simultaneously
+# max_concurrent_ai_calls = 6  # max concurrent AI API calls across all reviews
 
 [auth]
 # Shared secret that Otto extensions use to authenticate.
@@ -38,6 +40,9 @@ api_key = ""
 # adversarial_tests = "claude-sonnet-4-5"
 # contracts = "claude-sonnet-4-5"
 # behavioral_delta = "claude-sonnet-4-5"
+# semantic_conflict = "claude-sonnet-4-5"
+# cluster_summary = "claude-sonnet-4-5"
+# cluster_review_order = "claude-haiku-4-5"
 
 [sandbox]
 # Auto-detected from Docker availability. Override to force on/off.
@@ -63,6 +68,23 @@ api_key = ""
 # is already cached and waiting.
 # auto_review_on_push = false
 
+[cluster]
+# Cross-MR cluster detection — groups related MRs by shared Jira ticket
+# or file overlap. Requires the file index to be populated (via webhooks
+# or on-demand when a user opens an MR page).
+# enabled = true
+# max_cluster_size = 8               # max MRs per cluster (2–20)
+# file_overlap_threshold = 0.15      # Jaccard similarity threshold (0.05–0.80)
+# summary_ttl_days = 7               # how long cluster entries are cached
+
+[conflict]
+# Conflict Radar — detects overlapping changes across in-flight MRs.
+# Like clusters, requires the file index. Populated automatically from
+# webhooks or on-demand when a user opens an MR.
+# enabled = true
+# semantic_analysis = false           # AI-powered semantic conflict analysis (expensive)
+# semantic_cache_ttl_days = 3         # how long semantic analysis results are cached
+
 [harness]
 # Self-evolving prompt engineering harness. Disabled by default.
 # enabled = false
@@ -73,3 +95,44 @@ api_key = ""
 # gitlab_seed_orgs = ["gitlab-org"]
 # memory_dir = "harness"      # directory for prompts, learnings, test cases
 # judge_model = "claude-opus-4-6"
+
+[workflow]
+# Automated multi-step workflows triggered by events. Disabled by default.
+# enabled = false
+# max_concurrent_runs = 3        # max parallel workflow executions
+# default_step_timeout_secs = 300  # timeout per workflow step
+
+[mentor]
+# Cross-repo learning system. Learns patterns from linked repositories
+# to improve review quality over time. Disabled by default.
+# enabled = false
+# prune_below_confidence = 0.1   # remove patterns below this confidence
+# prune_interval_secs = 86400    # how often to prune (default: daily)
+# linked_repos = []              # list of linked repo sets for cross-learning
+# Example linked repos for microservices:
+# linked_repos = [
+#     { name = "payments", repos = ["service-auth", "service-users", "service-billing"] },
+# ]
+
+[channels]
+# Channel adapter layer — enables @botto commands in GitLab comments and
+# Slack messages. Disabled by default. Requires [workflow] to be enabled
+# for autonomous features (fix, directives).
+# enabled = false
+
+# [channels.gitlab]
+# enabled = true                     # respond to @botto in GitLab comments
+# allowed_users = []                 # empty = all users with project access
+# blocked_users = []                 # block specific users (e.g., other bots)
+# rate_limit_per_minute = 20         # max commands per user per minute
+
+# [channels.slack]
+# enabled = false                    # Slack integration (requires bot setup)
+# bot_token_env = "BOTTO_SLACK_BOT_TOKEN"       # env var name for bot token
+# signing_secret_env = "BOTTO_SLACK_SIGNING_SECRET"  # env var name for signing secret
+# allowed_channels = []              # empty = all channels bot is invited to
+# rate_limit_per_minute = 20
+
+# [channels.output]
+# gitlab_comments = true             # post results as GitLab comments
+# slack_messages = true              # post results as Slack messages

@@ -67,10 +67,15 @@ pub struct GitLabConfig {
 // ---------------------------------------------------------------------------
 
 fn build_client() -> Client {
-    Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .expect("failed to build HTTP client")
+    static CLIENT: std::sync::OnceLock<Client> = std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .expect("failed to build HTTP client")
+        })
+        .clone()
 }
 
 fn auth_headers(token: &str) -> HeaderMap {
@@ -444,6 +449,34 @@ pub async fn create_commit(
         .map_err(|e| GitLabError::Parse(e.to_string()))
 }
 
+/// Post a note (comment) on an issue.
+/// Mirrors post_mr_note but targets the issues endpoint.
+pub async fn post_issue_note(
+    cfg: &GitLabConfig,
+    project_id: i64,
+    issue_iid: u64,
+    body: &str,
+) -> Result<Note, GitLabError> {
+    let url = format!(
+        "{}/api/v4/projects/{}/issues/{}/notes",
+        cfg.base_url, project_id, issue_iid
+    );
+    let client = build_client();
+
+    let resp = client
+        .post(&url)
+        .headers(auth_headers(&cfg.token))
+        .json(&serde_json::json!({ "body": body }))
+        .send()
+        .await
+        .map_err(|e| GitLabError::Network(e.to_string()))?;
+
+    let resp = check_response(resp, "post_issue_note").await?;
+    resp.json()
+        .await
+        .map_err(|e| GitLabError::Parse(e.to_string()))
+}
+
 /// Post a note (comment) on a merge request.
 /// Used to notify the MR about successful sandbox fixes with commit links.
 pub async fn post_mr_note(
@@ -696,6 +729,8 @@ pub struct MergeRequest {
     pub target_project_id: Option<i64>,
     pub web_url: String,
     pub author: Option<MrAuthor>,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
     pub merged_at: Option<String>,
     /// Whether the MR is a draft/WIP. Defaults to false if not present
     /// (e.g. older GitLab versions or list endpoints that omit it).

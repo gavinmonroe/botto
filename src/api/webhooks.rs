@@ -205,6 +205,128 @@ async fn handle_push_event(state: &AppState, payload: &serde_json::Value) {
         payload: Some(serde_json::json!({ "branch": branch, "trigger": "push" })),
     });
 
+    // --- File index update on push ---
+    // When a push lands on a branch with open MRs, the diff has changed.
+    // Re-populate the file index and run conflict/cluster detection so
+    // viewers get updated results without waiting for a separate MR webhook.
+    // (GitLab sends Push Hook and Merge Request Hook independently — the MR
+    // hook may arrive later or not at all if only Push events are configured.)
+    {
+        let cfg = state.config();
+        if cfg.conflict.enabled || cfg.cluster.enabled {
+            if let Some(project_id) = payload["project"]["id"].as_i64() {
+                let state = state.clone();
+                let project_path = project_path.to_string();
+                let branch = branch.to_string();
+
+                tokio::spawn(async move {
+                    let cfg = state.config();
+                    let gl_cfg = gitlab::GitLabConfig {
+                        base_url: cfg.gitlab.url.clone(),
+                        token: cfg.gitlab.bot_token.clone(),
+                    };
+
+                    // Find open MRs sourced from this branch
+                    let open_mrs = match gitlab::fetch_open_mrs_for_branch(
+                        &gl_cfg, project_id, &branch,
+                    ).await {
+                        Ok(mrs) => mrs,
+                        Err(e) => {
+                            warn!("push file index: failed to fetch open MRs for branch {}: {}", branch, e);
+                            return;
+                        }
+                    };
+
+                    for mr in &open_mrs {
+                        // Force re-populate — the push means the diff changed.
+                        if let Err(e) = crate::services::file_index::populate(
+                            state.pool(), &gl_cfg, project_id, mr.iid,
+                        ).await {
+                            warn!("push file index: populate failed for !{}: {}", mr.iid, e);
+                            continue;
+                        }
+
+                        let mr_ref = MrRef {
+                            project_path: project_path.clone(),
+                            mr_iid: mr.iid,
+                        };
+
+                        // Run conflict detection and broadcast
+                        if cfg.conflict.enabled {
+                            if let Ok(report) = crate::services::conflict::detector::detect_conflicts(
+                                state.pool(), &gl_cfg, project_id, mr.iid,
+                            ).await {
+                                if !report.conflicts.is_empty() {
+                                    let msg = crate::api::ws::WsOutbound::ConflictUpdated {
+                                        project_id,
+                                        mr_iid: mr.iid,
+                                        conflicts: serde_json::to_value(&report).unwrap_or_default(),
+                                    };
+                                    state.broadcast_to_mr(&mr_ref, &serde_json::to_string(&msg).unwrap_or_default());
+
+                                    // Also notify viewers of conflicting MRs
+                                    let conflicting_iids: std::collections::HashSet<u64> = report
+                                        .conflicts
+                                        .iter()
+                                        .flat_map(|fc| fc.conflicting_mrs.iter().map(|cm| cm.mr_iid))
+                                        .collect();
+
+                                    for other_iid in conflicting_iids {
+                                        if let Ok(other_report) = crate::services::conflict::detector::detect_conflicts(
+                                            state.pool(), &gl_cfg, project_id, other_iid,
+                                        ).await {
+                                            let other_ref = MrRef {
+                                                project_path: project_path.clone(),
+                                                mr_iid: other_iid,
+                                            };
+                                            let other_msg = crate::api::ws::WsOutbound::ConflictUpdated {
+                                                project_id,
+                                                mr_iid: other_iid,
+                                                conflicts: serde_json::to_value(&other_report).unwrap_or_default(),
+                                            };
+                                            state.broadcast_to_mr(&other_ref, &serde_json::to_string(&other_msg).unwrap_or_default());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Run cluster detection and broadcast
+                        if cfg.cluster.enabled {
+                            let ticket_strategy =
+                                crate::services::cluster::strategies::ticket::TicketClusterStrategy;
+                            let file_strategy =
+                                crate::services::cluster::strategies::file_overlap::FileOverlapStrategy {
+                                    jaccard_threshold: cfg.cluster.file_overlap_threshold,
+                                    max_cluster_size: cfg.cluster.max_cluster_size,
+                                };
+                            let strategies: Vec<&dyn crate::services::cluster::strategies::ClusterStrategy> =
+                                vec![&ticket_strategy, &file_strategy];
+
+                            if let Ok(clusters) = crate::services::cluster::detector::detect_clusters(
+                                state.pool(), &gl_cfg, project_id, mr.iid, &strategies,
+                            ).await {
+                                for cluster in &clusters {
+                                    for member in &cluster.member_mrs {
+                                        let member_ref = MrRef {
+                                            project_path: project_path.clone(),
+                                            mr_iid: member.mr_iid,
+                                        };
+                                        let msg = crate::api::ws::WsOutbound::ClusterUpdated {
+                                            project_id,
+                                            cluster: serde_json::to_value(cluster).unwrap_or_default(),
+                                        };
+                                        state.broadcast_to_mr(&member_ref, &serde_json::to_string(&msg).unwrap_or_default());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        }
+    }
+
     // --- Auto-review on push ---
     // If enabled, find open MRs for this branch and enqueue them for review.
     // Spawned as a background task so the webhook returns 200 immediately
@@ -228,28 +350,39 @@ async fn handle_note_event(state: &AppState, payload: &serde_json::Value) {
         .as_str()
         .unwrap_or("");
     let mr_iid = payload["merge_request"]["iid"].as_u64();
+    let issue_iid = payload["issue"]["iid"].as_u64();
 
-    if project_path.is_empty() || mr_iid.is_none() {
+    if project_path.is_empty() || (mr_iid.is_none() && issue_iid.is_none()) {
         return;
     }
 
-    let mr_iid = mr_iid.unwrap();
-    info!("note event: {} !{}", project_path, mr_iid);
+    match (mr_iid, issue_iid) {
+        (Some(iid), _) => info!("note event: {} !{}", project_path, iid),
+        (None, Some(iid)) => info!("note event: {} #{}", project_path, iid),
+        _ => return,
+    }
+
+    // Channel adapter: parse @botto mentions and /botto commands
+    if let Some(bus) = state.message_bus() {
+        crate::services::channels::gitlab_input::parse_gitlab_comment(bus, payload);
+    }
 
     // Notify connected Ottos that a new comment was posted
-    let mr_ref = MrRef {
-        project_path: project_path.to_string(),
-        mr_iid,
-    };
+    if let Some(mr_iid) = mr_iid {
+        let mr_ref = MrRef {
+            project_path: project_path.to_string(),
+            mr_iid,
+        };
 
-    let msg = serde_json::json!({
-        "type": "EVENT_NOTIFICATION",
-        "event_type": "note_added",
-        "project_path": project_path,
-        "mr_iid": mr_iid,
-    });
+        let msg = serde_json::json!({
+            "type": "EVENT_NOTIFICATION",
+            "event_type": "note_added",
+            "project_path": project_path,
+            "mr_iid": mr_iid,
+        });
 
-    state.broadcast_to_mr(&mr_ref, &msg.to_string());
+        state.broadcast_to_mr(&mr_ref, &msg.to_string());
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -439,66 +572,18 @@ async fn update_file_index_and_detect(
         }
 
         "open" | "update" | "reopen" => {
-            // Fetch MR changes and populate the file index.
-            let changes = gitlab::fetch_mr_changes(&gl_cfg, project_id, mr_iid)
-                .await
-                .map_err(|e| format!("fetch_mr_changes: {}", e))?;
-
-            // Clear existing file index entries for this MR before re-inserting.
-            // This handles force-pushes that remove files from the diff — without
-            // this, stale entries persist and cause phantom conflicts.
-            if let Err(e) = crate::db::queries::delete_mr_changed_files(
-                pool,
-                project_id,
-                mr_iid as i64,
+            // Fetch MR changes from GitLab and (re-)populate the file index.
+            // Uses file_index::populate (not ensure_populated) because webhooks
+            // always indicate a change — we need to re-fetch, not skip.
+            let file_count = crate::services::file_index::populate(
+                pool, &gl_cfg, project_id, mr_iid,
             )
             .await
-            {
-                warn!(
-                    "file index cleanup failed for {} !{}: {}",
-                    project_path, mr_iid, e
-                );
-            }
-
-            // Parse and upsert each changed file
-            for change in &changes.changes {
-                let change_type = crate::types::cluster::change_type_from_diff(
-                    change.new_file,
-                    change.deleted_file,
-                    change.renamed_file,
-                );
-                let hunks = crate::types::cluster::parse_hunks(&change.diff);
-                let diff_hash = crate::util::hash::djb2(&change.diff);
-                let hunks_json = serde_json::to_string(&hunks).unwrap_or_else(|_| "[]".into());
-
-                if let Err(e) = crate::db::queries::upsert_mr_changed_file(
-                    pool,
-                    project_id,
-                    mr_iid as i64,
-                    &change.new_path,
-                    if change.renamed_file {
-                        Some(change.old_path.as_str())
-                    } else {
-                        None
-                    },
-                    change_type.as_str(),
-                    &diff_hash,
-                    &hunks_json,
-                )
-                .await
-                {
-                    warn!(
-                        "file index upsert failed for {} !{} {}: {}",
-                        project_path, mr_iid, change.new_path, e
-                    );
-                }
-            }
+            .map_err(|e| format!("file index populate: {}", e))?;
 
             debug!(
-                "file index: upserted {} files for {} !{}",
-                changes.changes.len(),
-                project_path,
-                mr_iid
+                "file index: populated {} files for {} !{} (webhook: {})",
+                file_count, project_path, mr_iid, action
             );
 
             // Run conflict detection and broadcast results

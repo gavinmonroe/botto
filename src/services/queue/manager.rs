@@ -98,14 +98,14 @@ impl QueueManager {
         });
 
         // Sort by priority descending
-        items.sort_by(|a, b| b.priority_score.partial_cmp(&a.priority_score).unwrap());
+        items.sort_by(|a, b| b.priority_score.partial_cmp(&a.priority_score).unwrap_or(std::cmp::Ordering::Equal));
 
         // Persist to DB (review_queue table)
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs() as i64;
-        let mr_context_json = serde_json::to_vec(&json!({})).unwrap();
+        let mr_context_json = serde_json::to_vec(&json!({})).unwrap_or_default();
         let pool = self.state.pool();
         let _ = sqlx::query(
             "INSERT INTO review_queue (project_path, mr_iid, priority_score, status, mr_context, enqueued_at)
@@ -241,8 +241,15 @@ impl QueueManager {
                 // Read config fresh (hot-swap safe)
                 let cfg = self.state.config();
 
-                // Build MrContext from GitLab API
-                let mr_context = self.build_mr_context(&cfg, &project_path, mr_iid).await;
+                // Build MrContext from GitLab API (retry once on failure)
+                let mr_context = match self.build_mr_context(&cfg, &project_path, mr_iid).await {
+                    Some(ctx) => Some(ctx),
+                    None => {
+                        warn!("queue: first attempt to build context failed for {}:!{}, retrying...", project_path, mr_iid);
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        self.build_mr_context(&cfg, &project_path, mr_iid).await
+                    }
+                };
 
                 match mr_context {
                     Some(ctx) => {
@@ -307,9 +314,17 @@ impl QueueManager {
                     }
                     None => {
                         warn!(
-                            "queue: failed to build context for {}:!{}",
+                            "queue: failed to build context for {}:!{} after retry",
                             project_path, mr_iid
                         );
+                        // Mark as error in DB so it's visible in queue status
+                        let _ = crate::db::queries::update_queue_status(
+                            self.state.pool(),
+                            &project_path,
+                            mr_iid as i64,
+                            &["running"],
+                            "error",
+                        ).await;
                     }
                 }
 
