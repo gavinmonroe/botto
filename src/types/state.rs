@@ -7,6 +7,7 @@
 // ---------------------------------------------------------------------------
 
 use crate::config::BottoConfig;
+use crate::services::channels::bus::MessageBus;
 use crate::services::events::EventBus;
 use crate::services::queue::manager::QueueManager;
 use crate::services::sandbox::manager::WarmPool;
@@ -153,12 +154,19 @@ pub struct AppStateInner {
     /// Keyed by "project_id:mr_iid". Entries are lightweight (Arc<Mutex<()>>)
     /// and bounded by the number of concurrently-active MR webhooks.
     pub mr_webhook_locks: DashMap<String, Arc<tokio::sync::Mutex<()>>>,
+    /// Shared semaphore for workflow run concurrency (cron, event, and API triggers).
+    /// Initialized from `config.workflows.max_concurrent_runs`.
+    pub workflow_semaphore: Arc<Semaphore>,
+    /// Channel adapter message bus for inbound/outbound message routing.
+    /// None if channels are disabled.
+    pub message_bus: Option<MessageBus>,
 }
 
 impl AppState {
     pub fn new(config: BottoConfig, pool: SqlitePool) -> Self {
         let review_semaphore = Arc::new(Semaphore::new(config.server.max_concurrent_reviews));
         let ai_semaphore = Arc::new(Semaphore::new(config.server.max_concurrent_ai_calls));
+        let workflow_semaphore = Arc::new(Semaphore::new(config.workflows.max_concurrent_runs));
 
         // Initialize warm pool if sandbox + warm containers are both enabled
         let warm_pool = if config.sandbox.enabled && config.sandbox.warm_containers {
@@ -169,6 +177,13 @@ impl AppState {
                 );
                 Arc::new(p)
             })
+        } else {
+            None
+        };
+
+        // Initialize message bus if channels are enabled
+        let message_bus = if config.channels.enabled {
+            Some(MessageBus::new())
         } else {
             None
         };
@@ -187,6 +202,8 @@ impl AppState {
                 queue_manager: OnceLock::new(),
                 project_id_cache: DashMap::new(),
                 mr_webhook_locks: DashMap::new(),
+                workflow_semaphore,
+                message_bus,
             }),
         }
     }
@@ -230,6 +247,15 @@ impl AppState {
 
     pub fn warm_pool(&self) -> Option<&Arc<WarmPool>> {
         self.inner.warm_pool.as_ref()
+    }
+
+    pub fn workflow_semaphore(&self) -> &Arc<Semaphore> {
+        &self.inner.workflow_semaphore
+    }
+
+    /// Get the channel adapter message bus, if channels are enabled.
+    pub fn message_bus(&self) -> Option<&MessageBus> {
+        self.inner.message_bus.as_ref()
     }
 
     /// Store the queue manager after construction. Called once from main.rs

@@ -37,6 +37,22 @@ pub enum EventType {
     ConflictUpdated,
     /// A cluster was created, updated, or dissolved.
     ClusterUpdated,
+    /// A workflow run started.
+    WorkflowRunStarted,
+    /// A workflow run completed (success or failure).
+    WorkflowRunCompleted,
+    /// A workflow step started.
+    WorkflowStepStarted,
+    /// A workflow step completed.
+    WorkflowStepCompleted,
+    /// A workflow step failed.
+    WorkflowStepFailed,
+    /// A session escalated to a human for intervention.
+    SessionEscalation,
+    /// A session resumed after human response.
+    SessionResumed,
+    /// A directive escalated (empty polls, high failure rate).
+    DirectiveEscalation,
 }
 
 #[derive(Clone)]

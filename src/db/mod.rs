@@ -40,7 +40,8 @@ pub async fn init(db_path: &Path) -> Result<SqlitePool> {
 }
 
 /// Run embedded migrations. Idempotent — safe to call on every startup.
-async fn migrate(pool: &SqlitePool) -> Result<()> {
+/// Also used by tests via `init_test_db`.
+pub(crate) async fn migrate(pool: &SqlitePool) -> Result<()> {
     info!("running database migrations...");
 
     sqlx::query(MIGRATION_001)
@@ -107,6 +108,51 @@ async fn migrate(pool: &SqlitePool) -> Result<()> {
         .execute(pool)
         .await
         .context("migration 007 failed")?;
+
+    sqlx::query(MIGRATION_008)
+        .execute(pool)
+        .await
+        .context("migration 008 failed")?;
+
+    sqlx::query(MIGRATION_009)
+        .execute(pool)
+        .await
+        .context("migration 009 failed")?;
+
+    sqlx::query(MIGRATION_010)
+        .execute(pool)
+        .await
+        .context("migration 010 failed")?;
+
+    sqlx::query(MIGRATION_011)
+        .execute(pool)
+        .await
+        .context("migration 011 failed")?;
+
+    // Additional indexes for query performance (idempotent via IF NOT EXISTS).
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_sandbox_jobs_mr
+         ON sandbox_jobs(project_path, mr_iid)",
+    )
+    .execute(pool)
+    .await
+    .context("create sandbox_jobs MR index")?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_sandbox_jobs_status
+         ON sandbox_jobs(status, created_at)",
+    )
+    .execute(pool)
+    .await
+    .context("create sandbox_jobs status index")?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_digests_lookup
+         ON digests(project_path, period)",
+    )
+    .execute(pool)
+    .await
+    .context("create digests lookup index")?;
 
     info!("migrations complete");
     Ok(())
@@ -336,3 +382,297 @@ CREATE INDEX IF NOT EXISTS idx_clusters_project
 CREATE INDEX IF NOT EXISTS idx_clusters_ticket
     ON mr_clusters(ticket_key);
 "#;
+
+const MIGRATION_008: &str = r#"
+-- ---------------------------------------------------------------------------
+-- Mentor knowledge store
+-- ---------------------------------------------------------------------------
+
+-- Core knowledge entries — execution patterns, domain knowledge, workflow
+-- learnings, and user corrections. Scoped per-repo, per-linked-set, or global.
+-- hit_count + last_queried_at drive the self-pruning system: entries that are
+-- never queried decay in confidence and eventually get pruned.
+CREATE TABLE IF NOT EXISTS mentor_entries (
+    id                  TEXT PRIMARY KEY,
+    content             TEXT NOT NULL,
+    scope               TEXT NOT NULL,
+    scope_type          TEXT NOT NULL CHECK(scope_type IN ('repo', 'linked', 'global')),
+    category            TEXT NOT NULL CHECK(category IN ('execution', 'domain', 'workflow', 'correction')),
+    source_workflow_id  TEXT,
+    source_step_id      TEXT,
+    created_at          INTEGER NOT NULL,
+    last_queried_at     INTEGER,
+    hit_count           INTEGER NOT NULL DEFAULT 0,
+    confidence          REAL NOT NULL DEFAULT 1.0
+);
+CREATE INDEX IF NOT EXISTS idx_mentor_scope
+    ON mentor_entries(scope, scope_type);
+CREATE INDEX IF NOT EXISTS idx_mentor_scope_category
+    ON mentor_entries(scope, category);
+CREATE INDEX IF NOT EXISTS idx_mentor_confidence
+    ON mentor_entries(confidence);
+
+-- FTS5 virtual table for full-text search over mentor entries.
+-- Uses external content mode: the actual data lives in mentor_entries,
+-- FTS5 only maintains the inverted index. We index content, scope, and
+-- category so queries can match on any of these.
+CREATE VIRTUAL TABLE IF NOT EXISTS mentor_fts USING fts5(
+    content,
+    scope,
+    category,
+    content=mentor_entries,
+    content_rowid=rowid
+);
+
+-- Sync triggers: keep mentor_fts in lockstep with mentor_entries.
+-- COALESCE guards against NULL reaching the FTS index (content is NOT NULL,
+-- but defence-in-depth costs nothing here).
+
+CREATE TRIGGER IF NOT EXISTS mentor_fts_insert
+AFTER INSERT ON mentor_entries BEGIN
+    INSERT INTO mentor_fts(rowid, content, scope, category)
+    VALUES (new.rowid, COALESCE(new.content, ''), COALESCE(new.scope, ''), COALESCE(new.category, ''));
+END;
+
+CREATE TRIGGER IF NOT EXISTS mentor_fts_delete
+BEFORE DELETE ON mentor_entries BEGIN
+    INSERT INTO mentor_fts(mentor_fts, rowid, content, scope, category)
+    VALUES ('delete', old.rowid, COALESCE(old.content, ''), COALESCE(old.scope, ''), COALESCE(old.category, ''));
+END;
+
+-- Update is two-phase: delete old index entry before the row changes,
+-- insert new entry after the row changes.
+CREATE TRIGGER IF NOT EXISTS mentor_fts_update_delete
+BEFORE UPDATE ON mentor_entries BEGIN
+    INSERT INTO mentor_fts(mentor_fts, rowid, content, scope, category)
+    VALUES ('delete', old.rowid, COALESCE(old.content, ''), COALESCE(old.scope, ''), COALESCE(old.category, ''));
+END;
+
+CREATE TRIGGER IF NOT EXISTS mentor_fts_update_insert
+AFTER UPDATE ON mentor_entries BEGIN
+    INSERT INTO mentor_fts(rowid, content, scope, category)
+    VALUES (new.rowid, COALESCE(new.content, ''), COALESCE(new.scope, ''), COALESCE(new.category, ''));
+END;
+
+-- Explicit cross-project repo links. Users configure linked sets in botto.toml
+-- (e.g., "payments" = ["service-auth", "service-users", "service-billing"]).
+-- This table is synced from config on startup for admin visibility and querying.
+CREATE TABLE IF NOT EXISTS mentor_repo_links (
+    link_name   TEXT NOT NULL,
+    repo_path   TEXT NOT NULL,
+    created_at  INTEGER NOT NULL,
+    PRIMARY KEY (link_name, repo_path)
+);
+CREATE INDEX IF NOT EXISTS idx_mentor_links_repo
+    ON mentor_repo_links(repo_path);
+
+-- ---------------------------------------------------------------------------
+-- Workflow engine
+-- ---------------------------------------------------------------------------
+
+-- Workflow definitions — the "what to do" template.
+-- definition is a JSON blob containing the full step DAG, triggers, and metadata.
+-- description preserves the original natural language intent for AI verification.
+CREATE TABLE IF NOT EXISTS workflows (
+    id            TEXT PRIMARY KEY,
+    name          TEXT NOT NULL,
+    description   TEXT NOT NULL,
+    project_id    INTEGER,
+    definition    TEXT NOT NULL,
+    enabled       INTEGER NOT NULL DEFAULT 1,
+    created_by    TEXT,
+    created_at    INTEGER NOT NULL,
+    updated_at    INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_workflows_project
+    ON workflows(project_id, enabled);
+CREATE INDEX IF NOT EXISTS idx_workflows_enabled
+    ON workflows(enabled);
+
+-- Workflow run instances — one row per execution of a workflow.
+-- step_states is a JSON object mapping step_id → StepState.
+-- final_verification is a JSON object with the AI verification result.
+-- Both are checkpointed after every step transition for crash recovery.
+CREATE TABLE IF NOT EXISTS workflow_runs (
+    id                  TEXT PRIMARY KEY,
+    workflow_id         TEXT NOT NULL REFERENCES workflows(id),
+    trigger_type        TEXT NOT NULL,
+    trigger_data        TEXT,
+    status              TEXT NOT NULL CHECK(status IN ('pending', 'running', 'completed', 'failed', 'cancelled')),
+    step_states         TEXT NOT NULL DEFAULT '{}',
+    final_verification  TEXT,
+    started_at          INTEGER NOT NULL,
+    completed_at        INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_wfruns_workflow
+    ON workflow_runs(workflow_id, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_wfruns_status
+    ON workflow_runs(status);
+
+-- Step-level event log for workflow runs — append-only audit trail.
+-- Used for monitoring dashboards and debugging failed runs.
+CREATE TABLE IF NOT EXISTS workflow_run_log (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id      TEXT NOT NULL REFERENCES workflow_runs(id),
+    step_id     TEXT,
+    event_type  TEXT NOT NULL,
+    data        TEXT,
+    created_at  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_wflog_run
+    ON workflow_run_log(run_id, created_at);
+"#;
+
+const MIGRATION_009: &str = r#"
+-- ---------------------------------------------------------------------------
+-- Session-based orchestrator (v2)
+-- ---------------------------------------------------------------------------
+
+-- Workflow sessions — long-running stateful execution with human-in-the-loop.
+-- Each session is a single run of a workflow through the plan-execute-evaluate
+-- loop. Mutable state columns (status, plan, step_outputs, current_step_id,
+-- retry_count, evaluator_feedback, escalation) are checkpointed after every
+-- state transition for crash recovery.
+CREATE TABLE IF NOT EXISTS workflow_sessions (
+    id                TEXT PRIMARY KEY,
+    workflow_id       TEXT NOT NULL REFERENCES workflows(id),
+    status            TEXT NOT NULL CHECK(status IN (
+                          'created', 'planning', 'executing', 'evaluating',
+                          'adapting', 'waiting_for_human', 'completed',
+                          'failed', 'cancelled'
+                      )),
+    trigger_type      TEXT NOT NULL,
+    trigger_data      TEXT,
+    plan              TEXT,
+    step_outputs      TEXT NOT NULL DEFAULT '{}',
+    current_step_id   TEXT,
+    retry_count       INTEGER NOT NULL DEFAULT 0,
+    max_retries       INTEGER NOT NULL DEFAULT 3,
+    evaluator_feedback TEXT,
+    escalation        TEXT,
+    started_at        INTEGER NOT NULL,
+    completed_at      INTEGER,
+    updated_at        INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sessions_status
+    ON workflow_sessions(status);
+CREATE INDEX IF NOT EXISTS idx_sessions_workflow
+    ON workflow_sessions(workflow_id, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_sessions_waiting
+    ON workflow_sessions(status) WHERE status = 'waiting_for_human';
+
+-- Session messages — human conversation thread per session.
+-- Supports the escalation / human-in-the-loop flow: agent asks a question,
+-- human replies, agent resumes.
+CREATE TABLE IF NOT EXISTS session_messages (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id  TEXT NOT NULL REFERENCES workflow_sessions(id),
+    direction   TEXT NOT NULL CHECK(direction IN ('agent_to_human', 'human_to_agent')),
+    content     TEXT NOT NULL,
+    metadata    TEXT,
+    created_at  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_session_messages
+    ON session_messages(session_id, created_at);
+"#;
+
+const MIGRATION_010: &str = r#"
+-- ---------------------------------------------------------------------------
+-- Directives — standing orders that continuously discover and process work.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS directives (
+    id              TEXT PRIMARY KEY,
+    name            TEXT NOT NULL,
+    intent          TEXT NOT NULL,
+    sources         TEXT NOT NULL DEFAULT '[]',
+    constraints     TEXT NOT NULL DEFAULT '{}',
+    priority        INTEGER NOT NULL DEFAULT 5,
+    status          TEXT NOT NULL CHECK(status IN ('active', 'paused', 'waiting_for_human', 'retired')),
+    poll_interval_secs INTEGER NOT NULL DEFAULT 300,
+    last_poll_at    INTEGER,
+    next_poll_at    INTEGER,
+    escalation      TEXT,
+    created_by      TEXT,
+    created_at      INTEGER NOT NULL,
+    updated_at      INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_directives_status
+    ON directives(status);
+CREATE INDEX IF NOT EXISTS idx_directives_active_poll
+    ON directives(status, next_poll_at) WHERE status = 'active';
+
+CREATE TABLE IF NOT EXISTS directive_work_items (
+    directive_id    TEXT NOT NULL REFERENCES directives(id),
+    external_id     TEXT NOT NULL,
+    source_type     TEXT NOT NULL,
+    source_url      TEXT,
+    title           TEXT NOT NULL,
+    description     TEXT,
+    metadata        TEXT NOT NULL DEFAULT '{}',
+    session_id      TEXT REFERENCES workflow_sessions(id),
+    status          TEXT NOT NULL CHECK(status IN (
+                        'discovered', 'accepted', 'rejected',
+                        'in_progress', 'completed', 'failed'
+                    )),
+    triage_reason   TEXT,
+    priority        INTEGER NOT NULL DEFAULT 5,
+    discovered_at   INTEGER NOT NULL,
+    updated_at      INTEGER NOT NULL,
+    PRIMARY KEY (directive_id, external_id)
+);
+CREATE INDEX IF NOT EXISTS idx_dwi_directive_status
+    ON directive_work_items(directive_id, status);
+CREATE INDEX IF NOT EXISTS idx_dwi_session
+    ON directive_work_items(session_id);
+"#;
+
+const MIGRATION_011: &str = r#"
+-- ---------------------------------------------------------------------------
+-- Channel Adapter — audit log and rate limiting
+-- ---------------------------------------------------------------------------
+
+-- Channel messages audit log — records all inbound and outbound messages
+-- across all channels for debugging, compliance, and thread history.
+CREATE TABLE IF NOT EXISTS channel_messages (
+    id          TEXT PRIMARY KEY,
+    direction   TEXT NOT NULL CHECK(direction IN ('inbound', 'outbound')),
+    channel     TEXT NOT NULL,
+    channel_id  TEXT NOT NULL,
+    user_id     TEXT NOT NULL DEFAULT '',
+    user_name   TEXT NOT NULL DEFAULT '',
+    thread_id   TEXT,
+    action      TEXT NOT NULL,
+    content     TEXT NOT NULL,
+    context_json TEXT NOT NULL DEFAULT '{}',
+    created_at  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_channel_messages_channel_thread
+    ON channel_messages(channel, thread_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_channel_messages_user
+    ON channel_messages(user_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_channel_messages_created
+    ON channel_messages(created_at);
+
+-- Rate limit tracking — sliding window token bucket.
+-- Entries older than 2 minutes are periodically cleaned up.
+CREATE TABLE IF NOT EXISTS channel_rate_limits (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    rate_key    TEXT NOT NULL,
+    created_at  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_channel_rate_limits_key
+    ON channel_rate_limits(rate_key, created_at);
+"#;
+
+/// Create an in-memory SQLite pool with all migrations applied. For tests only.
+#[cfg(test)]
+pub async fn test_pool() -> SqlitePool {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("failed to create in-memory SQLite pool");
+    migrate(&pool).await.expect("migrations failed on test pool");
+    pool
+}

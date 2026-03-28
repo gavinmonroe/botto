@@ -39,13 +39,16 @@ anyhow = "1"
 thiserror = "2"
 
 # Utilities
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 flate2 = "1"
 dashmap = "6"
 sysinfo = "0.33"
+url = "2"
 urlencoding = "2"
 base64 = "0.22"
+hmac = "0.12"
+sha2 = "0.10"
 arc-swap = "1"
 
 # Async utilities

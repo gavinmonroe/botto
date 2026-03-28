@@ -27,6 +27,9 @@ pub struct BottoConfig {
     pub harness: HarnessConfig,
     pub cluster: ClusterConfig,
     pub conflict: ConflictConfig,
+    pub workflows: WorkflowConfig,
+    pub mentor: MentorConfig,
+    pub channels: ChannelConfig,
     pub data_dir: PathBuf,
 }
 
@@ -83,6 +86,10 @@ pub struct AiModelConfig {
     pub cluster_summary: String,
     /// Model for cross-MR guided review order generation.
     pub cluster_review_order: String,
+    /// Model for decomposing natural-language workflow descriptions into steps.
+    pub workflow_decompose: String,
+    /// Model for orchestrating workflow step execution.
+    pub workflow_orchestrate: String,
 }
 
 impl Default for AiModelConfig {
@@ -103,6 +110,8 @@ impl Default for AiModelConfig {
             semantic_conflict: "claude-sonnet-4-5".into(),
             cluster_summary: "claude-sonnet-4-5".into(),
             cluster_review_order: "claude-haiku-4-5".into(),
+            workflow_decompose: "claude-sonnet-4-5".into(),
+            workflow_orchestrate: "claude-sonnet-4-5".into(),
         }
     }
 }
@@ -289,6 +298,129 @@ impl Default for ConflictConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkflowConfig {
+    pub enabled: bool,
+    pub max_concurrent_runs: usize,
+    pub default_step_timeout_secs: u64,
+}
+
+impl Default for WorkflowConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_concurrent_runs: 3,
+            default_step_timeout_secs: 300,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MentorConfig {
+    pub enabled: bool,
+    pub prune_below_confidence: f64,
+    pub prune_interval_secs: u64,
+    pub linked_repos: Vec<LinkedRepoSet>,
+}
+
+impl Default for MentorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            prune_below_confidence: 0.1,
+            prune_interval_secs: 86400,
+            linked_repos: Vec::new(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Channel Adapter config
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ChannelConfig {
+    /// Master switch for the channel adapter layer.
+    pub enabled: bool,
+    pub gitlab: GitLabChannelConfig,
+    pub slack: SlackChannelConfig,
+    pub output: OutputChannelConfig,
+    /// Default rate limit (requests per minute) for channels without a specific limit.
+    pub default_rate_limit_per_minute: u32,
+}
+
+impl Default for ChannelConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            gitlab: GitLabChannelConfig::default(),
+            slack: SlackChannelConfig::default(),
+            output: OutputChannelConfig::default(),
+            default_rate_limit_per_minute: 30,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GitLabChannelConfig {
+    pub enabled: bool,
+    /// Users allowed to interact via GitLab comments. Empty = all users.
+    pub allowed_users: Vec<String>,
+    pub rate_limit_per_minute: u32,
+}
+
+impl Default for GitLabChannelConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            allowed_users: Vec::new(),
+            rate_limit_per_minute: 20,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SlackChannelConfig {
+    pub enabled: bool,
+    pub bot_token: String,
+    pub signing_secret: String,
+    pub rate_limit_per_minute: u32,
+}
+
+impl Default for SlackChannelConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bot_token: String::new(),
+            signing_secret: String::new(),
+            rate_limit_per_minute: 20,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OutputChannelConfig {
+    /// Post GitLab comments for outbound messages.
+    pub gitlab_comments: bool,
+    /// Post Slack messages for outbound messages.
+    pub slack_messages: bool,
+}
+
+impl Default for OutputChannelConfig {
+    fn default() -> Self {
+        Self {
+            gitlab_comments: true,
+            slack_messages: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LinkedRepoSet {
+    pub name: String,
+    pub repos: Vec<String>,
+}
+
 // ---------------------------------------------------------------------------
 // TOML file schema (optional fields — everything has defaults)
 // ---------------------------------------------------------------------------
@@ -305,6 +437,9 @@ struct TomlConfig {
     harness: Option<TomlHarness>,
     cluster: Option<TomlCluster>,
     conflict: Option<TomlConflict>,
+    workflows: Option<TomlWorkflows>,
+    mentor: Option<TomlMentor>,
+    channels: Option<TomlChannels>,
 }
 
 #[derive(Deserialize, Default)]
@@ -352,6 +487,8 @@ struct TomlAiModels {
     semantic_conflict: Option<String>,
     cluster_summary: Option<String>,
     cluster_review_order: Option<String>,
+    workflow_decompose: Option<String>,
+    workflow_orchestrate: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -426,6 +563,51 @@ struct TomlConflict {
     enabled: Option<bool>,
     semantic_analysis: Option<bool>,
     semantic_cache_ttl_days: Option<u32>,
+}
+
+#[derive(Deserialize, Default)]
+struct TomlWorkflows {
+    enabled: Option<bool>,
+    max_concurrent_runs: Option<usize>,
+    default_step_timeout_secs: Option<u64>,
+}
+
+#[derive(Deserialize, Default)]
+struct TomlMentor {
+    enabled: Option<bool>,
+    prune_below_confidence: Option<f64>,
+    prune_interval_secs: Option<u64>,
+    linked_repos: Option<Vec<LinkedRepoSet>>,
+}
+
+#[derive(Deserialize, Default)]
+struct TomlChannels {
+    enabled: Option<bool>,
+    default_rate_limit_per_minute: Option<u32>,
+    gitlab: Option<TomlGitLabChannel>,
+    slack: Option<TomlSlackChannel>,
+    output: Option<TomlOutputChannel>,
+}
+
+#[derive(Deserialize, Default)]
+struct TomlGitLabChannel {
+    enabled: Option<bool>,
+    allowed_users: Option<Vec<String>>,
+    rate_limit_per_minute: Option<u32>,
+}
+
+#[derive(Deserialize, Default)]
+struct TomlSlackChannel {
+    enabled: Option<bool>,
+    bot_token: Option<String>,
+    signing_secret: Option<String>,
+    rate_limit_per_minute: Option<u32>,
+}
+
+#[derive(Deserialize, Default)]
+struct TomlOutputChannel {
+    gitlab_comments: Option<bool>,
+    slack_messages: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -503,6 +685,9 @@ pub async fn load(config_path: &Option<PathBuf>, data_dir: &Path) -> Result<Bott
     let toml_harness = toml_cfg.harness.unwrap_or_default();
     let toml_cluster = toml_cfg.cluster.unwrap_or_default();
     let toml_conflict = toml_cfg.conflict.unwrap_or_default();
+    let toml_workflows = toml_cfg.workflows.unwrap_or_default();
+    let toml_mentor = toml_cfg.mentor.unwrap_or_default();
+    let toml_channels = toml_cfg.channels.unwrap_or_default();
     let toml_models = toml_ai.models.unwrap_or_default();
     let toml_custom_prompts = toml_ai.custom_prompts.unwrap_or_default();
     let default_models = AiModelConfig::default();
@@ -561,6 +746,8 @@ pub async fn load(config_path: &Option<PathBuf>, data_dir: &Path) -> Result<Bott
                 semantic_conflict: toml_models.semantic_conflict.unwrap_or(default_models.semantic_conflict),
                 cluster_summary: toml_models.cluster_summary.unwrap_or(default_models.cluster_summary),
                 cluster_review_order: toml_models.cluster_review_order.unwrap_or(default_models.cluster_review_order),
+                workflow_decompose: toml_models.workflow_decompose.unwrap_or(default_models.workflow_decompose),
+                workflow_orchestrate: toml_models.workflow_orchestrate.unwrap_or(default_models.workflow_orchestrate),
             },
             custom_prompts: AiCustomPrompts {
                 summary: toml_custom_prompts.summary.unwrap_or_default(),
@@ -630,6 +817,43 @@ pub async fn load(config_path: &Option<PathBuf>, data_dir: &Path) -> Result<Bott
             semantic_analysis: toml_conflict.semantic_analysis.unwrap_or(false),
             semantic_cache_ttl_days: toml_conflict.semantic_cache_ttl_days.unwrap_or(3),
         },
+        workflows: WorkflowConfig {
+            enabled: toml_workflows.enabled.unwrap_or(false),
+            max_concurrent_runs: toml_workflows.max_concurrent_runs.unwrap_or(3),
+            default_step_timeout_secs: toml_workflows.default_step_timeout_secs.unwrap_or(300),
+        },
+        mentor: MentorConfig {
+            enabled: toml_mentor.enabled.unwrap_or(false),
+            prune_below_confidence: toml_mentor.prune_below_confidence.unwrap_or(0.1),
+            prune_interval_secs: toml_mentor.prune_interval_secs.unwrap_or(86400),
+            linked_repos: toml_mentor.linked_repos.unwrap_or_default(),
+        },
+        channels: {
+            let toml_gl_ch = toml_channels.gitlab.unwrap_or_default();
+            let toml_sl_ch = toml_channels.slack.unwrap_or_default();
+            let toml_out_ch = toml_channels.output.unwrap_or_default();
+            let env_slack_token = std::env::var("BOTTO_SLACK_BOT_TOKEN").ok();
+            let env_slack_secret = std::env::var("BOTTO_SLACK_SIGNING_SECRET").ok();
+            ChannelConfig {
+                enabled: toml_channels.enabled.unwrap_or(false),
+                default_rate_limit_per_minute: toml_channels.default_rate_limit_per_minute.unwrap_or(30),
+                gitlab: GitLabChannelConfig {
+                    enabled: toml_gl_ch.enabled.unwrap_or(true),
+                    allowed_users: toml_gl_ch.allowed_users.unwrap_or_default(),
+                    rate_limit_per_minute: toml_gl_ch.rate_limit_per_minute.unwrap_or(20),
+                },
+                slack: SlackChannelConfig {
+                    enabled: toml_sl_ch.enabled.unwrap_or(false),
+                    bot_token: env_slack_token.or(toml_sl_ch.bot_token).unwrap_or_default(),
+                    signing_secret: env_slack_secret.or(toml_sl_ch.signing_secret).unwrap_or_default(),
+                    rate_limit_per_minute: toml_sl_ch.rate_limit_per_minute.unwrap_or(20),
+                },
+                output: OutputChannelConfig {
+                    gitlab_comments: toml_out_ch.gitlab_comments.unwrap_or(true),
+                    slack_messages: toml_out_ch.slack_messages.unwrap_or(true),
+                },
+            }
+        },
         data_dir: data_dir.to_path_buf(),
     })
 }
@@ -697,6 +921,8 @@ pub struct ConfigResponse {
     pub harness: HarnessConfigRedacted,
     pub cluster: ClusterConfig,
     pub conflict: ConflictConfig,
+    pub workflows: WorkflowConfig,
+    pub mentor: MentorConfig,
     pub data_dir: String,
 }
 
@@ -765,6 +991,8 @@ impl ConfigResponse {
             },
             cluster: cfg.cluster.clone(),
             conflict: cfg.conflict.clone(),
+            workflows: cfg.workflows.clone(),
+            mentor: cfg.mentor.clone(),
             data_dir: cfg.data_dir.display().to_string(),
         }
     }
@@ -785,6 +1013,8 @@ pub struct ConfigUpdate {
     pub harness: Option<HarnessConfigUpdate>,
     pub cluster: Option<ClusterConfigUpdate>,
     pub conflict: Option<ConflictConfigUpdate>,
+    pub workflows: Option<WorkflowConfigUpdate>,
+    pub mentor: Option<MentorConfigUpdate>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -832,6 +1062,8 @@ pub struct AiModelConfigUpdate {
     pub semantic_conflict: Option<String>,
     pub cluster_summary: Option<String>,
     pub cluster_review_order: Option<String>,
+    pub workflow_decompose: Option<String>,
+    pub workflow_orchestrate: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -905,6 +1137,21 @@ pub struct ConflictConfigUpdate {
     pub enabled: Option<bool>,
     pub semantic_analysis: Option<bool>,
     pub semantic_cache_ttl_days: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WorkflowConfigUpdate {
+    pub enabled: Option<bool>,
+    pub max_concurrent_runs: Option<usize>,
+    pub default_step_timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MentorConfigUpdate {
+    pub enabled: Option<bool>,
+    pub prune_below_confidence: Option<f64>,
+    pub prune_interval_secs: Option<u64>,
+    pub linked_repos: Option<Vec<LinkedRepoSet>>,
 }
 
 /// Fields that require a server restart to take effect.
@@ -991,6 +1238,8 @@ pub fn apply_update(current: &BottoConfig, update: ConfigUpdate) -> (BottoConfig
             if let Some(v) = m.semantic_conflict { cfg.ai.models.semantic_conflict = v; }
             if let Some(v) = m.cluster_summary { cfg.ai.models.cluster_summary = v; }
             if let Some(v) = m.cluster_review_order { cfg.ai.models.cluster_review_order = v; }
+            if let Some(v) = m.workflow_decompose { cfg.ai.models.workflow_decompose = v; }
+            if let Some(v) = m.workflow_orchestrate { cfg.ai.models.workflow_orchestrate = v; }
         }
         if let Some(p) = a.custom_prompts {
             if let Some(v) = p.summary { cfg.ai.custom_prompts.summary = v; }
@@ -1064,6 +1313,19 @@ pub fn apply_update(current: &BottoConfig, update: ConfigUpdate) -> (BottoConfig
         if let Some(v) = c.semantic_cache_ttl_days { cfg.conflict.semantic_cache_ttl_days = v; }
     }
 
+    if let Some(w) = update.workflows {
+        if let Some(v) = w.enabled { cfg.workflows.enabled = v; }
+        if let Some(v) = w.max_concurrent_runs { cfg.workflows.max_concurrent_runs = v; }
+        if let Some(v) = w.default_step_timeout_secs { cfg.workflows.default_step_timeout_secs = v; }
+    }
+
+    if let Some(m) = update.mentor {
+        if let Some(v) = m.enabled { cfg.mentor.enabled = v; }
+        if let Some(v) = m.prune_below_confidence { cfg.mentor.prune_below_confidence = v; }
+        if let Some(v) = m.prune_interval_secs { cfg.mentor.prune_interval_secs = v; }
+        if let Some(v) = m.linked_repos { cfg.mentor.linked_repos = v; }
+    }
+
     (cfg, restart_needed)
 }
 
@@ -1083,6 +1345,8 @@ pub fn to_toml_string(cfg: &BottoConfig) -> Result<String> {
         harness: HarnessOut<'a>,
         cluster: &'a ClusterConfig,
         conflict: &'a ConflictConfig,
+        workflows: &'a WorkflowConfig,
+        mentor: &'a MentorConfig,
     }
 
     #[derive(Serialize)]
@@ -1181,6 +1445,8 @@ pub fn to_toml_string(cfg: &BottoConfig) -> Result<String> {
         },
         cluster: &cfg.cluster,
         conflict: &cfg.conflict,
+        workflows: &cfg.workflows,
+        mentor: &cfg.mentor,
     };
 
     toml::to_string_pretty(&out).map_err(|e| anyhow::anyhow!("TOML serialize error: {}", e))
@@ -1265,6 +1531,9 @@ mod tests {
             },
             cluster: ClusterConfig::default(),
             conflict: ConflictConfig::default(),
+            workflows: WorkflowConfig::default(),
+            mentor: MentorConfig::default(),
+            channels: ChannelConfig::default(),
             data_dir: PathBuf::from("/tmp/botto-test"),
         }
     }
@@ -1341,6 +1610,7 @@ mod tests {
                     adversarial_tests: None, contracts: None, behavioral_delta: None,
                     fix: None, inquiry: None,
                     semantic_conflict: None, cluster_summary: None, cluster_review_order: None,
+                    workflow_decompose: None, workflow_orchestrate: None,
                 }),
                 custom_prompts: None,
             }),
@@ -1350,6 +1620,8 @@ mod tests {
             harness: None,
             cluster: None,
             conflict: None,
+            workflows: None,
+            mentor: None,
         };
 
         let (new_cfg, restart_fields) = apply_update(&cfg, update);
@@ -1386,6 +1658,8 @@ mod tests {
             harness: None,
             cluster: None,
             conflict: None,
+            workflows: None,
+            mentor: None,
         };
 
         let (new_cfg, _) = apply_update(&cfg, update);
@@ -1416,6 +1690,8 @@ mod tests {
             harness: None,
             cluster: None,
             conflict: None,
+            workflows: None,
+            mentor: None,
         };
 
         let (new_cfg, _) = apply_update(&cfg, update);
@@ -1442,6 +1718,8 @@ mod tests {
             harness: None,
             cluster: None,
             conflict: None,
+            workflows: None,
+            mentor: None,
         };
 
         let (new_cfg, restart_fields) = apply_update(&cfg, update);
@@ -1471,6 +1749,8 @@ mod tests {
             harness: None,
             cluster: None,
             conflict: None,
+            workflows: None,
+            mentor: None,
         };
 
         let (_, restart_fields) = apply_update(&cfg, update);
@@ -1504,6 +1784,8 @@ mod tests {
             harness: None,
             cluster: None,
             conflict: None,
+            workflows: None,
+            mentor: None,
         };
 
         let (new_cfg, _) = apply_update(&cfg, update);
@@ -1520,7 +1802,7 @@ mod tests {
                 bot_token: None,
                 webhook_secret: Some("".into()), // empty = clear
             }),
-            ai: None, sandbox: None, cache: None, review: None, harness: None, cluster: None, conflict: None,
+            ai: None, sandbox: None, cache: None, review: None, harness: None, cluster: None, conflict: None, workflows: None, mentor: None,
         };
 
         let (new_cfg, _) = apply_update(&cfg, update);
@@ -1541,6 +1823,8 @@ mod tests {
             harness: None,
             cluster: None,
             conflict: None,
+            workflows: None,
+            mentor: None,
         };
 
         let (new_cfg, restart_fields) = apply_update(&cfg, update);

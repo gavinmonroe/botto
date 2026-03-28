@@ -273,10 +273,12 @@ dependencies = [
  "dashmap",
  "flate2",
  "futures",
+ "hmac",
  "reqwest",
  "reqwest-eventsource",
  "serde",
  "serde_json",
+ "sha2",
  "sqlx",
  "sysinfo",
  "thiserror 2.0.18",
@@ -288,6 +290,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "url",
  "urlencoding",
  "uuid",
 ]
@@ -3104,6 +3107,7 @@ checksum = "a68d3c8f01c0cfa54a75291d83601161799e4a89a39e0929f4b0354d88757a37"
 dependencies = [
  "getrandom 0.4.2",
  "js-sys",
+ "serde_core",
  "wasm-bindgen",
 ]
 
