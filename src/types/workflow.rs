@@ -406,6 +406,7 @@ pub enum SessionStatus {
     Evaluating,
     Adapting,
     WaitingForHuman,
+    Clarifying,
     Completed,
     Failed,
     Cancelled,
@@ -420,6 +421,7 @@ impl SessionStatus {
             Self::Evaluating => "evaluating",
             Self::Adapting => "adapting",
             Self::WaitingForHuman => "waiting_for_human",
+            Self::Clarifying => "clarifying",
             Self::Completed => "completed",
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
@@ -485,6 +487,10 @@ pub struct PlanStep {
     pub success_criteria: String,
     pub depends_on: Vec<String>,
     pub capabilities_needed: Vec<String>,
+    /// Tool name from the tool catalog (e.g., "gitlab.list_open_mrs").
+    /// When present, the generator dispatches directly instead of keyword-matching.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
 }
 
 /// A pending plan modification from the Generator, to be applied directly
@@ -586,6 +592,68 @@ pub struct SessionMessage {
 pub enum MessageDirection {
     AgentToHuman,
     HumanToAgent,
+}
+
+// ---------------------------------------------------------------------------
+// Execution trace — detailed audit trail for session tool calls
+// ---------------------------------------------------------------------------
+
+/// Type of trace event recorded during session execution.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TraceEventType {
+    PlanCreated,
+    ClarificationRequested,
+    ClarificationReceived,
+    ToolCallStarted,
+    ToolCallCompleted,
+    ToolCallFailed,
+    RecoveryAttempted,
+    EvaluationRun,
+    EscalationSent,
+    HumanResponseReceived,
+    SessionCompleted,
+}
+
+impl TraceEventType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::PlanCreated => "plan_created",
+            Self::ClarificationRequested => "clarification_requested",
+            Self::ClarificationReceived => "clarification_received",
+            Self::ToolCallStarted => "tool_call_started",
+            Self::ToolCallCompleted => "tool_call_completed",
+            Self::ToolCallFailed => "tool_call_failed",
+            Self::RecoveryAttempted => "recovery_attempted",
+            Self::EvaluationRun => "evaluation_run",
+            Self::EscalationSent => "escalation_sent",
+            Self::HumanResponseReceived => "human_response_received",
+            Self::SessionCompleted => "session_completed",
+        }
+    }
+}
+
+impl std::fmt::Display for TraceEventType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A single trace event recorded during session execution.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TraceEvent {
+    pub id: i64,
+    pub session_id: Uuid,
+    pub event_type: TraceEventType,
+    pub step_id: Option<String>,
+    pub tool_name: Option<String>,
+    pub inputs: Option<serde_json::Value>,
+    pub output: Option<serde_json::Value>,
+    pub error: Option<String>,
+    pub duration_ms: Option<i64>,
+    pub metadata: Option<serde_json::Value>,
+    pub created_at: i64,
 }
 
 // ---------------------------------------------------------------------------

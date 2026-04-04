@@ -129,6 +129,11 @@ pub(crate) async fn migrate(pool: &SqlitePool) -> Result<()> {
         .await
         .context("migration 011 failed")?;
 
+    // Migration 012: session_trace table + add 'clarifying' to workflow_sessions CHECK.
+    // We use table recreation for the CHECK constraint update since SQLite can't ALTER CHECK.
+    // The session_trace table is created with IF NOT EXISTS so it's idempotent.
+    migrate_012(pool).await.context("migration 012 failed")?;
+
     // Additional indexes for query performance (idempotent via IF NOT EXISTS).
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_sandbox_jobs_mr
@@ -664,6 +669,150 @@ CREATE TABLE IF NOT EXISTS channel_rate_limits (
 CREATE INDEX IF NOT EXISTS idx_channel_rate_limits_key
     ON channel_rate_limits(rate_key, created_at);
 "#;
+
+/// Migration 012: session_trace table + update workflow_sessions and session_messages
+/// CHECK constraints to include 'clarifying' status.
+async fn migrate_012(pool: &SqlitePool) -> Result<()> {
+    // 1. Check if workflow_sessions already has 'clarifying' in its CHECK.
+    let has_clarifying: bool = {
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='workflow_sessions'"
+        )
+        .fetch_optional(pool)
+        .await
+        .unwrap_or(None);
+
+        row.map(|(sql,)| sql.contains("clarifying")).unwrap_or(false)
+    };
+
+    if !has_clarifying {
+        sqlx::query("PRAGMA foreign_keys = OFF")
+            .execute(pool)
+            .await
+            .context("migration 012: disable foreign_keys")?;
+
+        let mut tx = pool.begin().await.context("migration 012: begin tx")?;
+
+        // Drop session_trace first if it exists (it may have a bad FK from a previous run).
+        sqlx::query("DROP TABLE IF EXISTS session_trace")
+            .execute(&mut *tx)
+            .await
+            .context("migration 012: drop old session_trace")?;
+
+        // Recreate workflow_sessions with updated CHECK.
+        sqlx::query("ALTER TABLE workflow_sessions RENAME TO _ws_old_012")
+            .execute(&mut *tx)
+            .await
+            .context("migration 012: rename workflow_sessions")?;
+
+        sqlx::query(
+            "CREATE TABLE workflow_sessions (
+                id                TEXT PRIMARY KEY,
+                workflow_id       TEXT NOT NULL REFERENCES workflows(id),
+                status            TEXT NOT NULL CHECK(status IN (
+                                      'created', 'planning', 'executing', 'evaluating',
+                                      'adapting', 'waiting_for_human', 'clarifying',
+                                      'completed', 'failed', 'cancelled'
+                                  )),
+                trigger_type      TEXT NOT NULL,
+                trigger_data      TEXT,
+                plan              TEXT,
+                step_outputs      TEXT NOT NULL DEFAULT '{}',
+                current_step_id   TEXT,
+                retry_count       INTEGER NOT NULL DEFAULT 0,
+                max_retries       INTEGER NOT NULL DEFAULT 3,
+                evaluator_feedback TEXT,
+                escalation        TEXT,
+                started_at        INTEGER NOT NULL,
+                completed_at      INTEGER,
+                updated_at        INTEGER NOT NULL
+            )"
+        )
+        .execute(&mut *tx)
+        .await
+        .context("migration 012: create new workflow_sessions")?;
+
+        sqlx::query("INSERT INTO workflow_sessions SELECT * FROM _ws_old_012")
+            .execute(&mut *tx)
+            .await
+            .context("migration 012: copy workflow_sessions data")?;
+
+        // Recreate session_messages so its FK points to the new workflow_sessions.
+        sqlx::query("ALTER TABLE session_messages RENAME TO _sm_old_012")
+            .execute(&mut *tx)
+            .await
+            .context("migration 012: rename session_messages")?;
+
+        sqlx::query(
+            "CREATE TABLE session_messages (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id  TEXT NOT NULL REFERENCES workflow_sessions(id),
+                direction   TEXT NOT NULL CHECK(direction IN ('agent_to_human', 'human_to_agent')),
+                content     TEXT NOT NULL,
+                metadata    TEXT,
+                created_at  INTEGER NOT NULL
+            )"
+        )
+        .execute(&mut *tx)
+        .await
+        .context("migration 012: create new session_messages")?;
+
+        sqlx::query("INSERT INTO session_messages SELECT * FROM _sm_old_012")
+            .execute(&mut *tx)
+            .await
+            .context("migration 012: copy session_messages data")?;
+
+        // Drop old tables.
+        sqlx::query("DROP TABLE _sm_old_012").execute(&mut *tx).await
+            .context("migration 012: drop old session_messages")?;
+        sqlx::query("DROP TABLE _ws_old_012").execute(&mut *tx).await
+            .context("migration 012: drop old workflow_sessions")?;
+
+        // Recreate indexes.
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_sessions_status ON workflow_sessions(status)")
+            .execute(&mut *tx).await.context("migration 012: recreate sessions status index")?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_sessions_workflow ON workflow_sessions(workflow_id, started_at DESC)")
+            .execute(&mut *tx).await.context("migration 012: recreate sessions workflow index")?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_sessions_waiting ON workflow_sessions(status) WHERE status IN ('waiting_for_human', 'clarifying')")
+            .execute(&mut *tx).await.context("migration 012: recreate sessions waiting index")?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_session_messages ON session_messages(session_id, created_at)")
+            .execute(&mut *tx).await.context("migration 012: recreate session_messages index")?;
+
+        tx.commit().await.context("migration 012: commit tx")?;
+
+        sqlx::query("PRAGMA foreign_keys = ON")
+            .execute(pool)
+            .await
+            .context("migration 012: re-enable foreign_keys")?;
+    }
+
+    // 2. Create session_trace AFTER table recreation so FK is correct.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS session_trace (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id  TEXT NOT NULL,
+            event_type  TEXT NOT NULL,
+            step_id     TEXT,
+            tool_name   TEXT,
+            inputs      TEXT,
+            output      TEXT,
+            error       TEXT,
+            duration_ms INTEGER,
+            metadata    TEXT,
+            created_at  INTEGER NOT NULL
+        )"
+    )
+    .execute(pool)
+    .await
+    .context("migration 012: create session_trace")?;
+
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_session_trace_session ON session_trace(session_id, created_at)")
+        .execute(pool).await.context("migration 012: create session_trace index")?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_session_trace_step ON session_trace(session_id, step_id)")
+        .execute(pool).await.context("migration 012: create session_trace step index")?;
+
+    Ok(())
+}
 
 /// Create an in-memory SQLite pool with all migrations applied. For tests only.
 #[cfg(test)]

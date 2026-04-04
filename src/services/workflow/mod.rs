@@ -21,6 +21,7 @@ pub mod http;
 pub mod generator;
 pub mod orchestrator;
 pub mod planner;
+pub mod registry;
 pub mod sandbox;
 pub mod scheduler;
 pub mod script;

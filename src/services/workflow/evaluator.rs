@@ -365,6 +365,7 @@ mod tests {
             success_criteria: "thing is done correctly".into(),
             depends_on: vec![],
             capabilities_needed: vec![],
+            tool: None,
         }
     }
 

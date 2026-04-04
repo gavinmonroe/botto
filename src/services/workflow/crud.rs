@@ -12,7 +12,7 @@ use tracing::{debug, warn};
 
 use crate::types::workflow::{
     EscalationMessage, EvaluatorVerdict, MessageDirection, RunStatus, SessionMessage, SessionPlan,
-    SessionState, SessionStatus, WorkflowDefinition, WorkflowRun,
+    SessionState, SessionStatus, TraceEvent, TraceEventType, WorkflowDefinition, WorkflowRun,
 };
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -628,6 +628,135 @@ pub async fn load_session_messages(
 }
 
 // ---------------------------------------------------------------------------
+// Session Trace (execution audit trail)
+// ---------------------------------------------------------------------------
+
+/// Append a trace event to the session_trace table.
+pub async fn append_trace(
+    pool: &SqlitePool,
+    session_id: &Uuid,
+    event_type: &TraceEventType,
+    step_id: Option<&str>,
+    tool_name: Option<&str>,
+    inputs: Option<&serde_json::Value>,
+    output: Option<&serde_json::Value>,
+    error: Option<&str>,
+    duration_ms: Option<i64>,
+    metadata: Option<&serde_json::Value>,
+) -> Result<()> {
+    let now = epoch_secs();
+    let inputs_json = inputs
+        .map(|v| serde_json::to_string(v))
+        .transpose()
+        .context("serialize trace inputs")?;
+    let output_json = output
+        .map(|v| serde_json::to_string(v))
+        .transpose()
+        .context("serialize trace output")?;
+    let metadata_json = metadata
+        .map(|v| serde_json::to_string(v))
+        .transpose()
+        .context("serialize trace metadata")?;
+
+    sqlx::query(
+        "INSERT INTO session_trace
+         (session_id, event_type, step_id, tool_name, inputs, output, error, duration_ms, metadata, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(session_id.to_string())
+    .bind(event_type.as_str())
+    .bind(step_id)
+    .bind(tool_name)
+    .bind(&inputs_json)
+    .bind(&output_json)
+    .bind(error)
+    .bind(duration_ms)
+    .bind(&metadata_json)
+    .bind(now)
+    .execute(pool)
+    .await
+    .context("insert trace event")?;
+
+    debug!(
+        session_id = %session_id,
+        event_type = %event_type,
+        "trace event appended"
+    );
+    Ok(())
+}
+
+/// Load the full execution trace for a session, ordered chronologically.
+pub async fn load_trace(pool: &SqlitePool, session_id: &str) -> Result<Vec<TraceEvent>> {
+    let rows: Vec<(
+        i64,            // id
+        String,         // session_id
+        String,         // event_type
+        Option<String>, // step_id
+        Option<String>, // tool_name
+        Option<String>, // inputs
+        Option<String>, // output
+        Option<String>, // error
+        Option<i64>,    // duration_ms
+        Option<String>, // metadata
+        i64,            // created_at
+    )> = sqlx::query_as(
+        "SELECT id, session_id, event_type, step_id, tool_name, inputs, output, error,
+                duration_ms, metadata, created_at
+         FROM session_trace
+         WHERE session_id = ?
+         ORDER BY created_at ASC, id ASC",
+    )
+    .bind(session_id)
+    .fetch_all(pool)
+    .await
+    .context("load trace")?;
+
+    let mut events = Vec::with_capacity(rows.len());
+    for (id, sid, event_type_str, step_id, tool_name, inputs_json, output_json, error, duration_ms, metadata_json, created_at) in rows {
+        let event_type = parse_trace_event_type(&event_type_str);
+        let inputs = inputs_json.and_then(|j| serde_json::from_str(&j).ok());
+        let output = output_json.and_then(|j| serde_json::from_str(&j).ok());
+        let metadata = metadata_json.and_then(|j| serde_json::from_str(&j).ok());
+
+        events.push(TraceEvent {
+            id,
+            session_id: sid.parse().context("parse trace session_id")?,
+            event_type,
+            step_id,
+            tool_name,
+            inputs,
+            output,
+            error,
+            duration_ms,
+            metadata,
+            created_at,
+        });
+    }
+    Ok(events)
+}
+
+/// Parse a trace event type string.
+fn parse_trace_event_type(s: &str) -> TraceEventType {
+    match s {
+        "plan_created" => TraceEventType::PlanCreated,
+        "clarification_requested" => TraceEventType::ClarificationRequested,
+        "clarification_received" => TraceEventType::ClarificationReceived,
+        "tool_call_started" => TraceEventType::ToolCallStarted,
+        "tool_call_completed" => TraceEventType::ToolCallCompleted,
+        "tool_call_failed" => TraceEventType::ToolCallFailed,
+        "recovery_attempted" => TraceEventType::RecoveryAttempted,
+        "evaluation_run" => TraceEventType::EvaluationRun,
+        "escalation_sent" => TraceEventType::EscalationSent,
+        "human_response_received" => TraceEventType::HumanResponseReceived,
+        "session_completed" => TraceEventType::SessionCompleted,
+        _ => {
+            warn!(event_type = s, "unknown trace event type, defaulting to ToolCallFailed");
+            TraceEventType::ToolCallFailed
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Session helpers
 // ---------------------------------------------------------------------------
 
@@ -640,6 +769,7 @@ pub fn parse_session_status(s: &str) -> SessionStatus {
         "evaluating" => SessionStatus::Evaluating,
         "adapting" => SessionStatus::Adapting,
         "waiting_for_human" => SessionStatus::WaitingForHuman,
+        "clarifying" => SessionStatus::Clarifying,
         "completed" => SessionStatus::Completed,
         "failed" => SessionStatus::Failed,
         "cancelled" => SessionStatus::Cancelled,
@@ -916,6 +1046,7 @@ mod tests {
                 success_criteria: "it works".into(),
                 depends_on: vec![],
                 capabilities_needed: vec![],
+                tool: None,
             }],
             capabilities_needed: vec!["gitlab".into()],
         };
@@ -1027,6 +1158,7 @@ mod tests {
             SessionStatus::Evaluating,
             SessionStatus::Adapting,
             SessionStatus::WaitingForHuman,
+            SessionStatus::Clarifying,
             SessionStatus::Completed,
             SessionStatus::Failed,
             SessionStatus::Cancelled,
@@ -1039,7 +1171,7 @@ mod tests {
 
         let resumable = load_resumable_sessions(&pool).await.unwrap();
         // Terminal: Completed, Failed, Cancelled — should be excluded.
-        assert_eq!(resumable.len(), 6);
+        assert_eq!(resumable.len(), 7);
         for s in &resumable {
             assert!(!s.status.is_terminal());
         }
@@ -1147,6 +1279,10 @@ mod tests {
         assert_eq!(
             parse_session_status("waiting_for_human"),
             SessionStatus::WaitingForHuman
+        );
+        assert_eq!(
+            parse_session_status("clarifying"),
+            SessionStatus::Clarifying
         );
         assert_eq!(parse_session_status("completed"), SessionStatus::Completed);
         assert_eq!(parse_session_status("failed"), SessionStatus::Failed);

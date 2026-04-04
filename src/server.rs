@@ -57,6 +57,7 @@ pub async fn run(state: AppState) -> Result<()> {
         .route("/api/workflows/sessions/{id}", get(api::workflows::get_session))
         .route("/api/workflows/sessions/{id}/respond", post(api::workflows::respond_to_session))
         .route("/api/workflows/sessions/{id}/messages", get(api::workflows::session_messages))
+        .route("/api/workflows/sessions/{id}/trace", get(api::workflows::session_trace))
         .route("/api/mentor/query", post(api::workflows::mentor_query))
         // Directive API
         .route("/api/directives", get(api::directives::list_directives).post(api::directives::create_directive))

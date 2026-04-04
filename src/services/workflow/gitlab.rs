@@ -75,8 +75,31 @@ impl WorkflowAgent for GitLabAgent {
 }
 
 impl GitLabAgent {
+    /// Resolve project_id from inputs — accepts either numeric `project_id` or string `project_path`.
+    async fn resolve_project_id(&self, inputs: &HashMap<String, Value>) -> Result<i64, String> {
+        // Try numeric project_id first
+        if let Some(id) = inputs.get("project_id").and_then(|v| v.as_i64()) {
+            return Ok(id);
+        }
+        // Try string project_path and resolve via GitLab API
+        if let Some(path) = inputs.get("project_path").and_then(|v| v.as_str()) {
+            let project = gl::fetch_project(&self.config, path)
+                .await
+                .map_err(|e| format!("resolve project '{}': {}", path, e))?;
+            return Ok(project.id);
+        }
+        // Try "project" as a fallback key (Planner sometimes uses this)
+        if let Some(path) = inputs.get("project").and_then(|v| v.as_str()) {
+            let project = gl::fetch_project(&self.config, path)
+                .await
+                .map_err(|e| format!("resolve project '{}': {}", path, e))?;
+            return Ok(project.id);
+        }
+        Err("missing input: need 'project_id' (number) or 'project_path' (string)".into())
+    }
+
     async fn list_open_mrs(&self, inputs: &HashMap<String, Value>) -> Result<Value, String> {
-        let project_id = get_i64(inputs, "project_id")?;
+        let project_id = self.resolve_project_id(inputs).await?;
         let mrs = gl::fetch_open_mrs(&self.config, project_id)
             .await
             .map_err(|e| format!("list_open_mrs: {e}"))?;
@@ -84,7 +107,7 @@ impl GitLabAgent {
     }
 
     async fn fetch_mr(&self, inputs: &HashMap<String, Value>) -> Result<Value, String> {
-        let project_id = get_i64(inputs, "project_id")?;
+        let project_id = self.resolve_project_id(inputs).await?;
         let mr_iid = get_u64(inputs, "mr_iid")?;
         let mr = gl::fetch_merge_request(&self.config, project_id, mr_iid)
             .await
@@ -93,7 +116,7 @@ impl GitLabAgent {
     }
 
     async fn fetch_mr_changes(&self, inputs: &HashMap<String, Value>) -> Result<Value, String> {
-        let project_id = get_i64(inputs, "project_id")?;
+        let project_id = self.resolve_project_id(inputs).await?;
         let mr_iid = get_u64(inputs, "mr_iid")?;
         let changes = gl::fetch_mr_changes(&self.config, project_id, mr_iid)
             .await
@@ -102,7 +125,7 @@ impl GitLabAgent {
     }
 
     async fn post_comment(&self, inputs: &HashMap<String, Value>) -> Result<Value, String> {
-        let project_id = get_i64(inputs, "project_id")?;
+        let project_id = self.resolve_project_id(inputs).await?;
         let mr_iid = get_u64(inputs, "mr_iid")?;
         let body = get_str(inputs, "body")?;
         let note = gl::post_mr_note(&self.config, project_id, mr_iid, &body)
@@ -112,7 +135,7 @@ impl GitLabAgent {
     }
 
     async fn fetch_pipelines(&self, inputs: &HashMap<String, Value>) -> Result<Value, String> {
-        let project_id = get_i64(inputs, "project_id")?;
+        let project_id = self.resolve_project_id(inputs).await?;
         let mr_iid = get_u64(inputs, "mr_iid")?;
         // Use the MR metadata which includes pipeline info via head_pipeline.
         let mr = gl::fetch_merge_request(&self.config, project_id, mr_iid)
@@ -122,7 +145,7 @@ impl GitLabAgent {
     }
 
     async fn fetch_file(&self, inputs: &HashMap<String, Value>) -> Result<Value, String> {
-        let project_id = get_i64(inputs, "project_id")?;
+        let project_id = self.resolve_project_id(inputs).await?;
         let file_path = get_str(inputs, "file_path")?;
         let ref_name = get_str(inputs, "ref").unwrap_or_else(|_| "main".to_string());
         let content = gl::fetch_file_content(&self.config, project_id, &file_path, &ref_name)

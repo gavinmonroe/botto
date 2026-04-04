@@ -51,7 +51,7 @@ tr:hover{background:var(--surface2)}
 .status-executing,.status-running,.status-planning{background:rgba(56,139,253,0.15);color:var(--primary)}
 .status-completed{background:rgba(63,185,80,0.15);color:var(--success)}
 .status-failed{background:rgba(248,81,73,0.15);color:var(--danger)}
-.status-waiting_for_human{background:rgba(210,153,34,0.15);color:var(--warning)}
+.status-waiting_for_human,.status-clarifying{background:rgba(210,153,34,0.15);color:var(--warning)}
 .status-created,.status-evaluating,.status-adapting,.status-pending{background:rgba(139,148,158,0.15);color:var(--text2)}
 .status-cancelled{background:rgba(139,148,158,0.15);color:var(--text2)}
 
@@ -457,16 +457,60 @@ async function showSessionDetail(sessionId) {
 
   // Plan steps
   if (s.plan && s.plan.steps && s.plan.steps.length > 0) {
-    html += '<h3 style="font-size:13px;margin-bottom:6px">Plan Steps</h3>';
-    html += '<table style="margin-bottom:12px"><tr><th>Step</th><th>Agent</th><th>Description</th><th>Output</th></tr>';
+    html += '<h3 style="font-size:13px;margin-bottom:6px">Plan: ' + esc(s.plan.goal || '') + '</h3>';
+    html += '<table style="margin-bottom:12px"><tr><th>Step</th><th>Tool</th><th>Description</th><th>Status</th></tr>';
     for (const step of s.plan.steps) {
       const hasOutput = s.stepOutputs && s.stepOutputs[step.id];
+      const toolName = step.tool || (step.agentType + '.*');
       const outputBadge = hasOutput
         ? '<span class="status status-completed">done</span>'
         : (step.id === s.currentStepId ? '<span class="status status-executing">running</span>' : '<span class="status status-pending">pending</span>');
-      html += '<tr><td class="mono">' + esc(step.id) + '</td><td>' + esc(step.agentType) + '</td><td>' + esc(step.description) + '</td><td>' + outputBadge + '</td></tr>';
+      html += '<tr><td class="mono">' + esc(step.id) + '</td><td class="mono" style="font-size:11px">' + esc(toolName) + '</td><td>' + esc(step.description) + '</td><td>' + outputBadge + '</td></tr>';
     }
     html += '</table>';
+  }
+
+  // Step outputs (expandable)
+  if (s.stepOutputs && Object.keys(s.stepOutputs).length > 0) {
+    html += '<h3 style="font-size:13px;margin-bottom:6px">Step Outputs</h3>';
+    html += '<div style="margin-bottom:12px">';
+    for (const [stepId, output] of Object.entries(s.stepOutputs)) {
+      const preview = JSON.stringify(output).slice(0, 120);
+      const full = JSON.stringify(output, null, 2);
+      html += '<details style="margin-bottom:4px;border:1px solid var(--border);border-radius:var(--radius);padding:6px">' +
+        '<summary style="cursor:pointer;font-size:12px"><span class="mono">' + esc(stepId) + '</span> — ' + esc(preview) + (preview.length >= 120 ? '...' : '') + '</summary>' +
+        '<pre style="margin-top:6px;font-size:11px;overflow-x:auto;max-height:200px;background:var(--surface2);padding:8px;border-radius:4px">' + esc(full) + '</pre>' +
+        '</details>';
+    }
+    html += '</div>';
+  }
+
+  // Execution trace
+  const traceData = await apiFetch('/api/workflows/sessions/' + sessionId + '/trace');
+  const traceEvents = traceData ? (traceData.trace || []) : [];
+  if (traceEvents.length > 0) {
+    html += '<h3 style="font-size:13px;margin-bottom:6px">Execution Trace (' + traceEvents.length + ' events)</h3>';
+    html += '<div style="margin-bottom:12px;max-height:400px;overflow-y:auto;border:1px solid var(--border);border-radius:var(--radius)">';
+    html += '<table><tr><th>Time</th><th>Event</th><th>Step</th><th>Tool</th><th>Duration</th><th>Details</th></tr>';
+    for (const ev of traceEvents) {
+      const evType = ev.eventType || ev.event_type || '';
+      const evClass = evType.includes('failed') ? 'color:var(--danger)' :
+                      evType.includes('completed') ? 'color:var(--success)' :
+                      evType.includes('started') ? 'color:var(--primary)' :
+                      evType.includes('clarif') ? 'color:var(--warning)' : '';
+      const dur = ev.durationMs != null ? (ev.durationMs + 'ms') : '-';
+      const detail = ev.error ? '<span style="color:var(--danger)">' + esc(ev.error).slice(0, 80) + '</span>' :
+                     ev.output ? esc(JSON.stringify(ev.output)).slice(0, 80) + '...' : '-';
+      html += '<tr>' +
+        '<td style="font-size:11px;white-space:nowrap">' + fmtTime(ev.createdAt || ev.created_at) + '</td>' +
+        '<td style="font-size:11px;' + evClass + '">' + esc(evType) + '</td>' +
+        '<td class="mono" style="font-size:11px">' + esc(ev.stepId || ev.step_id || '-') + '</td>' +
+        '<td class="mono" style="font-size:11px">' + esc(ev.toolName || ev.tool_name || '-') + '</td>' +
+        '<td style="font-size:11px">' + dur + '</td>' +
+        '<td style="font-size:11px">' + detail + '</td>' +
+        '</tr>';
+    }
+    html += '</table></div>';
   }
 
   // Evaluator feedback
@@ -523,7 +567,10 @@ async function refreshAll() {
 }
 
 refreshAll();
-setInterval(refreshAll, 10000);
+// Poll every 10s for general updates, every 5s when viewing active sessions
+setInterval(() => {
+  refreshAll();
+}, currentTab === 'active' ? 5000 : 10000);
 </script>
 </body>
 </html>

@@ -172,6 +172,21 @@ impl AiAgent {
         let prompt = get_str(inputs, "prompt")?;
         let model = get_model(inputs, &self.default_model);
 
+        // Truncate content to avoid 400 errors from oversized requests.
+        // Most AI endpoints have a ~100k token limit; 40k chars is safe.
+        let content = if content.len() > 40_000 {
+            tracing::info!(
+                original_len = content.len(),
+                truncated_to = 40_000,
+                "ai agent: truncating analyze content to fit context window"
+            );
+            let mut end = 40_000;
+            while end > 0 && !content.is_char_boundary(end) { end -= 1; }
+            format!("{}...\n\n[Truncated from {} chars]", &content[..end], content.len())
+        } else {
+            content
+        };
+
         let request = ChatCompletionRequest {
             model,
             messages: vec![

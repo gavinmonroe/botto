@@ -84,6 +84,7 @@ pub struct RecentSessionsQuery {
 #[derive(Deserialize)]
 pub struct CreateWorkflowBody {
     pub description: String,
+    #[serde(default)]
     pub project_id: i64,
     pub created_by: Option<String>,
 }
@@ -396,19 +397,69 @@ pub async fn trigger_workflow(
     // Fix #4: create the run ID up front and return it to the caller.
     let run_id = uuid::Uuid::new_v4();
 
-    let orchestrator =
-        crate::services::workflow::orchestrator::Orchestrator::new(pool, mentor, agent_config, timeout);
-
-    let trigger = TriggerSource::Manual {
-        user: "api".into(),
-    };
-
     let wf_name = workflow.name.clone();
-    tokio::spawn(async move {
-        let _run = orchestrator.execute_with_id(run_id, &workflow, trigger).await;
-        drop(permit);
-        tracing::debug!(workflow = %wf_name, %run_id, "trigger_workflow: run finished");
-    });
+    let event_bus = state.event_bus().clone();
+    let ai_config_for_session = crate::services::ai::client::AiClientConfig {
+        base_url: cfg.ai.base_url.clone(),
+        api_key: cfg.ai.api_key.clone(),
+    };
+    let ai_model = cfg.ai.models.workflow_orchestrate.clone();
+
+    match workflow.mode {
+        crate::types::workflow::WorkflowMode::Autonomous => {
+            // v2 path: SessionManager with Planner/Generator/Evaluator
+            let sm_config = SessionManagerConfig {
+                ai_model: ai_model.clone(),
+                ..Default::default()
+            };
+            let manager = SessionManager::new(
+                pool.clone(),
+                ai_config_for_session,
+                agent_config,
+                mentor,
+                event_bus,
+                sm_config,
+            );
+
+            let trigger_data = serde_json::json!({
+                "trigger": "manual",
+                "user": "api",
+            });
+
+            tokio::spawn(async move {
+                match crate::services::workflow::session::create_session(
+                    &pool, workflow.id, "manual", Some(trigger_data),
+                ).await {
+                    Ok(mut session) => {
+                        tracing::info!(workflow = %wf_name, session_id = %session.id, "autonomous session started");
+                        if let Err(e) = manager.drive(&mut session, &wf_name).await {
+                            tracing::error!(workflow = %wf_name, session_id = %session.id, error = %e, "autonomous session failed");
+                        } else {
+                            tracing::info!(workflow = %wf_name, session_id = %session.id, status = %session.status, "autonomous session finished");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(workflow = %wf_name, error = %e, "failed to create session");
+                    }
+                }
+                drop(permit);
+            });
+        }
+        crate::types::workflow::WorkflowMode::Simple => {
+            // v1 path: DAG orchestrator
+            let orchestrator =
+                crate::services::workflow::orchestrator::Orchestrator::new(pool, mentor, agent_config, timeout);
+            let trigger = TriggerSource::Manual {
+                user: "api".into(),
+            };
+
+            tokio::spawn(async move {
+                let _run = orchestrator.execute_with_id(run_id, &workflow, trigger).await;
+                drop(permit);
+                tracing::debug!(workflow = %wf_name, %run_id, "simple workflow run finished");
+            });
+        }
+    }
 
     (
         StatusCode::ACCEPTED,
@@ -613,13 +664,15 @@ pub async fn respond_to_session(
         }
     };
 
-    // Validate it's waiting for human input.
-    if session.status != crate::types::workflow::SessionStatus::WaitingForHuman {
+    // Validate it's waiting for human input or clarification.
+    if session.status != crate::types::workflow::SessionStatus::WaitingForHuman
+        && session.status != crate::types::workflow::SessionStatus::Clarifying
+    {
         return (
             StatusCode::CONFLICT,
             Json(serde_json::json!({
                 "ok": false,
-                "error": format!("session is in '{}' state, not 'waiting_for_human'", session.status),
+                "error": format!("session is in '{}' state, not 'waiting_for_human' or 'clarifying'", session.status),
             })),
         )
             .into_response();
@@ -795,6 +848,30 @@ pub async fn active_sessions(
         Ok(sessions) => Json(serde_json::json!({
             "ok": true,
             "sessions": sessions,
+        }))
+        .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "ok": false, "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+/// GET /api/workflows/sessions/{id}/trace
+pub async fn session_trace(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = check_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    match crud::load_trace(state.pool(), &id).await {
+        Ok(events) => Json(serde_json::json!({
+            "ok": true,
+            "trace": events,
         }))
         .into_response(),
         Err(e) => (

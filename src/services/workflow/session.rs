@@ -22,11 +22,11 @@ use uuid::Uuid;
 use crate::services::ai::client::AiClientConfig;
 use crate::services::events::{Event, EventBus, EventType};
 use crate::services::mentor::client::MentorClient;
-use crate::services::workflow::{connector, crud, escalation, evaluator, generator, planner};
+use crate::services::workflow::{connector, crud, escalation, evaluator, generator, planner, registry};
 use crate::services::workflow::factory::AgentFactoryConfig;
 use crate::types::workflow::{
     EscalationSeverity, GeneratorOutcome, PlanStep, SessionPlan, SessionState, SessionStatus,
-    PendingPlanModification,
+    PendingPlanModification, TraceEventType,
 };
 
 // ---------------------------------------------------------------------------
@@ -51,7 +51,7 @@ impl Default for SessionManagerConfig {
         Self {
             max_step_retries: 3,
             max_session_retries: 10,
-            eval_threshold: 0.8,
+            eval_threshold: 0.6,
             ai_model: "claude-sonnet-4-5".into(),
         }
     }
@@ -188,16 +188,55 @@ impl SessionManager {
                     self.transition_to_planning(session).await?;
                 }
                 SessionStatus::Planning => {
-                    self.run_planning(session).await?;
+                    if let Err(e) = self.run_planning(session).await {
+                        warn!(session_id = %session.id, error = ?e, "planning failed");
+                        // Don't leave the session stuck in planning — fail it
+                        self.fail_session(session, &format!("planning failed: {e:#}")).await?;
+                    }
                 }
                 SessionStatus::Executing => {
-                    self.run_next_step(session, workflow_name).await?;
+                    if let Err(e) = self.run_next_step(session, workflow_name).await {
+                        warn!(session_id = %session.id, error = %e, "step execution failed");
+                        self.fail_session(session, &format!("execution failed: {e}")).await?;
+                    }
                 }
                 SessionStatus::Evaluating => {
-                    self.run_evaluation(session, workflow_name).await?;
+                    if let Err(e) = self.run_evaluation(session, workflow_name).await {
+                        warn!(session_id = %session.id, error = %e, "evaluation failed");
+                        self.fail_session(session, &format!("evaluation failed: {e}")).await?;
+                    }
                 }
                 SessionStatus::Adapting => {
-                    self.run_replanning(session).await?;
+                    if let Err(e) = self.run_replanning(session).await {
+                        warn!(session_id = %session.id, error = %e, "replanning failed");
+                        self.fail_session(session, &format!("replanning failed: {e}")).await?;
+                    }
+                }
+                SessionStatus::Clarifying => {
+                    // Clarifying works like WaitingForHuman — session is paused
+                    // until the user provides answers. Re-emit the escalation.
+                    if let Some(ref esc) = session.escalation {
+                        info!(
+                            session_id = %session.id,
+                            reason = %esc.reason,
+                            "session waiting for clarification — re-emitting notification"
+                        );
+                        self.event_bus.publish(crate::services::events::Event {
+                            event_type: crate::services::events::EventType::SessionEscalation,
+                            project_path: String::new(),
+                            mr_iid: None,
+                            user_id: None,
+                            payload: Some(serde_json::json!({
+                                "type": "clarification_needed",
+                                "session_id": session.id.to_string(),
+                                "reason": esc.reason,
+                                "what_i_need": esc.what_i_need,
+                            })),
+                        });
+                    } else {
+                        debug!(session_id = %session.id, "session blocked on clarification (no escalation data)");
+                    }
+                    return Ok(());
                 }
                 SessionStatus::WaitingForHuman => {
                     // Re-emit escalation on recovery — if we crashed after
@@ -263,29 +302,172 @@ impl SessionManager {
         // Load the workflow description for the planner prompt.
         let workflow_desc = self.load_workflow_description(session).await?;
 
-        let plan = planner::create_plan(
+        // Build the tool catalog from agent configuration.
+        let tool_catalog = registry::build_tool_catalog(&self.agent_config);
+
+        // Check if we're resuming from Clarifying with user answers.
+        let clarification_answers = if session.status == SessionStatus::Planning {
+            // Check for recent human_to_agent messages that contain clarification answers.
+            let messages = crud::load_session_messages(
+                &self.pool,
+                &session.id.to_string(),
+                10,
+            ).await.unwrap_or_default();
+
+            let answers: Vec<String> = messages
+                .iter()
+                .filter(|m| m.direction == crate::types::workflow::MessageDirection::HumanToAgent)
+                .map(|m| m.content.clone())
+                .collect();
+
+            if answers.is_empty() { None } else { Some(answers) }
+        } else {
+            None
+        };
+
+        // Build trigger data with clarification answers if available.
+        let planning_trigger = if let Some(answers) = clarification_answers {
+            let mut data = trigger_data.clone();
+            if let Some(obj) = data.as_object_mut() {
+                obj.insert(
+                    "clarification_answers".into(),
+                    serde_json::Value::Array(
+                        answers.into_iter().map(serde_json::Value::String).collect(),
+                    ),
+                );
+            }
+            data
+        } else {
+            trigger_data
+        };
+
+        let plan_result = planner::create_plan(
             &self.ai_config,
             &self.config.ai_model,
             &self.mentor,
-            &trigger_data,
+            &planning_trigger,
             &workflow_desc,
+            &tool_catalog,
         )
         .await
         .context("planner failed")?;
 
-        info!(
-            session_id = %session.id,
-            goal = %plan.goal,
-            steps = plan.steps.len(),
-            "plan created"
-        );
+        match plan_result {
+            planner::PlanResult::Plan(plan) => {
+                info!(
+                    session_id = %session.id,
+                    goal = %plan.goal,
+                    steps = plan.steps.len(),
+                    "plan created"
+                );
 
-        session.plan = Some(plan);
-        session.status = SessionStatus::Executing;
-        session.updated_at = crud::epoch_secs();
-        crud::checkpoint_session(&self.pool, session).await?;
+                // Trace: plan created.
+                if let Err(e) = crud::append_trace(
+                    &self.pool,
+                    &session.id,
+                    &TraceEventType::PlanCreated,
+                    None,
+                    None,
+                    None,
+                    Some(&serde_json::json!({
+                        "goal": plan.goal,
+                        "step_count": plan.steps.len(),
+                        "steps": plan.steps.iter().map(|s| serde_json::json!({
+                            "id": s.id,
+                            "tool": s.tool,
+                            "agent_type": s.agent_type.as_str(),
+                        })).collect::<Vec<_>>(),
+                    })),
+                    None,
+                    None,
+                    None,
+                ).await {
+                    warn!(session_id = %session.id, error = %e, "failed to append PlanCreated trace");
+                }
 
-        self.publish_event(session, EventType::WorkflowRunStarted);
+                session.plan = Some(plan);
+                session.status = SessionStatus::Executing;
+                session.updated_at = crud::epoch_secs();
+                crud::checkpoint_session(&self.pool, session).await?;
+
+                self.publish_event(session, EventType::WorkflowRunStarted);
+            }
+            planner::PlanResult::NeedsClarification { questions, reason } => {
+                info!(
+                    session_id = %session.id,
+                    questions = questions.len(),
+                    %reason,
+                    "planner needs clarification"
+                );
+
+                // Trace: clarification requested.
+                if let Err(e) = crud::append_trace(
+                    &self.pool,
+                    &session.id,
+                    &TraceEventType::ClarificationRequested,
+                    None,
+                    None,
+                    None,
+                    Some(&serde_json::json!({
+                        "questions": questions,
+                        "reason": reason,
+                    })),
+                    None,
+                    None,
+                    None,
+                ).await {
+                    warn!(session_id = %session.id, error = %e, "failed to append ClarificationRequested trace");
+                }
+
+                // Build escalation message with the questions.
+                let questions_text = questions
+                    .iter()
+                    .enumerate()
+                    .map(|(i, q)| format!("{}. {}", i + 1, q))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+
+                let msg = crate::types::workflow::EscalationMessage {
+                    session_id: session.id,
+                    workflow_name: workflow_desc.clone(),
+                    step_id: None,
+                    severity: EscalationSeverity::Info,
+                    reason: reason.clone(),
+                    what_i_need: questions_text,
+                    options: vec![],
+                    created_at: crud::epoch_secs(),
+                };
+
+                // Set status to Clarifying and escalate.
+                session.status = SessionStatus::Clarifying;
+                session.escalation = Some(msg.clone());
+                session.updated_at = crud::epoch_secs();
+                crud::checkpoint_session(&self.pool, session).await?;
+
+                // Record the questions as an agent message.
+                let _ = crud::add_session_message(
+                    &self.pool,
+                    &session.id,
+                    "agent_to_human",
+                    &format!("{}\n\n{}", reason, questions.iter()
+                        .enumerate()
+                        .map(|(i, q)| format!("{}. {}", i + 1, q))
+                        .collect::<Vec<_>>()
+                        .join("\n")),
+                    None,
+                ).await;
+
+                // Publish escalation event.
+                self.event_bus.publish(Event {
+                    event_type: EventType::SessionEscalation,
+                    project_path: String::new(),
+                    mr_iid: None,
+                    user_id: None,
+                    payload: serde_json::to_value(&msg).ok(),
+                });
+            }
+        }
+
         Ok(())
     }
 
@@ -337,6 +519,29 @@ impl SessionManager {
 
         self.publish_event(session, EventType::WorkflowStepStarted);
 
+        // Build tool catalog for the generator.
+        let tool_catalog = registry::build_tool_catalog(&self.agent_config);
+
+        // Trace: tool call started.
+        let step_start = std::time::Instant::now();
+        if let Err(e) = crud::append_trace(
+            &self.pool,
+            &session.id,
+            &TraceEventType::ToolCallStarted,
+            Some(&step.id),
+            step.tool.as_deref(),
+            Some(&serde_json::json!({
+                "description": step.description,
+                "agent_type": step.agent_type.as_str(),
+            })),
+            None,
+            None,
+            None,
+            None,
+        ).await {
+            warn!(session_id = %session.id, step_id = %step.id, error = %e, "failed to append ToolCallStarted trace");
+        }
+
         // Run the Generator.
         let eval_feedback = session.evaluator_feedback.as_ref();
         let session_context = session.trigger_data.as_ref();
@@ -349,14 +554,33 @@ impl SessionManager {
             &self.config.ai_model,
             eval_feedback,
             session_context,
+            &tool_catalog,
         )
         .await
         .context("generator failed")?;
+
+        let step_duration_ms = step_start.elapsed().as_millis() as i64;
 
         // Handle the outcome.
         match outcome {
             GeneratorOutcome::Success { output, .. } => {
                 info!(session_id = %session.id, step_id = %step.id, "step succeeded");
+
+                // Trace: tool call completed.
+                if let Err(e) = crud::append_trace(
+                    &self.pool,
+                    &session.id,
+                    &TraceEventType::ToolCallCompleted,
+                    Some(&step.id),
+                    step.tool.as_deref(),
+                    None,
+                    Some(&output),
+                    None,
+                    Some(step_duration_ms),
+                    None,
+                ).await {
+                    warn!(session_id = %session.id, step_id = %step.id, error = %e, "failed to append ToolCallCompleted trace");
+                }
 
                 // Bug #7: Evaluate step output if the step has non-empty success criteria.
                 if !step.success_criteria.is_empty() {
@@ -370,6 +594,26 @@ impl SessionManager {
                     .await
                     {
                         Ok(verdict) => {
+                            // Trace: step evaluation run.
+                            if let Err(e) = crud::append_trace(
+                                &self.pool,
+                                &session.id,
+                                &TraceEventType::EvaluationRun,
+                                Some(&step.id),
+                                step.tool.as_deref(),
+                                None,
+                                Some(&serde_json::json!({
+                                    "passed": verdict.passed,
+                                    "score": verdict.score,
+                                    "feedback": verdict.feedback,
+                                })),
+                                None,
+                                None,
+                                None,
+                            ).await {
+                                warn!(session_id = %session.id, step_id = %step.id, error = %e, "failed to append EvaluationRun trace");
+                            }
+
                             if !verdict.passed {
                                 info!(
                                     session_id = %session.id,
@@ -420,6 +664,23 @@ impl SessionManager {
 
             GeneratorOutcome::Failure { error } => {
                 warn!(session_id = %session.id, step_id = %step.id, %error, "step failed");
+
+                // Trace: tool call failed.
+                if let Err(e) = crud::append_trace(
+                    &self.pool,
+                    &session.id,
+                    &TraceEventType::ToolCallFailed,
+                    Some(&step.id),
+                    step.tool.as_deref(),
+                    None,
+                    None,
+                    Some(&error),
+                    Some(step_duration_ms),
+                    None,
+                ).await {
+                    warn!(session_id = %session.id, step_id = %step.id, error = %e, "failed to append ToolCallFailed trace");
+                }
+
                 session.step_retry_count += 1;
 
                 if session.step_retry_count >= self.config.max_step_retries {
@@ -622,6 +883,27 @@ impl SessionManager {
             "session evaluation complete"
         );
 
+        // Trace: session evaluation run.
+        if let Err(e) = crud::append_trace(
+            &self.pool,
+            &session.id,
+            &TraceEventType::EvaluationRun,
+            None,
+            None,
+            None,
+            Some(&serde_json::json!({
+                "scope": "session",
+                "passed": verdict.passed,
+                "score": verdict.score,
+                "feedback": verdict.feedback,
+            })),
+            None,
+            None,
+            None,
+        ).await {
+            warn!(session_id = %session.id, error = %e, "failed to append session EvaluationRun trace");
+        }
+
         if verdict.passed {
             self.complete_session(session).await?;
         } else {
@@ -734,6 +1016,8 @@ impl SessionManager {
             .as_ref()
             .and_then(|f| f.suggestion.as_deref());
 
+        let tool_catalog = registry::build_tool_catalog(&self.agent_config);
+
         let revised_plan = planner::replan(
             &self.ai_config,
             &self.config.ai_model,
@@ -742,6 +1026,7 @@ impl SessionManager {
             &completed,
             &failed,
             new_context,
+            &tool_catalog,
         )
         .await
         .context("replanning failed")?;
@@ -792,6 +1077,22 @@ impl SessionManager {
         session.updated_at = crud::epoch_secs();
         crud::checkpoint_session(&self.pool, session).await?;
 
+        // Trace: session completed.
+        if let Err(e) = crud::append_trace(
+            &self.pool,
+            &session.id,
+            &TraceEventType::SessionCompleted,
+            None,
+            None,
+            None,
+            Some(&serde_json::json!({ "status": "completed" })),
+            None,
+            None,
+            None,
+        ).await {
+            warn!(session_id = %session.id, error = %e, "failed to append SessionCompleted trace");
+        }
+
         self.publish_event(session, EventType::WorkflowRunCompleted);
 
         info!(session_id = %session.id, "session completed successfully");
@@ -800,6 +1101,22 @@ impl SessionManager {
 
     async fn fail_session(&self, session: &mut SessionState, reason: &str) -> Result<()> {
         warn!(session_id = %session.id, %reason, "session failed");
+
+        // Trace: session completed (failed).
+        if let Err(e) = crud::append_trace(
+            &self.pool,
+            &session.id,
+            &TraceEventType::SessionCompleted,
+            None,
+            None,
+            None,
+            None,
+            Some(reason),
+            None,
+            Some(&serde_json::json!({ "status": "failed" })),
+        ).await {
+            warn!(session_id = %session.id, error = %e, "failed to append SessionCompleted (failed) trace");
+        }
 
         session.status = SessionStatus::Failed;
         session.completed_at = Some(crud::epoch_secs());
@@ -903,10 +1220,12 @@ pub async fn resume_sessions(
             .map(|w| w.name)
             .unwrap_or_else(|| "unknown".into());
 
-        // Bug #4 & #5: Re-emit escalation event for WaitingForHuman sessions
+        // Bug #4 & #5: Re-emit escalation event for WaitingForHuman/Clarifying sessions
         // so that listeners (WebSocket, notifications) are aware of the pending
         // escalation even if the original event was lost in a crash.
-        if session.status == SessionStatus::WaitingForHuman {
+        if session.status == SessionStatus::WaitingForHuman
+            || session.status == SessionStatus::Clarifying
+        {
             if let Some(ref esc) = session.escalation {
                 info!(
                     session_id = %sid,
@@ -998,6 +1317,7 @@ mod tests {
             success_criteria: "done".into(),
             depends_on: deps.iter().map(|s| s.to_string()).collect(),
             capabilities_needed: vec![],
+            tool: None,
         }
     }
 
@@ -1151,6 +1471,7 @@ mod tests {
         assert!(!SessionStatus::Evaluating.is_terminal());
         assert!(!SessionStatus::Adapting.is_terminal());
         assert!(!SessionStatus::WaitingForHuman.is_terminal());
+        assert!(!SessionStatus::Clarifying.is_terminal());
     }
 
     #[test]
@@ -1162,6 +1483,7 @@ mod tests {
             SessionStatus::Evaluating,
             SessionStatus::Adapting,
             SessionStatus::WaitingForHuman,
+            SessionStatus::Clarifying,
             SessionStatus::Completed,
             SessionStatus::Failed,
             SessionStatus::Cancelled,

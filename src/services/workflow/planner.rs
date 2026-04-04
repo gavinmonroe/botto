@@ -8,10 +8,26 @@ use std::collections::{HashMap, HashSet};
 use tracing::{debug, info, warn};
 
 use crate::services::ai::client::{
-    self, AiClientConfig, ChatCompletionRequest, ChatMessage,
+    self, AiClientConfig, ChatCompletionRequest, ChatMessage, ToolDefinition,
 };
 use crate::services::mentor::client::MentorClient;
 use crate::types::workflow::{PlanStep, SessionPlan};
+
+// ---------------------------------------------------------------------------
+// PlanResult — the planner can produce a plan or request clarification
+// ---------------------------------------------------------------------------
+
+/// Result of the planning phase.
+#[derive(Debug, Clone)]
+pub enum PlanResult {
+    /// A complete execution plan ready for the generator.
+    Plan(SessionPlan),
+    /// The planner needs more information from the user before it can plan.
+    NeedsClarification {
+        questions: Vec<String>,
+        reason: String,
+    },
+}
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -20,31 +36,76 @@ use crate::types::workflow::{PlanStep, SessionPlan};
 /// Create an execution plan from trigger context.
 ///
 /// 1. Queries the mentor for relevant knowledge
-/// 2. Builds a prompt with trigger data + mentor context + workflow description
-/// 3. Calls the AI service
-/// 4. Parses and validates the response into a `SessionPlan`
+/// 2. Builds a prompt with trigger data + mentor context + workflow description + tool catalog
+/// 3. Calls the AI service with tools available for function calling
+/// 4. If the AI calls the `clarify` tool → return PlanResult::NeedsClarification
+/// 5. Otherwise parses and validates the response into a `SessionPlan`
 pub async fn create_plan(
     ai_config: &AiClientConfig,
     model: &str,
     mentor: &MentorClient,
     trigger_data: &serde_json::Value,
     workflow_description: &str,
-) -> Result<SessionPlan> {
+    tool_catalog: &[ToolDefinition],
+) -> Result<PlanResult> {
     info!("creating execution plan for workflow");
 
     // 1. Query mentor for relevant context.
     let mentor_context = query_mentor_context(mentor, workflow_description).await;
 
     // 2. Build the prompt.
-    let system_prompt = build_system_prompt();
+    let system_prompt = build_system_prompt(tool_catalog);
     let user_prompt = build_create_prompt(trigger_data, workflow_description, &mentor_context);
 
-    // 3. Call AI.
-    let response = call_ai(ai_config, model, &system_prompt, &user_prompt).await?;
-    debug!(response_len = response.len(), "planner AI response received");
+    // 3. Call AI — try with tools first, fall back to text-only if the endpoint
+    //    doesn't support function calling (returns 400).
+    let response = match call_ai_with_tools(ai_config, model, &system_prompt, &user_prompt, tool_catalog).await {
+        Ok(resp) => resp,
+        Err(e) => {
+            warn!("planner AI call with tools failed ({e:#}), retrying without tools");
+            let fallback_prompt = build_fallback_prompt(trigger_data, workflow_description, &mentor_context, tool_catalog);
+            let text = call_ai_text_only(ai_config, model, &fallback_prompt).await?;
+            PlannerAiResponse {
+                text: Some(text),
+                clarification: None,
+            }
+        }
+    };
 
-    // 4. Parse and validate.
-    let plan = parse_plan(&response).context("failed to parse planner response")?;
+    // 4. Check if the AI called the clarify tool.
+    if let Some(clarification) = response.clarification {
+        info!(
+            questions = clarification.questions.len(),
+            reason = %clarification.reason,
+            "planner requested clarification"
+        );
+        return Ok(PlanResult::NeedsClarification {
+            questions: clarification.questions,
+            reason: clarification.reason,
+        });
+    }
+
+    // 5. Parse and validate the text response.
+    let text = response.text.as_deref().unwrap_or("");
+
+    // If the response is empty or doesn't look like JSON (AI ignored tools and
+    // returned conversational text), retry without tools using a JSON-focused prompt.
+    let plan_text = if text.is_empty() || (!text.contains('{') && !text.contains("goal")) {
+        warn!("planner AI returned non-JSON response, retrying with text-only prompt");
+        let fallback_prompt = build_fallback_prompt(trigger_data, workflow_description, &mentor_context, tool_catalog);
+        let fallback = call_ai_text_only(ai_config, model, &fallback_prompt).await?;
+        fallback
+    } else {
+        text.to_string()
+    };
+
+    if plan_text.is_empty() {
+        bail!("planner AI returned empty response");
+    }
+
+    debug!(response_len = plan_text.len(), "planner response received");
+
+    let plan = parse_plan(&plan_text).context("failed to parse planner response")?;
     let plan = validate_plan(plan)?;
 
     info!(
@@ -52,7 +113,7 @@ pub async fn create_plan(
         step_count = plan.steps.len(),
         "execution plan created"
     );
-    Ok(plan)
+    Ok(PlanResult::Plan(plan))
 }
 
 /// Replan after partial execution — keeps completed steps, replaces failed ones.
@@ -64,6 +125,7 @@ pub async fn replan(
     completed_steps: &[&str],
     failed_steps: &[(&str, &str)], // (step_id, error_message)
     new_context: Option<&str>,
+    tool_catalog: &[ToolDefinition],
 ) -> Result<SessionPlan> {
     info!(
         completed = completed_steps.len(),
@@ -73,7 +135,7 @@ pub async fn replan(
 
     let mentor_context = query_mentor_context(mentor, &original_plan.goal).await;
 
-    let system_prompt = build_system_prompt();
+    let system_prompt = build_system_prompt(tool_catalog);
     let user_prompt = build_replan_prompt(
         original_plan,
         completed_steps,
@@ -123,6 +185,112 @@ async fn query_mentor_context(mentor: &MentorClient, question: &str) -> String {
 // AI interaction
 // ---------------------------------------------------------------------------
 
+/// Internal response from the AI call — either text content or a clarification request.
+struct PlannerAiResponse {
+    text: Option<String>,
+    clarification: Option<ClarificationRequest>,
+}
+
+struct ClarificationRequest {
+    questions: Vec<String>,
+    reason: String,
+}
+
+/// Call AI with tool catalog for function calling. Checks if the model called
+/// the `clarify` tool; otherwise returns the text response for plan parsing.
+async fn call_ai_with_tools(
+    cfg: &AiClientConfig,
+    model: &str,
+    system_prompt: &str,
+    user_prompt: &str,
+    tool_catalog: &[ToolDefinition],
+) -> Result<PlannerAiResponse> {
+    let tools = if tool_catalog.is_empty() {
+        None
+    } else {
+        Some(tool_catalog.to_vec())
+    };
+
+    let request = ChatCompletionRequest {
+        model: model.to_string(),
+        messages: vec![
+            ChatMessage {
+                role: "system".into(),
+                content: Some(system_prompt.to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: Some(user_prompt.to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+        ],
+        temperature: Some(0.2),
+        max_tokens: Some(4096),
+        stream: None,
+        tools,
+        tool_choice: None,
+    };
+
+    let resp = client::chat_completion(cfg, request)
+        .await
+        .context("planner AI call failed")?;
+
+    let choice = resp.choices.first().ok_or_else(|| {
+        anyhow::anyhow!("planner AI returned no choices")
+    })?;
+
+    // Check for tool calls — specifically the clarify tool.
+    if let Some(ref tool_calls) = choice.message.tool_calls {
+        for tc in tool_calls {
+            if tc.function.name == "clarify" {
+                // Parse the clarify tool arguments.
+                let args: serde_json::Value = serde_json::from_str(&tc.function.arguments)
+                    .unwrap_or_else(|_| serde_json::json!({}));
+
+                let questions = args
+                    .get("questions")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                let reason = args
+                    .get("reason")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Clarification needed")
+                    .to_string();
+
+                return Ok(PlannerAiResponse {
+                    text: None,
+                    clarification: Some(ClarificationRequest { questions, reason }),
+                });
+            }
+        }
+    }
+
+    // No clarify tool call — return text content.
+    let content = choice
+        .message
+        .content
+        .clone()
+        .unwrap_or_default();
+
+    if content.is_empty() {
+        bail!("planner AI returned empty response");
+    }
+
+    Ok(PlannerAiResponse {
+        text: Some(content),
+        clarification: None,
+    })
+}
+
 async fn call_ai(
     cfg: &AiClientConfig,
     model: &str,
@@ -156,35 +324,114 @@ async fn call_ai(
         .await
         .context("planner AI call failed")?;
 
-    let content = resp
-        .choices
+    resp.choices
         .first()
-        .and_then(|c| c.message.content.as_deref())
-        .unwrap_or("")
-        .to_string();
+        .and_then(|c| c.message.content.clone())
+        .ok_or_else(|| anyhow::anyhow!("planner AI returned empty response"))
+}
 
-    if content.is_empty() {
-        bail!("planner AI returned empty response");
+/// Fallback: call AI without tools, with a prompt that explicitly asks for JSON.
+/// Used when the AI endpoint doesn't support function calling.
+async fn call_ai_text_only(
+    cfg: &AiClientConfig,
+    model: &str,
+    prompt: &str,
+) -> Result<String> {
+    call_ai(cfg, model, FALLBACK_SYSTEM_PROMPT, prompt).await
+}
+
+const FALLBACK_SYSTEM_PROMPT: &str = r#"You are a workflow planner. Create a structured execution plan as JSON.
+
+Return ONLY a JSON object with this exact structure:
+{
+  "goal": "one sentence describing the goal",
+  "steps": [
+    {
+      "id": "kebab-case-step-id",
+      "description": "what this step does",
+      "tool": "agent.action_name",
+      "agent_type": "gitlab|ai|http|script|sandbox|coding",
+      "inputs": {"param": "value"},
+      "success_criteria": "how to verify success",
+      "depends_on": ["other-step-id"],
+      "capabilities_needed": []
+    }
+  ],
+  "capabilities_needed": []
+}
+
+Return ONLY valid JSON. No markdown fences, no prose."#;
+
+/// Build a fallback prompt that includes the tool catalog as text
+/// (for AI endpoints that don't support function calling).
+fn build_fallback_prompt(
+    trigger_data: &serde_json::Value,
+    workflow_description: &str,
+    mentor_context: &str,
+    tool_catalog: &[ToolDefinition],
+) -> String {
+    let tools_text: Vec<String> = tool_catalog
+        .iter()
+        .filter(|t| t.function.name != "clarify")
+        .map(|t| {
+            let params = t.function.parameters
+                .get("properties")
+                .and_then(|p| p.as_object())
+                .map(|props| {
+                    props.keys().cloned().collect::<Vec<_>>().join(", ")
+                })
+                .unwrap_or_default();
+            format!("- {} ({}) — {}", t.function.name, params, t.function.description)
+        })
+        .collect();
+
+    let mut prompt = format!(
+        "Create an execution plan for this task:\n\n{}\n\nAvailable tools:\n{}\n",
+        workflow_description,
+        tools_text.join("\n"),
+    );
+
+    if !trigger_data.is_null() {
+        prompt.push_str(&format!(
+            "\nTrigger data:\n{}\n",
+            serde_json::to_string_pretty(trigger_data).unwrap_or_default()
+        ));
     }
 
-    Ok(content)
+    if !mentor_context.is_empty() {
+        prompt.push_str(&format!("\nRelevant knowledge:\n{}\n", mentor_context));
+    }
+
+    prompt.push_str("\nUse the exact tool names from the list above in the 'tool' field of each step. Include the required inputs for each tool.");
+
+    prompt
 }
 
 // ---------------------------------------------------------------------------
 // Prompt construction
 // ---------------------------------------------------------------------------
 
-fn build_system_prompt() -> String {
-    r#"You are a workflow planner. Given a trigger event and workflow description, produce a JSON execution plan.
+fn build_system_prompt(tool_catalog: &[ToolDefinition]) -> String {
+    let mut prompt = r#"You are a workflow planner. Given a trigger event and workflow description, produce a JSON execution plan.
 
-Available agent types and their capabilities:
-- "gitlab": GitLab API operations — list MRs, post comments, manage branches, read files from repos.
-- "ai": AI analysis — summarization, decision-making, code review, text generation.
-- "sandbox": Run scripts/tests in isolated Docker containers — build, test, lint.
-- "http": Call external APIs — Slack, Jira, webhooks, any HTTP endpoint.
-- "script": Run shell commands on the host with resource limits.
-- "composite": A mini-workflow that delegates to other agents for complex multi-step sub-tasks.
-- "coding": Multi-turn AI coding in a Docker sandbox (clone repo, understand codebase, write code, run tests, iterate until passing, commit + push).
+You have access to the following tools. Each step in your plan should specify which tool to use via the "tool" field:"#.to_string();
+
+    // Include tool descriptions from the catalog.
+    if !tool_catalog.is_empty() {
+        prompt.push_str("\n\nAvailable tools:\n");
+        for tool in tool_catalog {
+            if tool.function.name == "clarify" {
+                continue; // Clarify is handled via function calling, not plan steps.
+            }
+            prompt.push_str(&format!(
+                "- \"{}\": {}\n",
+                tool.function.name, tool.function.description
+            ));
+        }
+    }
+
+    prompt.push_str(r#"
+If you need more information from the user before you can create a good plan, call the "clarify" tool with your questions instead of producing a plan.
 
 Respond with ONLY a JSON object (no markdown, no explanation) matching this schema:
 {
@@ -194,6 +441,7 @@ Respond with ONLY a JSON object (no markdown, no explanation) matching this sche
       "id": "string — unique kebab-case identifier",
       "description": "string — what this step does",
       "agentType": "gitlab" | "ai" | "sandbox" | "http" | "script" | "composite" | "coding",
+      "tool": "string — tool name from the catalog (e.g., 'gitlab.list_open_mrs')",
       "successCriteria": "string — how to verify this step succeeded",
       "dependsOn": ["step-id", ...],
       "capabilitiesNeeded": ["string", ...]
@@ -208,8 +456,12 @@ Rules:
 - The dependency graph must be acyclic (no circular dependencies).
 - Order steps so dependencies come before dependents.
 - Keep plans minimal — only include steps that are necessary.
-- Each step should do one thing well."#
-        .to_string()
+- Each step should do one thing well.
+- The "tool" field should match a tool name from the available tools list.
+- The "agentType" should match the prefix of the tool name (e.g., "gitlab" for "gitlab.list_open_mrs").
+- Use {{step-id.output}} in step descriptions to reference outputs from previous steps."#);
+
+    prompt
 }
 
 fn build_create_prompt(
@@ -476,6 +728,7 @@ mod tests {
             success_criteria: "done".into(),
             depends_on: deps.iter().map(|s| s.to_string()).collect(),
             capabilities_needed: vec![],
+            tool: None,
         }
     }
 

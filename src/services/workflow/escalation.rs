@@ -14,6 +14,7 @@ use crate::services::events::{Event, EventBus, EventType};
 use crate::services::workflow::crud;
 use crate::types::workflow::{
     EscalationMessage, EscalationOption, EscalationSeverity, SessionState, SessionStatus,
+    TraceEventType,
 };
 
 // ---------------------------------------------------------------------------
@@ -53,7 +54,27 @@ pub async fn escalate(
         .await
         .context("checkpoint session during escalation")?;
 
-    // 3. Log the escalation as a conversation message so the thread is complete.
+    // 3. Trace: escalation sent.
+    if let Err(e) = crud::append_trace(
+        pool,
+        &session_id,
+        &TraceEventType::EscalationSent,
+        message.step_id.as_deref(),
+        None,
+        None,
+        Some(&serde_json::json!({
+            "severity": format!("{:?}", message.severity),
+            "reason": message.reason,
+            "what_i_need": message.what_i_need,
+        })),
+        None,
+        None,
+        None,
+    ).await {
+        warn!(session_id = %session_id, error = %e, "failed to append EscalationSent trace");
+    }
+
+    // 4. Log the escalation as a conversation message so the thread is complete.
     let content = format!(
         "[Escalation — {:?}] {}\n\nWhat I need: {}",
         severity, reason, message.what_i_need
@@ -70,7 +91,7 @@ pub async fn escalate(
     .await
     .context("log escalation message")?;
 
-    // 4. Broadcast for WebSocket listeners.
+    // 5. Broadcast for WebSocket listeners.
     let payload = serde_json::to_value(&message).ok();
     event_bus.publish(Event {
         event_type: EventType::SessionEscalation,
@@ -97,18 +118,22 @@ pub async fn handle_response(
     let session_id = session.id;
 
     // Guard: only respond to sessions that are actually waiting.
-    if session.status != SessionStatus::WaitingForHuman {
+    if session.status != SessionStatus::WaitingForHuman
+        && session.status != SessionStatus::Clarifying
+    {
         warn!(
             session_id = %session_id,
             current_status = %session.status,
             "handle_response called but session is not waiting for human"
         );
         bail!(
-            "session {} is in status '{}', not 'waiting_for_human'",
+            "session {} is in status '{}', not 'waiting_for_human' or 'clarifying'",
             session_id,
             session.status
         );
     }
+
+    let was_clarifying = session.status == SessionStatus::Clarifying;
 
     info!(
         session_id = %session_id,
@@ -129,10 +154,19 @@ pub async fn handle_response(
     .context("log human response message")?;
 
     // 2. Determine next status from the chosen option.
-    let next_status = match chosen_option {
-        Some("cancel") => SessionStatus::Cancelled,
-        Some(opt) if opt.starts_with("replan") => SessionStatus::Adapting,
-        _ => SessionStatus::Executing,
+    let next_status = if was_clarifying {
+        // Resuming from clarification — go back to Planning so the planner
+        // re-runs with the user's answers included in trigger_data.
+        match chosen_option {
+            Some("cancel") => SessionStatus::Cancelled,
+            _ => SessionStatus::Planning,
+        }
+    } else {
+        match chosen_option {
+            Some("cancel") => SessionStatus::Cancelled,
+            Some(opt) if opt.starts_with("replan") => SessionStatus::Adapting,
+            _ => SessionStatus::Executing,
+        }
     };
 
     debug!(
@@ -465,7 +499,7 @@ mod tests {
 
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("not 'waiting_for_human'"));
+        assert!(err_msg.contains("not 'waiting_for_human' or 'clarifying'"));
     }
 
     #[tokio::test]
